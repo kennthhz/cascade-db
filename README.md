@@ -62,4 +62,15 @@ To achieve zero-friction onboarding, Cascade DB presents an identical surface ar
 
 ## 6. Engineering Roadmap
 
-* **Phase 1: Storage Foundation (Complete)** *
+* **Phase 1: Storage Foundation (Complete)** * `O_DIRECT` + `io_uring` page allocation and disk I/O verification (`storage.rs`).
+* **Phase 2: Memory & Durability (Next)**
+  * Userspace Buffer Pool Manager (BPM).
+  * Per-Database Write-Ahead Log (WAL) implementation.
+* **Phase 3: Data Structures**
+  * Page layout design (Headers, Slot Arrays, Checksums).
+  * B+Tree implementation with Optimistic Lock Coupling.
+  * Undo-Log segment manager.
+* **Phase 4: Compute & Compatibility**
+  * Postgres Wire Protocol integration.
+  * SQL Parser / DataFusion integration.
+  * Catalog Facade implementation.
