@@ -3,7 +3,7 @@
 ## 1. Executive Summary
 **Cascade DB** is a high-performance, predictable-latency relational database designed as a drop-in replacement for PostgreSQL. It combines 100% Postgres wire compatibility with a fundamentally rewritten, modern storage kernel built in Rust. 
 
-Cascade DB is designed to eradicate the three "original sins" of legacy PostgreSQL architecture: **VACUUM bloat** (via In-Place MVCC), **Double Buffering** (via `O_DIRECT`), and **Checkpoint Latency Spikes** (via `io_uring`). Furthermore, it introduces a **Per-Database WAL architecture**, solving the "noisy neighbor" replication and recovery bottlenecks inherent in Postgres's global cluster design.
+Cascade DB is designed to eradicate the legacy architectural bottlenecks of PostgreSQL: **VACUUM bloat** (via In-Place MVCC), **Double Buffering** (via `O_DIRECT`), **Checkpoint Latency Spikes** (via `io_uring`), and **Connection Limits** (via a Thread-per-Core architecture). Furthermore, it introduces a **Per-Database WAL architecture**, solving the "noisy neighbor" replication and recovery bottlenecks inherent in Postgres's global cluster design.
 
 ## 2. Target Market & Use Cases
 * **High-Throughput OLTP:** Applications constrained by Postgres write-amplification and checkpoint stalling.
@@ -19,19 +19,25 @@ Cascade DB is designed to eradicate the three "original sins" of legacy PostgreS
 * **Syscall Eradication:** Utilizes `io_uring` to batch I/O submissions and completions asynchronously. Reduces CPU context-switch overhead to near-zero during heavy I/O.
 * **Predictable Latency:** Eliminates the need for blocking `fsync` storms. Dirty pages are trickle-flushed asynchronously, keeping P99 latencies flat during checkpoints.
 
-### 3.2. The "Anti-VACUUM" Engine (In-Place MVCC)
+### 3.2. Thread-per-Core Execution Model
+* **The Problem:** PostgreSQL uses a legacy process-per-connection model. Spawning a heavy OS process for every client consumes massive amounts of RAM and causes severe CPU context-switching overhead under load, forcing users to deploy external proxies like PgBouncer.
+* **The Cascade DB Solution:** Implements a modern thread-per-core (shared-nothing) async architecture. It pins lightweight worker threads to physical CPU cores and multiplexes network I/O concurrently using `io_uring`.
+* **Built-in Connection Scaling:** Can natively handle tens of thousands of concurrent connections without memory bloat.
+* **Result:** Maximizes CPU cache locality, drastically improves query performance, and entirely eliminates the operational complexity of running external connection poolers (PgBouncer/Pgpool).
+
+### 3.3. The "Anti-VACUUM" Engine (In-Place MVCC)
 * **In-Place Updates:** Modifies records directly within their original 8KB data pages, preventing table bloat and write-amplification.
 * **Undo-Log Rollback Segments:** Preserves MVCC isolation by writing the pre-update row state to a separate, sequential Undo Log.
 * **Result:** Eradicates the need for a background VACUUM daemon or table-locking `VACUUM FULL` operations.
 
-### 3.3. Isolated Durability (Per-Database WAL & LSN)
+### 3.4. Isolated Durability (Per-Database WAL & LSN)
 Exploiting the fact that Postgres does not natively support cross-database transactions, Cascade DB physically isolates operational logging.
 * **Per-Database Write-Ahead Log (WAL):** Each database maintains its own WAL, LSN sequence, and Transaction ID (XID) space.
 * **Isolated Replication:** A massive write spike in Database A has zero impact on the replication stream or WAL size of Database B.
 * **Granular Recovery:** Enables trivial, instantaneous Point-in-Time Recovery (PITR) for a single database without requiring a full cluster restore.
 * **Sharding Readiness:** Databases are self-contained physical units, making cross-node migration and sharding significantly easier than legacy Postgres.
 
-### 3.4. Userspace Buffer Pool Manager (BPM)
+### 3.5. Userspace Buffer Pool Manager (BPM)
 * **Direct Memory Control:** A highly optimized Rust concurrency layer managing a pre-allocated pool of `AlignedBuf` 8KB pages.
 * **Eviction:** Utilizes modern eviction algorithms (e.g., LRU-K or CLOCK-sweep) optimized for B+Tree index traversal and sequential scans.
 
@@ -51,7 +57,9 @@ To achieve zero-friction onboarding, Cascade DB presents an identical surface ar
 
 | Feature / Bottleneck | PostgreSQL (Legacy) | Cascade DB |
 | :--- | :--- | :--- |
-| **Memory Architecture** | Double Buffered (OS Cache + Shared Buffers) | Zero-Copy Userspace Buffer Pool |
+| **Concurrency Model**| Process-per-Connection (Heavy) | **Thread-per-Core** (Async, Lightweight) |
+| **Connection Pooling** | Requires External Proxy (PgBouncer) | **Native** (Handles 10k+ connections) |
+| **Memory Architecture**| Double Buffered (OS Cache + Shared Buffers) | Zero-Copy Userspace Buffer Pool |
 | **Checkpointing** | Blocking `fsync` storms (Latency Spikes) | Continuous Async Flushing (`io_uring`) |
 | **MVCC Model** | Append-Only (Causes Bloat) | In-Place Updates + Undo Log |
 | **Maintenance** | Requires Autovacuum Tuning | **Zero VACUUM** |
@@ -71,6 +79,7 @@ To achieve zero-friction onboarding, Cascade DB presents an identical surface ar
   * B+Tree implementation with Optimistic Lock Coupling.
   * Undo-Log segment manager.
 * **Phase 4: Compute & Compatibility**
+  * Async Thread-per-Core network listener integration.
   * Postgres Wire Protocol integration.
   * SQL Parser / DataFusion integration.
   * Catalog Facade implementation.
