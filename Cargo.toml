@@ -7,3 +7,12 @@ edition = "2021"
 tokio-uring = "0.5.0" 
 crc32fast = "1.4"
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt", "macros"] }
+cpu-time = "1.0"
+memory-stats = "1.1"
+
+[[bench]]
+name = "checkpoint_bench"
+harness = false  # Set to false if you are using Criterion or custom main()
