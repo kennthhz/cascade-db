@@ -1,0 +1,16 @@
+[package]
+name        = "cascade-mvcc"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "In-place MVCC: XID allocation, snapshots, visibility, transaction state machine. Pillar §3.3."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-wal       = { workspace = true }
+cascade-undo      = { workspace = true }

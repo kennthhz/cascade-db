@@ -1,0 +1,18 @@
+[package]
+name        = "cascade-runtime"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Thread-per-core async scheduler over io_uring. Pillar §3.2."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-tenant    = { workspace = true }
+
+tokio-uring = { workspace = true }
+libc        = { workspace = true }

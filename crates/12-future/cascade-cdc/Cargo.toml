@@ -1,0 +1,14 @@
+[package]
+name        = "cascade-cdc"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Logical decoder + CDC stream. §6.3 reservation — v1 hooks only."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-wal       = { workspace = true }

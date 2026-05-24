@@ -1,0 +1,14 @@
+[package]
+name        = "cascade-pg-parser"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Safe Rust wrapper over cascade-pg-parser-sys (libpg_query). The only crate downstream code touches."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-pg-parser-sys = { workspace = true }

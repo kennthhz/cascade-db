@@ -1,0 +1,13 @@
+[package]
+name        = "cascade-telemetry"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Span, MetricsRegistry, and structured logging primitives. v1 stubs for §6.2 observability."
+
+[dependencies]
+# Foundation; intentionally no external observability deps in v1.
+# OTLP exporter, Prometheus endpoint, etc. land in a later phase.

@@ -1,0 +1,18 @@
+[package]
+name        = "cascade-columnar"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Native columnar secondary storage + vectorized execution. Pillar §3.7 (HTAP)."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-storage   = { workspace = true }
+cascade-bpm       = { workspace = true }
+cascade-mvcc      = { workspace = true }
+cascade-pgtypes   = { workspace = true }

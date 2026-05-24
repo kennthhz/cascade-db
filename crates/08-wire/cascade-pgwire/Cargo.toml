@@ -1,0 +1,17 @@
+[package]
+name        = "cascade-pgwire"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "PostgreSQL wire protocol (simple + extended, COPY, prepared statements). §4.1."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-pgtypes   = { workspace = true }
+cascade-sql-planner = { workspace = true }
+cascade-sql-exec  = { workspace = true }

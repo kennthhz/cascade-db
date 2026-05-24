@@ -1,0 +1,17 @@
+[package]
+name        = "cascade-catalog"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Real (query-backed) pg_catalog and information_schema. §4.3 compatibility."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-heap      = { workspace = true }
+cascade-btree     = { workspace = true }
+cascade-mvcc      = { workspace = true }

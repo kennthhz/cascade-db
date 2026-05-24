@@ -1,0 +1,14 @@
+[package]
+name        = "cascade-page"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "8 KB page layout: headers, slot arrays, checksums, PageLSN. Format authority for all access methods."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+crc32fast         = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name        = "cascade-sql-planner"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "SQL planner: parse tree -> logical plan -> physical plan. Cost-based routing between row and columnar (§3.7)."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-pg-parser = { workspace = true }
+cascade-catalog   = { workspace = true }
+cascade-pgtypes   = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name        = "cascade-types"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Shared primitive types for Cascade DB (PageId, Lsn, Xid, DatabaseId, AlignedBuf, ...)."
+
+[dependencies]
+# Foundation layer — depends on nothing else in the workspace.

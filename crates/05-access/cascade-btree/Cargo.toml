@@ -1,0 +1,16 @@
+[package]
+name        = "cascade-btree"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "B+Tree access method with Optimistic Lock Coupling."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-page      = { workspace = true }
+cascade-bpm       = { workspace = true }

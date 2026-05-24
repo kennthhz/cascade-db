@@ -1,0 +1,18 @@
+[package]
+name        = "cascade-storage"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "PageStore trait + local O_DIRECT / io_uring implementation. Pillar §3.1, reservation §6.4."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+
+tokio-uring = { workspace = true }
+crc32fast   = { workspace = true }
+libc        = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name        = "cascade-tenant"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "TenantContext propagation. §6.1 reservation — the data-carrier for future multi-tenant resource governance."
+
+[dependencies]
+cascade-types = { workspace = true }

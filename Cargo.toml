@@ -1,18 +1,97 @@
-[package]
-name = "aquifer"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = [
+    # 01-foundation
+    "crates/01-foundation/cascade-types",
+    "crates/01-foundation/cascade-error",
+    "crates/01-foundation/cascade-telemetry",
+    # 02-storage
+    "crates/02-storage/cascade-storage",
+    "crates/02-storage/cascade-wal",
+    # 03-memory
+    "crates/03-memory/cascade-bpm",
+    # 04-txn
+    "crates/04-txn/cascade-mvcc",
+    "crates/04-txn/cascade-undo",
+    # 05-access
+    "crates/05-access/cascade-page",
+    "crates/05-access/cascade-btree",
+    "crates/05-access/cascade-heap",
+    # 06-catalog
+    "crates/06-catalog/cascade-catalog",
+    # 07-sql
+    "crates/07-sql/cascade-pg-parser-sys",
+    "crates/07-sql/cascade-pg-parser",
+    "crates/07-sql/cascade-sql-planner",
+    "crates/07-sql/cascade-sql-exec",
+    "crates/07-sql/cascade-pgtypes",
+    "crates/07-sql/cascade-plpgsql",
+    # 08-wire
+    "crates/08-wire/cascade-pgwire",
+    # 09-runtime
+    "crates/09-runtime/cascade-runtime",
+    "crates/09-runtime/cascade-tenant",
+    # 10-columnar
+    "crates/10-columnar/cascade-columnar",
+    # 11-extension
+    "crates/11-extension/cascade-ext-abi",
+    # 12-future (reserved design space; v1 hooks only)
+    "crates/12-future/cascade-cdc",
+    "crates/12-future/cascade-governance",
+    # binaries
+    "bin/cascade-server",
+]
 
-[dependencies]
-tokio-uring = "0.5.0" 
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.75"
+license      = "Apache-2.0"
+repository   = "https://github.com/kennthhz/cascade-db"
+authors      = ["Cascade DB Authors"]
+
+[workspace.dependencies]
+# I/O & async
+tokio-uring = "0.5"
+tokio       = { version = "1", features = ["rt", "macros"] }
+
+# checksums / hashing
 crc32fast = "1.4"
+
+# system
 libc = "0.2"
 
-[dev-dependencies]
-tokio = { version = "1.0", features = ["rt", "macros"] }
-cpu-time = "1.0"
-memory-stats = "1.1"
+# error handling
+thiserror = "1"
 
-[[bench]]
-name = "checkpoint_bench"
-harness = false  # Set to false if you are using Criterion or custom main()
+# internal crates (declared here so members reference by `{ workspace = true }`)
+cascade-types     = { path = "crates/01-foundation/cascade-types" }
+cascade-error     = { path = "crates/01-foundation/cascade-error" }
+cascade-telemetry = { path = "crates/01-foundation/cascade-telemetry" }
+cascade-storage   = { path = "crates/02-storage/cascade-storage" }
+cascade-wal       = { path = "crates/02-storage/cascade-wal" }
+cascade-bpm       = { path = "crates/03-memory/cascade-bpm" }
+cascade-mvcc      = { path = "crates/04-txn/cascade-mvcc" }
+cascade-undo      = { path = "crates/04-txn/cascade-undo" }
+cascade-page      = { path = "crates/05-access/cascade-page" }
+cascade-btree     = { path = "crates/05-access/cascade-btree" }
+cascade-heap      = { path = "crates/05-access/cascade-heap" }
+cascade-catalog   = { path = "crates/06-catalog/cascade-catalog" }
+cascade-pg-parser-sys = { path = "crates/07-sql/cascade-pg-parser-sys" }
+cascade-pg-parser     = { path = "crates/07-sql/cascade-pg-parser" }
+cascade-sql-planner   = { path = "crates/07-sql/cascade-sql-planner" }
+cascade-sql-exec      = { path = "crates/07-sql/cascade-sql-exec" }
+cascade-pgtypes       = { path = "crates/07-sql/cascade-pgtypes" }
+cascade-plpgsql       = { path = "crates/07-sql/cascade-plpgsql" }
+cascade-pgwire        = { path = "crates/08-wire/cascade-pgwire" }
+cascade-runtime       = { path = "crates/09-runtime/cascade-runtime" }
+cascade-tenant        = { path = "crates/09-runtime/cascade-tenant" }
+cascade-columnar      = { path = "crates/10-columnar/cascade-columnar" }
+cascade-ext-abi       = { path = "crates/11-extension/cascade-ext-abi" }
+cascade-cdc           = { path = "crates/12-future/cascade-cdc" }
+cascade-governance    = { path = "crates/12-future/cascade-governance" }
+
+[profile.release]
+lto         = "thin"
+codegen-units = 1
+debug         = "line-tables-only"

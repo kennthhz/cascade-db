@@ -1,0 +1,13 @@
+[package]
+name        = "cascade-governance"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Per-DB / per-role resource quotas. §6.1 reservation — v1 holds counters, no enforcement."
+
+[dependencies]
+cascade-types  = { workspace = true }
+cascade-tenant = { workspace = true }

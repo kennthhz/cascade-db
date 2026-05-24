@@ -1,0 +1,15 @@
+[package]
+name        = "cascade-bpm"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Userspace Buffer Pool Manager. Pillar §3.5. Per-database page accounting (§6.1 reservation)."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-storage   = { workspace = true }

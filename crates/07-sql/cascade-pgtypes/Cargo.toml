@@ -1,0 +1,13 @@
+[package]
+name        = "cascade-pgtypes"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "PostgreSQL type system with wire-format parity. §4.2."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }

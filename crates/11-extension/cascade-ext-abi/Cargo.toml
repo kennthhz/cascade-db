@@ -1,0 +1,15 @@
+[package]
+name        = "cascade-ext-abi"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Extension hosting ABI. §4.4 — first-class support for pgvector, PostGIS, pg_trgm, etc."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-pgtypes   = { workspace = true }
+cascade-catalog   = { workspace = true }

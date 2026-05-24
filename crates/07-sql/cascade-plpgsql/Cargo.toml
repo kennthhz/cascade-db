@@ -1,0 +1,18 @@
+[package]
+name        = "cascade-plpgsql"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "PL/pgSQL procedural language runtime."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-pg-parser = { workspace = true }
+cascade-pgtypes   = { workspace = true }
+cascade-sql-planner = { workspace = true }
+cascade-sql-exec  = { workspace = true }

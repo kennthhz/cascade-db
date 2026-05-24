@@ -1,0 +1,16 @@
+[package]
+name        = "cascade-undo"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Undo-log rollback segments. Companion to cascade-mvcc. Pillar §3.3."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-storage   = { workspace = true }
+cascade-bpm       = { workspace = true }

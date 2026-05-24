@@ -1,0 +1,18 @@
+[package]
+name        = "cascade-wal"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Per-database Write-Ahead Log. Pillars §3.4, §6.3. Logical-decoding-ready record format."
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+
+tokio-uring = { workspace = true }
+crc32fast   = { workspace = true }
+libc        = { workspace = true }
