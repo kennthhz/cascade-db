@@ -9,6 +9,7 @@ Per-database WAL. The single most consequential crate for §6.3 (logical CDC) be
 - **§3.4 (Per-DB WAL):** the *defining* pillar. Every WAL is scoped to a `DatabaseId`.
 - **§6.3 (Logical CDC):** record format must be sufficient to reconstruct logical events. Get this right *before* the second consumer arrives.
 - **§6.4 (Disaggregated):** `WalStore` trait separates I/O backend from log logic. Future S3 / page-service WAL plugs in here.
+- **Runtime spec §4 Tier B scoping / §8.2 (NUMA placement):** WAL writers live on a specific NUMA per the owning DB's `numa_affinity`. For `single`-affinity DBs the writer lives on the DB's bound NUMA (all appends NUMA-local). For `cross`-affinity DBs the writer lives on one designated NUMA (chosen at DB creation; cross-NUMA reactors append via `Arc<WalWriter>` and pay cross-NUMA atomic cost on the commit path — documented trade).
 
 ## Hard Invariants
 

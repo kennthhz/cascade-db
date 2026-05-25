@@ -8,6 +8,7 @@ Real `pg_catalog` + `information_schema`. The compatibility-critical layer for O
 
 - **§4.3:** the entire reason this crate exists. Real, query-backed catalog.
 - **§6.3 (CDC):** DDL operations emit WAL records so logical decoders can interpret historical row formats.
+- **Runtime spec §2.5 / §4 / §5 (NUMA affinity):** the cluster catalog stores per-DB NUMA affinity (`pg_database.datnumaffinity`) and, for `single`-affinity DBs, the bound NUMA node (`pg_database.datnumanode`). These are read by the runtime on every connection accept and by the BPM on every page allocation. They live in Tier C (replicated per-reactor snapshot via `ArcSwap`).
 
 ## Hard Invariants
 
@@ -27,3 +28,5 @@ Real `pg_catalog` + `information_schema`. The compatibility-critical layer for O
 - Bootstrap sequence: how the catalog tables come into existence at first start.
 - OID assignment: copy PG's exact built-in OIDs (compatibility) or assign our own with a translation map. Lean toward exact match for well-known types.
 - `information_schema` — implemented as views over `pg_catalog`? PG does this; we can too.
+- NUMA-affinity DDL surface: where does `WITH (numa_affinity = …)` parse / live? Likely a Cascade-prefixed reloption (e.g., `cascade.numa_affinity`) so it doesn't collide with PG syntax. Confirm before Phase 4.
+- `single`-affinity DB placement at first activation: how the housekeeper picks the bound NUMA — least-loaded-NUMA at creation, round-robin, admin-pinned via `WITH (numa_node = N)`. (See runtime spec §11.)

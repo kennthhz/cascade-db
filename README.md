@@ -21,9 +21,15 @@ Cascade DB is designed to eradicate the legacy architectural bottlenecks of Post
 
 ### 3.2. Thread-per-Core Execution Model
 * **The Problem:** PostgreSQL uses a legacy process-per-connection model. Spawning a heavy OS process for every client consumes massive amounts of RAM and causes severe CPU context-switching overhead under load, forcing users to deploy external proxies like PgBouncer.
-* **The Cascade DB Solution:** Implements a modern thread-per-core (shared-nothing) async architecture. It pins lightweight worker threads to physical CPU cores and multiplexes network I/O concurrently using `io_uring`.
-* **Built-in Connection Scaling:** Can natively handle tens of thousands of concurrent connections without memory bloat.
+* **The Cascade DB Solution:** Implements a modern thread-per-core async architecture: **one worker thread pinned per CPU core**, each with a private `io_uring` ring and `!Send` per-connection query state. The shared data substrate (buffer pool, WAL, MVCC, catalog) uses lock-free primitives so a single database can scale across many cores.
+* **Latency / Throughput configuration.** Two coordinated knobs — one cluster-wide, one per-database — let operators choose explicitly:
+  * **SMT topology** (cluster-wide): `physical` (one worker per physical core, HT siblings idle; default, P99-optimized) or `logical` (one worker per vCPU; throughput-optimized).
+  * **NUMA affinity** (per-database): `single` (DB bound to one NUMA node; pages, WAL, and workers all NUMA-local; default, P99-optimized) or `cross` (DB spans all NUMA nodes; cross-NUMA traffic accepted; throughput-optimized).
+  * The combined "**latency stack**" (default: `physical` + `single` + NUMA-local arenas + kernel isolation) gives flat P99. The "**throughput stack**" (`logical` + `cross`) gives maximum aggregate CPU utilization. Mixed: some DBs on the same cluster can be `single`, others `cross`.
+* **Built-in Connection Scaling:** Can natively handle tens of thousands of concurrent connections without memory bloat. Connections are routed least-loaded at accept (within the DB's NUMA constraint), and pinned to their reactor for their lifetime — the borrow checker guarantees zero atomics on per-connection state.
+* **Cooperative Fairness:** Cooperative yielding at vectorized batch boundaries plus a CPU-deadline yield keeps OLTP p99 flat even when OLAP queries share the core. A reactor-stall detector logs any task that runs too long without yielding.
 * **Result:** Maximizes CPU cache locality, drastically improves query performance, and entirely eliminates the operational complexity of running external connection poolers (PgBouncer/Pgpool).
+* **Full design:** see [`docs/runtime-architecture.md`](docs/runtime-architecture.md).
 
 ### 3.3. The "Anti-VACUUM" Engine (In-Place MVCC)
 * **In-Place Updates:** Modifies records directly within their original 8KB data pages, preventing table bloat and write-amplification.
