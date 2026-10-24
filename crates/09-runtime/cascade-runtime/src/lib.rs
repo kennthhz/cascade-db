@@ -4,11 +4,11 @@
 
 #![allow(dead_code)]
 
+pub mod boot;
 pub mod config;
+pub mod pin;
+pub mod topology;
 
+pub use boot::{BootError, Housekeeper, Runtime, Worker};
 pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
-
-/// Runtime entry point. Implementation lands in Phase 4.
-pub struct Runtime {
-    _placeholder: (),
-}
+pub use topology::{AllowedCpuTopology, SyntheticTopology, TopologyError, TopologyProvider};
