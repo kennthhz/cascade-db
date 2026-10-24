@@ -9,10 +9,7 @@
 //! stored verifier keeps only StoredKey/ServerKey — the password (even
 //! hashed) is never kept.
 
-use base64::{
-    engine::general_purpose::STANDARD as B64,
-    Engine as _,
-};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
@@ -70,16 +67,21 @@ impl ScramVerifier {
         if mech != "SCRAM-SHA-256" {
             return Err(ScramError::NotScramSha256);
         }
-        let (iters_salt, keys) = rest.split_once('$').ok_or(ScramError::Malformed("missing key section"))?;
-        let (iters, salt_b64) = iters_salt.split_once(':').ok_or(ScramError::Malformed("missing salt"))?;
+        let (iters_salt, keys) = rest
+            .split_once('$')
+            .ok_or(ScramError::Malformed("missing key section"))?;
+        let (iters, salt_b64) = iters_salt
+            .split_once(':')
+            .ok_or(ScramError::Malformed("missing salt"))?;
         let iters: u32 = iters
             .parse()
             .map_err(|_| ScramError::Malformed("bad iteration count"))?;
         if iters == 0 || iters > 100_000_000 {
             return Err(ScramError::Malformed("iteration count out of range"));
         }
-        let (stored_b64, server_b64) =
-            keys.split_once(':').ok_or(ScramError::Malformed("missing server key"))?;
+        let (stored_b64, server_b64) = keys
+            .split_once(':')
+            .ok_or(ScramError::Malformed("missing server key"))?;
         let salt = B64
             .decode(salt_b64)
             .map_err(|_| ScramError::BadBase64("salt"))?;
@@ -93,7 +95,12 @@ impl ScramVerifier {
             .map_err(|_| ScramError::BadBase64("server key"))?
             .try_into()
             .map_err(|_| ScramError::Malformed("server key must be 32 bytes"))?;
-        Ok(Self { iters, salt, stored_key, server_key })
+        Ok(Self {
+            iters,
+            salt,
+            stored_key,
+            server_key,
+        })
     }
 
     /// Build a verifier from a password (tests and admin tooling; production
@@ -103,7 +110,12 @@ impl ScramVerifier {
         let client_key = hmac(&salted, CLIENT_KEY_LABEL);
         let stored_key: [u8; 32] = Sha256::digest(client_key).into();
         let server_key = hmac(&salted, SERVER_KEY_LABEL);
-        Self { iters, salt: salt.to_vec(), stored_key, server_key }
+        Self {
+            iters,
+            salt: salt.to_vec(),
+            stored_key,
+            server_key,
+        }
     }
 
     /// The PG-format verifier string.
@@ -139,13 +151,14 @@ impl ScramVerifier {
         }
         let auth_message = format!(
             "{},{},{}",
-            inputs.client_first_bare,
-            inputs.server_first,
-            inputs.client_final_without_proof,
+            inputs.client_first_bare, inputs.server_first, inputs.client_final_without_proof,
         );
         let client_signature = hmac(&self.stored_key, auth_message.as_bytes());
         let mut client_key = [0u8; 32];
-        for (c, (p, s)) in client_key.iter_mut().zip(proof.iter().zip(client_signature.iter())) {
+        for (c, (p, s)) in client_key
+            .iter_mut()
+            .zip(proof.iter().zip(client_signature.iter()))
+        {
             *c = p ^ s;
         }
         // Constant-time comparison: no early exit on mismatch.
@@ -190,7 +203,10 @@ mod tests {
     fn reject_non_scram_and_malformed() {
         assert!(ScramVerifier::parse("md5$...").is_err());
         assert!(ScramVerifier::parse("SCRAM-SHA-256$nope").is_err());
-        assert!(ScramVerifier::parse("SCRAM-SHA-256$0:aa$$bb").is_err(), "0 iters");
+        assert!(
+            ScramVerifier::parse("SCRAM-SHA-256$0:aa$$bb").is_err(),
+            "0 iters"
+        );
     }
 
     #[test]

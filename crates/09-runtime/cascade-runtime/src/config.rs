@@ -60,7 +60,10 @@ pub struct ListenConfig {
 
 impl Default for ListenConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: 5432 }
+        Self {
+            host: "127.0.0.1".into(),
+            port: 5432,
+        }
     }
 }
 
@@ -79,7 +82,11 @@ pub struct StallConfig {
 
 impl Default for StallConfig {
     fn default() -> Self {
-        Self { soft_us: 1_000, hard_us: 10_000, kill: false }
+        Self {
+            soft_us: 1_000,
+            hard_us: 10_000,
+            kill: false,
+        }
     }
 }
 
@@ -111,7 +118,10 @@ pub struct AuthConfig {
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self { mode: AuthMode::Trust, users: Vec::new() }
+        Self {
+            mode: AuthMode::Trust,
+            users: Vec::new(),
+        }
     }
 }
 
@@ -168,7 +178,9 @@ pub struct TopologyConfig {
 
 impl Default for TopologyConfig {
     fn default() -> Self {
-        Self { mode: SmtMode::Physical }
+        Self {
+            mode: SmtMode::Physical,
+        }
     }
 }
 
@@ -182,7 +194,9 @@ pub enum ConfigError {
     EmptyWorkerCores,
     #[error("runtime.worker_cores entry for NUMA {numa} has no cores")]
     WorkerWithEmptyCores { numa: u32 },
-    #[error("runtime.worker_cores references NUMA {numa} with no matching runtime.numa_pools entry")]
+    #[error(
+        "runtime.worker_cores references NUMA {numa} with no matching runtime.numa_pools entry"
+    )]
     MissingPool { numa: u32 },
     #[error("runtime.worker_cores lists NUMA {numa} more than once")]
     DuplicateWorkerNuma { numa: u32 },
@@ -227,12 +241,15 @@ pub enum ConfigError {
 impl RuntimeConfig {
     /// Parse a full `cascade.toml` document, taking the `[runtime]` table.
     pub fn from_toml_str(doc: &str) -> Result<Self, ConfigError> {
-        let table: toml::Table = toml::from_str(doc)
-            .map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let section = table.get("runtime").ok_or(ConfigError::MissingRuntimeTable)?;
-        let cfg: RuntimeConfig = section.clone().try_into().map_err(|e: toml::de::Error| {
-            ConfigError::Parse(e.to_string())
-        })?;
+        let table: toml::Table =
+            toml::from_str(doc).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let section = table
+            .get("runtime")
+            .ok_or(ConfigError::MissingRuntimeTable)?;
+        let cfg: RuntimeConfig = section
+            .clone()
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::Parse(e.to_string()))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -274,7 +291,10 @@ impl RuntimeConfig {
         if self.tierc_fanout_wait_ms == 0 {
             return Err(ConfigError::ZeroFanoutWait);
         }
-        if self.stall.soft_us == 0 || self.stall.hard_us == 0 || self.stall.soft_us > self.stall.hard_us {
+        if self.stall.soft_us == 0
+            || self.stall.hard_us == 0
+            || self.stall.soft_us > self.stall.hard_us
+        {
             return Err(ConfigError::StallThresholds {
                 soft_us: self.stall.soft_us,
                 hard_us: self.stall.hard_us,
@@ -325,7 +345,9 @@ impl RuntimeConfig {
             let mut seen_users = Vec::new();
             for user in &self.auth.users {
                 if seen_users.contains(&user.name) {
-                    return Err(ConfigError::DuplicateAuthUser { name: user.name.clone() });
+                    return Err(ConfigError::DuplicateAuthUser {
+                        name: user.name.clone(),
+                    });
                 }
                 seen_users.push(user.name.clone());
             }
@@ -454,7 +476,9 @@ size_mb = 1
     #[test]
     fn duplicate_housekeeper_core_rejected() {
         assert_err(
-            &with_workers("housekeeper_cores = [0, 0]\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n"),
+            &with_workers(
+                "housekeeper_cores = [0, 0]\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n",
+            ),
             &ConfigError::DuplicateHousekeeperCore { core: 0 },
         );
     }
@@ -462,14 +486,19 @@ size_mb = 1
     #[test]
     fn empty_housekeeper_cores_rejected() {
         assert_err(
-            &with_workers("housekeeper_cores = []\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n"),
+            &with_workers(
+                "housekeeper_cores = []\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n",
+            ),
             &ConfigError::EmptyHousekeeperCores,
         );
     }
 
     #[test]
     fn missing_worker_cores_rejected() {
-        assert_err("[runtime]\n[[runtime.numa_pools]]\nnuma = 0\nsize_mb = 1\n", &ConfigError::EmptyWorkerCores);
+        assert_err(
+            "[runtime]\n[[runtime.numa_pools]]\nnuma = 0\nsize_mb = 1\n",
+            &ConfigError::EmptyWorkerCores,
+        );
     }
 
     #[test]
@@ -537,7 +566,9 @@ size_mb = 1
             ("max_conns_per_worker", &ConfigError::ZeroMaxConns),
             ("tierc_fanout_wait_ms", &ConfigError::ZeroFanoutWait),
         ] {
-            let cfg = with_workers(&format!("{key} = 0\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n"));
+            let cfg = with_workers(&format!(
+                "{key} = 0\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n"
+            ));
             assert_err(&cfg, expected);
         }
     }

@@ -33,8 +33,14 @@ fn hot_path_records_the_exact_session_context() {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![allowed[0]],
-        worker_cores: vec![NumaWorkers { numa: 0, cores: vec![allowed[1], allowed[2]] }],
-        numa_pools: vec![NumaPool { numa: 0, size_mb: 1 }],
+        worker_cores: vec![NumaWorkers {
+            numa: 0,
+            cores: vec![allowed[1], allowed[2]],
+        }],
+        numa_pools: vec![NumaPool {
+            numa: 0,
+            size_mb: 1,
+        }],
         ..RuntimeConfig::default()
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).unwrap();
@@ -58,7 +64,8 @@ fn hot_path_records_the_exact_session_context() {
         body.push(0);
     }
     use std::io::{Read, Write};
-    sock.write_all(&(body.len() as i32 + 4).to_be_bytes()).unwrap();
+    sock.write_all(&(body.len() as i32 + 4).to_be_bytes())
+        .unwrap();
     sock.write_all(&body).unwrap();
     // Through ReadyForQuery (housekeeper handshake).
     loop {
@@ -72,12 +79,26 @@ fn hot_path_records_the_exact_session_context() {
         }
     }
 
-    // Two query chunks over the session.
-    for chunk in [b"q1".as_slice(), b"q2".as_slice()] {
-        sock.write_all(chunk).unwrap();
+    // Two queries over the session — each executed statement records the
+    // context it was handed, so the counters must land on the dev key.
+    for _ in 0..2 {
+        let mut payload = "SELECT * FROM debug_table;".as_bytes().to_vec();
+        payload.push(0);
+        sock.write_all(b"Q").unwrap();
+        sock.write_all(&((payload.len() as i32 + 4).to_be_bytes()))
+            .unwrap();
+        sock.write_all(&payload).unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut buf = vec![0u8; chunk.len() + 64];
-        let _ = sock.read(&mut buf).unwrap(); // echo; content irrelevant here
+        loop {
+            let mut hdr = [0u8; 5];
+            sock.read_exact(&mut hdr).unwrap();
+            let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize - 4;
+            let mut reply = vec![0u8; len];
+            sock.read_exact(&mut reply).unwrap();
+            if hdr[0] == b'Z' {
+                break;
+            }
+        }
     }
     drop(sock);
 

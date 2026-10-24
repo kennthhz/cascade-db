@@ -28,7 +28,10 @@ fn client_of(addr: std::net::SocketAddr) -> TcpStream {
 fn accepts_and_hands_off_raw_fds() {
     let loop_ = bind_ephemeral();
     let addr = loop_.local_addr().unwrap();
-    assert!(!loop_.reuses_port().unwrap(), "FR-5: SO_REUSEPORT must NOT be set");
+    assert!(
+        !loop_.reuses_port().unwrap(),
+        "FR-5: SO_REUSEPORT must NOT be set"
+    );
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || loop_.serve(tx));
@@ -39,7 +42,9 @@ fn accepts_and_hands_off_raw_fds() {
     c2.write_all(b"two").unwrap();
 
     let a = rx.recv_timeout(Duration::from_secs(5)).expect("first conn");
-    let b = rx.recv_timeout(Duration::from_secs(5)).expect("second conn");
+    let b = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second conn");
     assert_ne!(a.peer.port(), 0);
     assert_ne!(b.peer.port(), 0);
 
@@ -62,8 +67,11 @@ fn idle_listener_never_wakes() {
     std::thread::spawn(move || loop_.serve(tx));
 
     std::thread::sleep(OBSERVE_WINDOW);
-    assert_eq!(stats.accepted.load(std::sync::atomic::Ordering::Relaxed), 0,
-        "no clients → accept(2) must not have returned even once (FR-5: no busy-wait)");
+    assert_eq!(
+        stats.accepted.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "no clients → accept(2) must not have returned even once (FR-5: no busy-wait)"
+    );
     assert!(rx.try_recv().is_err());
 }
 
@@ -81,8 +89,11 @@ fn wakeup_count_tracks_connections_only() {
     let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
     std::thread::sleep(OBSERVE_WINDOW);
-    assert_eq!(stats.accepted.load(std::sync::atomic::Ordering::Relaxed), 2,
-        "idle time between clients must not add wakeups");
+    assert_eq!(
+        stats.accepted.load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "idle time between clients must not add wakeups"
+    );
 
     let _c3 = client_of(addr);
     let _ = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -108,5 +119,8 @@ fn receiver_gone_closes_fd_and_stops() {
     while !handle.is_finished() && started.elapsed() < Duration::from_secs(5) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert!(handle.is_finished(), "serve() must stop when the router is gone");
+    assert!(
+        handle.is_finished(),
+        "serve() must stop when the router is gone"
+    );
 }

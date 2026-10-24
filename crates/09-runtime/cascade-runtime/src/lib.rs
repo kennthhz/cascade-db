@@ -9,9 +9,11 @@ pub mod boot;
 pub mod config;
 pub mod handoff;
 pub mod pg;
-pub mod router;
 pub mod pin;
+pub mod router;
 pub mod scram;
+pub mod session;
+pub mod sql;
 pub mod tenant;
 pub mod topology;
 

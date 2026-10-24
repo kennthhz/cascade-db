@@ -8,7 +8,7 @@ use std::path::Path;
 use cascade_runtime::{
     config::{NumaPool, NumaWorkers, SmtMode},
     pin,
-    topology::{parse_cpu_list, SysTopology, SyntheticTopology, TopologyError, TopologyProvider},
+    topology::{parse_cpu_list, SyntheticTopology, SysTopology, TopologyError, TopologyProvider},
     BootError, Runtime, RuntimeConfig,
 };
 
@@ -34,7 +34,11 @@ fn single_core_layout() {
 fn smt_pair_layout() {
     let topo = fixture("smt-pairs");
     assert_eq!(topo.online_cpus().unwrap(), vec![0, 1, 2, 3]);
-    assert_eq!(topo.thread_siblings(0), vec![0, 2], "0 and 2 share a physical core");
+    assert_eq!(
+        topo.thread_siblings(0),
+        vec![0, 2],
+        "0 and 2 share a physical core"
+    );
     assert_eq!(topo.thread_siblings(3), vec![1, 3]);
     assert_eq!(topo.numa_node(2), Some(0));
 }
@@ -58,7 +62,10 @@ fn non_contiguous_layout() {
 fn malformed_sibling_list_is_an_error() {
     match SysTopology::from_root(&fixture_root("malformed")) {
         Err(TopologyError::Parse { path, .. }) => {
-            assert!(path.contains("thread_siblings_list"), "names the file: {path}");
+            assert!(
+                path.contains("thread_siblings_list"),
+                "names the file: {path}"
+            );
         }
         other => panic!("expected TopologyError::Parse, got {other:?}"),
     }
@@ -80,7 +87,11 @@ fn offline_cpus_are_not_reported() {
 fn missing_node_tree_degrades_to_numa_unknown() {
     let topo = fixture("no-numa");
     assert_eq!(topo.online_cpus().unwrap(), vec![0, 1]);
-    assert_eq!(topo.numa_node(0), None, "no node/ tree — NUMA unknown, not guessed");
+    assert_eq!(
+        topo.numa_node(0),
+        None,
+        "no node/ tree — NUMA unknown, not guessed"
+    );
 }
 
 #[test]
@@ -93,7 +104,10 @@ fn missing_sys_root_is_an_error() {
 
 #[test]
 fn cpu_list_parser() {
-    assert_eq!(parse_cpu_list("0-3,8,10-11").unwrap(), vec![0, 1, 2, 3, 8, 10, 11]);
+    assert_eq!(
+        parse_cpu_list("0-3,8,10-11").unwrap(),
+        vec![0, 1, 2, 3, 8, 10, 11]
+    );
     assert_eq!(parse_cpu_list("7").unwrap(), vec![7]);
     assert_eq!(parse_cpu_list("").unwrap(), Vec::<u32>::new());
     assert!(parse_cpu_list("x").is_err());
@@ -113,8 +127,14 @@ fn physical_mode_refuses_sibling_assignment() {
     let topo = SyntheticTopology::new([hk, wa, wb]).with_siblings(wa, wb);
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![hk],
-        worker_cores: vec![NumaWorkers { numa: 0, cores: vec![wa, wb] }],
-        numa_pools: vec![NumaPool { numa: 0, size_mb: 1 }],
+        worker_cores: vec![NumaWorkers {
+            numa: 0,
+            cores: vec![wa, wb],
+        }],
+        numa_pools: vec![NumaPool {
+            numa: 0,
+            size_mb: 1,
+        }],
         ..RuntimeConfig::default() // mode = physical
     };
 

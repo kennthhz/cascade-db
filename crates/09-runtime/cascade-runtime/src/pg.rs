@@ -15,10 +15,7 @@ use std::{
     net::TcpStream,
 };
 
-use base64::{
-    engine::general_purpose::STANDARD as B64,
-    Engine as _,
-};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
 use crate::{
     config::{AuthConfig, AuthMode, AuthUser},
@@ -65,7 +62,13 @@ impl AuthPolicy {
                 for AuthUser { name, verifier } in &cfg.users {
                     let parsed = ScramVerifier::parse(verifier)
                         .map_err(|e| format!("user {name:?}: {e}"))?;
-                    users.insert(name.clone(), AuthedUser { name: name.clone(), verifier: parsed });
+                    users.insert(
+                        name.clone(),
+                        AuthedUser {
+                            name: name.clone(),
+                            verifier: parsed,
+                        },
+                    );
                 }
                 Ok(AuthPolicy::ScramSha256(users))
             }
@@ -137,11 +140,7 @@ fn write_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> std::i
     stream.write_all(&buf)
 }
 
-fn reject(
-    stream: &mut TcpStream,
-    code: &'static str,
-    message: &str,
-) -> HandshakeError {
+fn reject(stream: &mut TcpStream, code: &'static str, message: &str) -> HandshakeError {
     // S (severity), C (code), M (message), each cstring, terminated by \0.
     let mut payload = Vec::new();
     payload.push(b'S');
@@ -156,7 +155,10 @@ fn reject(
     payload.push(0);
     payload.push(0);
     let _ = write_message(stream, b'E', &payload);
-    HandshakeError::Rejected { code, message: message.to_owned() }
+    HandshakeError::Rejected {
+        code,
+        message: message.to_owned(),
+    }
 }
 
 /// Read the startup packet (handling SSLRequest by declining), parse params,
@@ -189,7 +191,11 @@ fn read_startup(stream: &mut TcpStream) -> Result<Startup, HandshakeError> {
         }
         let len = u32::from_be_bytes(len_buf);
         if !(8..=MAX_STARTUP_LEN).contains(&len) {
-            return Err(reject(stream, sqlstate::PROTOCOL_VIOLATION, "invalid startup packet length"));
+            return Err(reject(
+                stream,
+                sqlstate::PROTOCOL_VIOLATION,
+                "invalid startup packet length",
+            ));
         }
         let mut body = vec![0u8; len as usize - 4];
         stream.read_exact(&mut body)?;
@@ -212,7 +218,11 @@ fn read_startup(stream: &mut TcpStream) -> Result<Startup, HandshakeError> {
             CANCEL_REQUEST => return Err(HandshakeError::Cancelled),
             PROTOCOL_3_0 => {
                 let params = parse_params(&body[4..]).ok_or_else(|| {
-                    reject(stream, sqlstate::PROTOCOL_VIOLATION, "malformed startup parameters")
+                    reject(
+                        stream,
+                        sqlstate::PROTOCOL_VIOLATION,
+                        "malformed startup parameters",
+                    )
                 })?;
                 return Ok(Startup { params });
             }
@@ -315,7 +325,11 @@ fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), Hands
         ));
     }
     let mech_end = payload.iter().position(|&b| b == 0).ok_or_else(|| {
-        reject(stream, sqlstate::PROTOCOL_VIOLATION, "unterminated mechanism name")
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "unterminated mechanism name",
+        )
     })?;
     let mechanism = std::str::from_utf8(&payload[..mech_end])
         .map_err(|_| reject(stream, sqlstate::PROTOCOL_VIOLATION, "mechanism not utf8"))?;
@@ -330,12 +344,21 @@ fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), Hands
     let initial = read_optional_payload(stream, rest)?;
 
     // 2. client-first-message: gs2 header ("n,," or "y,,"), then bare.
-    let client_first = std::str::from_utf8(&initial)
-        .map_err(|_| reject(stream, sqlstate::PROTOCOL_VIOLATION, "client-first not utf8"))?;
+    let client_first = std::str::from_utf8(&initial).map_err(|_| {
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client-first not utf8",
+        )
+    })?;
     let (gs2_header, client_first_bare) = split_gs2_header(client_first, stream)?;
 
     let client_nonce = parse_attr(client_first_bare, 'r').ok_or_else(|| {
-        reject(stream, sqlstate::PROTOCOL_VIOLATION, "client-first missing nonce")
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client-first missing nonce",
+        )
     })?;
     if parse_attr(client_first_bare, 'm').is_some() {
         return Err(reject(
@@ -364,17 +387,34 @@ fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), Hands
     // 4. SASLResponse: client-final-message.
     let (t, final_payload) = read_message(stream).map_err(io_closed)?;
     if t != b'p' {
-        return Err(reject(stream, sqlstate::PROTOCOL_VIOLATION, "expected SASLResponse"));
+        return Err(reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "expected SASLResponse",
+        ));
     }
-    let client_final = std::str::from_utf8(&final_payload)
-        .map_err(|_| reject(stream, sqlstate::PROTOCOL_VIOLATION, "client-final not utf8"))?;
+    let client_final = std::str::from_utf8(&final_payload).map_err(|_| {
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client-final not utf8",
+        )
+    })?;
 
     // client-final-without-proof is everything before ",p=".
     let Some((client_final_without_proof, proof_b64)) = client_final.rsplit_once(",p=") else {
-        return Err(reject(stream, sqlstate::PROTOCOL_VIOLATION, "client-final missing proof"));
+        return Err(reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client-final missing proof",
+        ));
     };
     let channel_binding = parse_attr(client_final_without_proof, 'c').ok_or_else(|| {
-        reject(stream, sqlstate::PROTOCOL_VIOLATION, "client-final missing channel binding")
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client-final missing channel binding",
+        )
     })?;
     let expected_binding = B64.encode(gs2_header.as_bytes());
     if channel_binding != expected_binding {
@@ -385,7 +425,11 @@ fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), Hands
         ));
     }
     let final_nonce = parse_attr(client_final_without_proof, 'r').ok_or_else(|| {
-        reject(stream, sqlstate::PROTOCOL_VIOLATION, "client-final missing nonce")
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client-final missing nonce",
+        )
     })?;
     if final_nonce != combined_nonce {
         return Err(reject(
@@ -394,8 +438,13 @@ fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), Hands
             "SCRAM nonce mismatch",
         ));
     }
-    let proof = B64.decode(proof_b64)
-        .map_err(|_| reject(stream, sqlstate::PROTOCOL_VIOLATION, "client proof not base64"))?;
+    let proof = B64.decode(proof_b64).map_err(|_| {
+        reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "client proof not base64",
+        )
+    })?;
 
     let server_signature = match user.verifier.verify_exchange(
         AuthMessageInputs {
@@ -445,12 +494,13 @@ fn split_gs2_header<'a>(
 
 /// SASLInitialResponse's initial response may be absent (length -1). Then a
 /// bare SASLResponse with the client-first follows.
-fn read_optional_payload(
-    stream: &mut TcpStream,
-    rest: &[u8],
-) -> Result<Vec<u8>, HandshakeError> {
+fn read_optional_payload(stream: &mut TcpStream, rest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
     if rest.len() < 4 {
-        return Err(reject(stream, sqlstate::PROTOCOL_VIOLATION, "SASLInitialResponse too short"));
+        return Err(reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "SASLInitialResponse too short",
+        ));
     }
     let declared = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
     if declared >= 0 {
@@ -466,7 +516,11 @@ fn read_optional_payload(
     }
     let (t, payload) = read_message(stream).map_err(io_closed)?;
     if t != b'p' {
-        return Err(reject(stream, sqlstate::PROTOCOL_VIOLATION, "expected SASLResponse"));
+        return Err(reject(
+            stream,
+            sqlstate::PROTOCOL_VIOLATION,
+            "expected SASLResponse",
+        ));
     }
     Ok(payload)
 }

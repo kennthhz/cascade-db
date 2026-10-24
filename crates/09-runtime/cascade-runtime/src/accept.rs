@@ -61,7 +61,10 @@ impl AcceptLoop {
                 return Err(io::Error::last_os_error());
             }
         }
-        Ok(Self { listener, stats: Arc::new(AcceptStats::default()) })
+        Ok(Self {
+            listener,
+            stats: Arc::new(AcceptStats::default()),
+        })
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {

@@ -8,6 +8,7 @@
 //! failure (FR-1, FR-2).
 
 use std::{
+    rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc,
@@ -25,7 +26,7 @@ use crate::{
     handoff::Handoff,
     pin::{self, PinError},
     router::Router,
-    tenant::{dev_context, TenantCounters},
+    tenant::TenantCounters,
     topology::{TopologyError, TopologyProvider},
 };
 
@@ -96,12 +97,13 @@ pub enum BootError {
     #[error("worker reactor on core {core} failed to spawn: {message}")]
     WorkerSpawn { core: u32, message: String },
     #[error("pin verification failed for core {core}: {source}")]
-    PinVerify { core: u32, #[source] source: PinError },
-    #[error("housekeeper pins unconfirmed for cores {cores:?} within {deadline_secs:?}")]
-    HousekeeperUnconfirmed {
-        cores: Vec<u32>,
-        deadline_secs: u64,
+    PinVerify {
+        core: u32,
+        #[source]
+        source: PinError,
     },
+    #[error("housekeeper pins unconfirmed for cores {cores:?} within {deadline_secs:?}")]
+    HousekeeperUnconfirmed { cores: Vec<u32>, deadline_secs: u64 },
     #[error("worker pins unconfirmed for cores {cores:?} within {deadline_secs:?}")]
     WorkerUnconfirmed { cores: Vec<u32>, deadline_secs: u64 },
     #[error("physical SMT mode: cores {a} and {b} share a physical core; assign only one of any sibling pair (FR-3, spec §2.4)")]
@@ -167,9 +169,12 @@ impl Runtime {
         }
 
         let housekeepers = spawn_housekeepers(cfg, listener, auth, senders, counters.clone())?;
-        let workers = spawn_workers(cfg, receivers, &counters, &tenant_counters)?;
+        let workers = spawn_workers(cfg, receivers, &counters, &tenant_counters, cfg.batch_rows)?;
 
-        Ok(Runtime { housekeepers, workers })
+        Ok(Runtime {
+            housekeepers,
+            workers,
+        })
     }
 
     pub fn housekeepers(&self) -> &[Housekeeper] {
@@ -247,27 +252,28 @@ fn spawn_housekeepers(
         out.push(Housekeeper { core, join });
     }
     drop(tx); // so a dead thread's disconnect is observable
-    confirm_pins(
-        rx,
-        &cfg.housekeeper_cores,
-        |cores, deadline_secs| BootError::HousekeeperUnconfirmed {
+    confirm_pins(rx, &cfg.housekeeper_cores, |cores, deadline_secs| {
+        BootError::HousekeeperUnconfirmed {
             cores,
             deadline_secs,
-        },
-    )?;
+        }
+    })?;
     Ok(out)
 }
 
 /// Spawn one glommio reactor per worker core, pinned via `Placement::Fixed`.
 /// The reactor verifies its own affinity in-task (FR-2), connects its
 /// handoff-channel receiver, and adopts each handed-off fd onto its own ring
-/// (FR-13). The placeholder session echoes bytes back with the adopting
-/// thread's name — T1.7 replaces it with the real query loop.
+/// (FR-13), where it becomes a Tier A session (FR-14) running the
+/// simple-query loop (FR-16). The debug table is per-reactor: all sessions
+/// on this worker share one `Rc<Table>` — same-thread sharing only, which is
+/// exactly what the `Rc` inside `Session` enforces.
 fn spawn_workers(
     cfg: &RuntimeConfig,
     receivers: Vec<SharedReceiver<Handoff>>,
     counters: &[Arc<AtomicU64>],
     tenant_counters: &[Arc<TenantCounters>],
+    batch_rows: u32,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
@@ -290,10 +296,15 @@ fn spawn_workers(
             .spawn(move || async move {
                 let _ = tx.send((core, pin::verify_core(core)));
                 let handoffs = rx.connect().await;
+                let table = Rc::new(crate::session::Table::new());
                 while let Some(handoff) = handoffs.recv().await {
                     let counter = task_counter.clone();
                     let tenants = task_tenants.clone();
-                    glommio::spawn_local(session_echo(handoff, counter, tenants)).detach();
+                    let table = Rc::clone(&table);
+                    glommio::spawn_local(crate::session::run(
+                        handoff, table, counter, tenants, batch_rows,
+                    ))
+                    .detach();
                 }
             })
             .map_err(|e| BootError::WorkerSpawn {
@@ -311,50 +322,16 @@ fn spawn_workers(
     drop(tx);
     confirm_pins(
         rx,
-        &cfg.worker_cores.iter().flat_map(|w| w.cores.clone()).collect::<Vec<_>>(),
+        &cfg.worker_cores
+            .iter()
+            .flat_map(|w| w.cores.clone())
+            .collect::<Vec<_>>(),
         |cores, deadline_secs| BootError::WorkerUnconfirmed {
             cores,
             deadline_secs,
         },
     )?;
     Ok(out)
-}
-
-/// Placeholder session (T1.7 replaces it with the Tier A query loop): adopt
-/// the fd, echo every read back prefixed with the adopting thread's name —
-/// the name prefix lets tests prove adoption happened on a worker thread.
-/// The tenant context and span are constructed once per session and
-/// *borrowed* through every hot-path call (FR-20/FR-21 — no retrofit).
-async fn session_echo(handoff: Handoff, counter: Arc<AtomicU64>, tenants: Arc<TenantCounters>) {
-    use cascade_telemetry::Span;
-    use futures_lite::{AsyncReadExt, AsyncWriteExt};
-    use std::os::unix::io::FromRawFd;
-    counter.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: the fd crossed exactly once via the shared channel and this
-    // task is its sole owner — adopted onto *this* reactor's ring (I2).
-    let mut stream = unsafe { glommio::net::TcpStream::from_raw_fd(handoff.fd) };
-    let name = std::thread::current().name().unwrap_or("unnamed").to_owned();
-    // Slice scope: the debug engine's fixed dev tenant. T1.7 maps the
-    // session's database to a real context via the catalog.
-    let ctx = dev_context();
-    let span = Span::noop();
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                crate::tenant::debug_hot_path(&ctx, &span, &tenants);
-                let ok = stream.write_all(name.as_bytes()).await.is_ok()
-                    && stream.write_all(&[0]).await.is_ok()
-                    && stream.write_all(&buf[..n]).await.is_ok();
-                if !ok {
-                    break;
-                }
-            }
-        }
-    }
-    drop(stream); // disconnect → FR-15's counter half lands here for now
-    counter.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Collect pin reports: every expected core must report `Ok(())` within the

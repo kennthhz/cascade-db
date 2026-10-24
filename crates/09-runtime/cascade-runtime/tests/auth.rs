@@ -24,7 +24,9 @@ const SECRET: &str = "correct horse battery staple";
 
 /// One-shot server: accept exactly one connection, run the handshake, and
 /// hand the result back for assertions.
-fn serve_one(policy: AuthPolicy) -> io::Result<(String, mpsc::Receiver<Result<(), HandshakeError>>)> {
+fn serve_one(
+    policy: AuthPolicy,
+) -> io::Result<(String, mpsc::Receiver<Result<(), HandshakeError>>)> {
     let listener = AcceptLoop::bind("127.0.0.1", 0)?;
     let port = listener.local_addr()?.port();
     let (conn_tx, conn_rx) = mpsc::channel();
@@ -35,8 +37,8 @@ fn serve_one(policy: AuthPolicy) -> io::Result<(String, mpsc::Receiver<Result<()
             .recv_timeout(Duration::from_secs(10))
             .expect("client connects");
         let mut stream = conn.stream;
-        let result = cascade_runtime::pg::handshake(&mut stream, &policy)
-            .map(|_| ()) as Result<(), HandshakeError>;
+        let result = cascade_runtime::pg::handshake(&mut stream, &policy).map(|_| ())
+            as Result<(), HandshakeError>;
         // Hold the socket open a moment so the client finishes reading its
         // handshake replies before the fd closes.
         let _ = done_tx.send(result);
@@ -49,7 +51,10 @@ fn scram_policy() -> AuthPolicy {
     let verifier = ScramVerifier::for_password(SECRET, salt, 4096).to_verifier();
     AuthPolicy::from_config(&AuthConfig {
         mode: AuthMode::ScramSha256,
-        users: vec![AuthUser { name: ALICE.into(), verifier }],
+        users: vec![AuthUser {
+            name: ALICE.into(),
+            verifier,
+        }],
     })
     .expect("verifier builds")
 }
@@ -70,30 +75,53 @@ fn db_error_code(err: postgres::Error) -> String {
 #[test]
 fn trust_mode_connects() {
     let (url, done) = serve_one(AuthPolicy::Trust).unwrap();
-    let mut client = postgres::Client::connect(&format!("postgres://anybody:ignored@{url}/dev"), postgres::NoTls)
-        .expect("trust mode needs no credentials");
-    client.simple_query("SELECT 1").expect_err("no query loop yet — but handshake completed");
-    assert!(matches!(done.recv_timeout(Duration::from_secs(5)), Ok(Ok(()))));
+    let mut client = postgres::Client::connect(
+        &format!("postgres://anybody:ignored@{url}/dev"),
+        postgres::NoTls,
+    )
+    .expect("trust mode needs no credentials");
+    // This fixture runs only the handshake (no router/worker behind it), so
+    // any query fails — the assertion is that the client got a *complete*
+    // handshake and reached the query phase. The full accept → auth →
+    // handoff → query path is integration-tested in tests/query.rs.
+    client
+        .simple_query("SELECT 1")
+        .expect_err("handshake-only fixture: nothing serves queries");
+    assert!(matches!(
+        done.recv_timeout(Duration::from_secs(5)),
+        Ok(Ok(()))
+    ));
 }
 
 #[test]
 fn scram_mode_connects_with_correct_password() {
     let (url, done) = serve_one(scram_policy()).unwrap();
-    let mut client = postgres::Client::connect(&format!("postgres://{ALICE}:{SECRET}@{url}/dev"), postgres::NoTls)
-        .expect("SCRAM exchange succeeds end-to-end");
+    let mut client = postgres::Client::connect(
+        &format!("postgres://{ALICE}:{SECRET}@{url}/dev"),
+        postgres::NoTls,
+    )
+    .expect("SCRAM exchange succeeds end-to-end");
     let _ = client.simple_query("SELECT 1");
-    assert!(matches!(done.recv_timeout(Duration::from_secs(5)), Ok(Ok(()))));
+    assert!(matches!(
+        done.recv_timeout(Duration::from_secs(5)),
+        Ok(Ok(()))
+    ));
 }
 
 #[test]
 fn scram_wrong_password_rejected_with_28p01() {
     let (url, done) = serve_one(scram_policy()).unwrap();
     let err = connect(&format!("postgres://{ALICE}:wrong-password@{url}/dev"));
-    assert_eq!(db_error_code(err), sqlstate::INVALID_PASSWORD,
-        "rejection must carry SQLSTATE 28P01, not just 'errored'");
+    assert_eq!(
+        db_error_code(err),
+        sqlstate::INVALID_PASSWORD,
+        "rejection must carry SQLSTATE 28P01, not just 'errored'"
+    );
     // The server side must also see the failure, not a hang.
     match done.recv_timeout(Duration::from_secs(5)) {
-        Ok(Err(HandshakeError::Rejected { code, .. })) => assert_eq!(code, sqlstate::INVALID_PASSWORD),
+        Ok(Err(HandshakeError::Rejected { code, .. })) => {
+            assert_eq!(code, sqlstate::INVALID_PASSWORD)
+        }
         other => panic!("expected Rejected(28P01) server-side, got {other:?}"),
     }
 }
@@ -102,7 +130,10 @@ fn scram_wrong_password_rejected_with_28p01() {
 fn scram_unknown_user_rejected_with_28000() {
     let (url, done) = serve_one(scram_policy()).unwrap();
     let err = connect(&format!("postgres://mallory:whatever@{url}/dev"));
-    assert_eq!(db_error_code(err), sqlstate::INVALID_AUTHORIZATION_SPECIFICATION);
+    assert_eq!(
+        db_error_code(err),
+        sqlstate::INVALID_AUTHORIZATION_SPECIFICATION
+    );
     match done.recv_timeout(Duration::from_secs(5)) {
         Ok(Err(HandshakeError::Rejected { code, .. })) => {
             assert_eq!(code, sqlstate::INVALID_AUTHORIZATION_SPECIFICATION)
@@ -117,7 +148,10 @@ fn scram_unknown_user_rejected_with_28000() {
 fn invalid_verifier_fails_policy_build() {
     let cfg = AuthConfig {
         mode: AuthMode::ScramSha256,
-        users: vec![AuthUser { name: "bob".into(), verifier: "not-a-verifier".into() }],
+        users: vec![AuthUser {
+            name: "bob".into(),
+            verifier: "not-a-verifier".into(),
+        }],
     };
     assert!(AuthPolicy::from_config(&cfg).is_err());
 }
@@ -155,8 +189,14 @@ fn unsupported_protocol_version_rejected() {
     sock.read_to_end(&mut reply).unwrap();
     let text = String::from_utf8_lossy(&reply);
     assert!(reply.contains(&b'E'), "expects an error message");
-    assert!(text.contains("0A000"), "error must carry SQLSTATE 0A000: {text:?}");
-    assert!(text.contains("unsupported frontend protocol"), "names the problem: {text:?}");
+    assert!(
+        text.contains("0A000"),
+        "error must carry SQLSTATE 0A000: {text:?}"
+    );
+    assert!(
+        text.contains("unsupported frontend protocol"),
+        "names the problem: {text:?}"
+    );
     let _ = done.recv_timeout(Duration::from_secs(5));
 }
 
@@ -180,16 +220,22 @@ fn ssl_request_declined_then_startup() {
         body.extend_from_slice(field.as_bytes());
         body.push(0);
     }
-    sock.write_all(&(body.len() as i32 + 4).to_be_bytes()).unwrap();
+    sock.write_all(&(body.len() as i32 + 4).to_be_bytes())
+        .unwrap();
     sock.write_all(&body).unwrap();
 
     // Trust → AuthenticationOk ('R' code 0) … then ReadyForQuery 'Z'.
     let mut header = [0u8; 5];
     sock.read_exact(&mut header).unwrap();
     assert_eq!(header[0], b'R');
-    let mut payload = vec![0u8; u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize - 4];
+    let mut payload =
+        vec![0u8; u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize - 4];
     sock.read_exact(&mut payload).unwrap();
-    assert_eq!(&payload[..4], &0i32.to_be_bytes(), "AuthenticationOk code 0");
+    assert_eq!(
+        &payload[..4],
+        &0i32.to_be_bytes(),
+        "AuthenticationOk code 0"
+    );
 
     // Read through to ReadyForQuery.
     loop {

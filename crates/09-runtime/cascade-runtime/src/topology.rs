@@ -10,10 +10,7 @@
 //! A file that *exists but doesn't parse* is an error — kernel truth must not
 //! be guessed at.
 
-use std::{
-    collections::HashMap,
-    path::Path,
-};
+use std::{collections::HashMap, path::Path};
 
 /// Source of truth for what is schedulable on this host.
 pub trait TopologyProvider: Send + Sync {
@@ -65,10 +62,7 @@ pub fn parse_cpu_list(s: &str) -> Result<Vec<u32>, String> {
                 }
                 out.extend(lo..=hi);
             }
-            None => out.push(
-                part.parse()
-                    .map_err(|_| format!("bad cpu id {part:?}"))?,
-            ),
+            None => out.push(part.parse().map_err(|_| format!("bad cpu id {part:?}"))?),
         }
     }
     Ok(out)
@@ -100,17 +94,18 @@ impl SysTopology {
     pub fn from_root(root: &Path) -> Result<Self, TopologyError> {
         let online_path = root.join("cpu/online");
         let online = parse_cpu_list(
-            &read_trimmed(&online_path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!("{} missing: not a Linux sysfs root", online_path.display()),
-                    )
-                } else {
-                    e
-                }
-            })
-            .map_err(TopologyError::Io)?,
+            &read_trimmed(&online_path)
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("{} missing: not a Linux sysfs root", online_path.display()),
+                        )
+                    } else {
+                        e
+                    }
+                })
+                .map_err(TopologyError::Io)?,
         )
         .map_err(|detail| TopologyError::Parse {
             path: online_path.display().to_string(),
@@ -140,7 +135,9 @@ impl SysTopology {
                 let entry = entry?;
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                let Some(node_id) = name.strip_prefix("node").and_then(|s| s.parse::<u32>().ok())
+                let Some(node_id) = name
+                    .strip_prefix("node")
+                    .and_then(|s| s.parse::<u32>().ok())
                 else {
                     continue;
                 };
@@ -158,7 +155,11 @@ impl SysTopology {
             }
         }
 
-        Ok(Self { online, siblings, numa })
+        Ok(Self {
+            online,
+            siblings,
+            numa,
+        })
     }
 }
 

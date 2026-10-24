@@ -71,6 +71,7 @@ toml = "0.8"
 
 # async traits (glommio TcpStream implements futures-io)
 futures-lite = "1"
+static_assertions = "1.1"
 
 # SCRAM-SHA-256 server auth (FR-9)
 hmac   = "0.12"

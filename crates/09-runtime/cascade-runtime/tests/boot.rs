@@ -6,8 +6,7 @@
 
 use cascade_runtime::{
     config::{NumaPool, NumaWorkers},
-    pin,
-    AllowedCpuTopology, BootError, Runtime, RuntimeConfig, SyntheticTopology,
+    pin, AllowedCpuTopology, BootError, Runtime, RuntimeConfig, SyntheticTopology,
 };
 
 /// A config shaped like production: housekeeper on one core, two workers on
@@ -15,8 +14,14 @@ use cascade_runtime::{
 fn test_config(hk: u32, workers: &[u32]) -> RuntimeConfig {
     RuntimeConfig {
         housekeeper_cores: vec![hk],
-        worker_cores: vec![NumaWorkers { numa: 0, cores: workers.to_vec() }],
-        numa_pools: vec![NumaPool { numa: 0, size_mb: 1 }],
+        worker_cores: vec![NumaWorkers {
+            numa: 0,
+            cores: workers.to_vec(),
+        }],
+        numa_pools: vec![NumaPool {
+            numa: 0,
+            size_mb: 1,
+        }],
         ..RuntimeConfig::default()
     }
 }
@@ -32,7 +37,11 @@ fn boots_synthetic_topology_and_verifies_pins() {
 
     let rt = Runtime::boot(&cfg, &topo).expect("boot succeeds on online cores");
 
-    assert_eq!(rt.housekeepers().len(), 1, "one housekeeper thread per housekeeper core");
+    assert_eq!(
+        rt.housekeepers().len(),
+        1,
+        "one housekeeper thread per housekeeper core"
+    );
     assert_eq!(rt.housekeepers()[0].core, allowed[0]);
     assert_eq!(
         rt.workers().iter().map(|w| w.core).collect::<Vec<_>>(),
@@ -90,7 +99,10 @@ fn refuses_core_provider_claims_but_kernel_rejects() {
 #[ignore]
 fn boots_bare_metal() {
     let allowed = pin::current_affinity();
-    assert!(allowed.len() >= 3, "bare-metal boot test needs at least 3 CPUs");
+    assert!(
+        allowed.len() >= 3,
+        "bare-metal boot test needs at least 3 CPUs"
+    );
 
     let topo = AllowedCpuTopology;
     let cfg = test_config(allowed[0], &[allowed[1], allowed[2]]);

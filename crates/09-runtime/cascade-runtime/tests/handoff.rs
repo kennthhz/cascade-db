@@ -2,6 +2,10 @@
 //! counter part). Proves: the fd crosses to a worker, is adopted on the
 //! worker's ring (not the housekeeper's), and the connection counter moves
 //! up on handoff and back to zero on disconnect.
+//!
+//! Since T1.7 the worker runs the Tier A query loop, so "which thread owns
+//! this fd" is observed through `SELECT debug_worker()` — the debug engine
+//! answers with the adopting reactor's thread name.
 
 use std::{
     io::{Read, Write},
@@ -38,8 +42,14 @@ fn boot_two_workers() -> Fixture {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![allowed[0]],
-        worker_cores: vec![NumaWorkers { numa: 0, cores: vec![allowed[1], allowed[2]] }],
-        numa_pools: vec![NumaPool { numa: 0, size_mb: 1 }],
+        worker_cores: vec![NumaWorkers {
+            numa: 0,
+            cores: vec![allowed[1], allowed[2]],
+        }],
+        numa_pools: vec![NumaPool {
+            numa: 0,
+            size_mb: 1,
+        }],
         ..RuntimeConfig::default()
     };
 
@@ -47,11 +57,14 @@ fn boot_two_workers() -> Fixture {
     let port = listener.local_addr().unwrap().port();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default())
         .expect("boot routed");
-    Fixture { addr: format!("127.0.0.1:{port}"), rt }
+    Fixture {
+        addr: format!("127.0.0.1:{port}"),
+        rt,
+    }
 }
 
 /// A raw client that completes the startup handshake and returns the live
-/// stream, ready for the worker-side echo.
+/// stream, ready for worker-side queries.
 fn connect(url: &str, user: &str) -> TcpStream {
     let mut sock = TcpStream::connect(url).expect("connect");
     let mut body = Vec::new();
@@ -60,7 +73,8 @@ fn connect(url: &str, user: &str) -> TcpStream {
         body.extend_from_slice(field.as_bytes());
         body.push(0);
     }
-    sock.write_all(&(body.len() as i32 + 4).to_be_bytes()).unwrap();
+    sock.write_all(&(body.len() as i32 + 4).to_be_bytes())
+        .unwrap();
     sock.write_all(&body).unwrap();
     // Read messages until ReadyForQuery — the handshake runs on the
     // housekeeper before any handoff (FR-9).
@@ -73,40 +87,56 @@ fn connect(url: &str, user: &str) -> TcpStream {
         if hdr[0] == b'Z' {
             break;
         }
-        assert_ne!(hdr[0], b'E', "unexpected error: {}", String::from_utf8_lossy(&payload));
+        assert_ne!(
+            hdr[0],
+            b'E',
+            "unexpected error: {}",
+            String::from_utf8_lossy(&payload)
+        );
     }
     sock
 }
 
-/// Read one echo frame — adopting thread name \0 payload. Segments may
-/// arrive split, so accumulate until the expected payload is complete.
-fn read_echo(sock: &mut TcpStream, written: &[u8]) -> (String, Vec<u8>) {
+/// Simple-protocol Query; collects worker replies up to ReadyForQuery.
+fn query(sock: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+    let mut frame = vec![b'Q'];
+    let mut payload = sql.as_bytes().to_vec();
+    payload.push(0);
+    frame.extend_from_slice(&((payload.len() as i32 + 4).to_be_bytes()));
+    frame.extend_from_slice(&payload);
+    sock.write_all(&frame).unwrap();
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut buf = Vec::new();
-    let (name, payload_start) = loop {
-        let mut chunk = [0u8; 512];
-        let got = sock.read(&mut chunk).expect("echo frame arrives");
-        assert!(got > 0, "connection closed before echo");
-        buf.extend_from_slice(&chunk[..got]);
-        if let Some(nul) = buf.iter().position(|&b| b == 0) {
-            if buf.len() - nul > written.len() {
-                break (String::from_utf8_lossy(&buf[..nul]).into_owned(), nul + 1);
-            }
+    let mut out = Vec::new();
+    loop {
+        let mut hdr = [0u8; 5];
+        sock.read_exact(&mut hdr).expect("reply arrives");
+        let len = u32::from_be_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize - 4;
+        let mut payload = vec![0u8; len];
+        sock.read_exact(&mut payload).unwrap();
+        if hdr[0] == b'Z' {
+            return out;
         }
-    };
-    let echoed = buf[payload_start..payload_start + written.len()].to_vec();
-    assert_eq!(echoed, written, "payload echoed verbatim");
-    (name, echoed)
+        out.push((hdr[0], payload));
+    }
+}
+
+/// First text field of the first DataRow in a reply set.
+fn scalar_text(msgs: &[(u8, Vec<u8>)]) -> String {
+    for (t, p) in msgs {
+        if *t == b'D' {
+            let flen = u32::from_be_bytes(p[2..6].try_into().unwrap()) as usize;
+            return String::from_utf8_lossy(&p[6..6 + flen]).into_owned();
+        }
+    }
+    panic!("no DataRow in reply: {msgs:?}");
 }
 
 #[test]
-fn handoff_echoes_on_a_worker_thread() {
+fn handoff_queries_on_a_worker_thread() {
     let fx = boot_two_workers();
 
     let mut sock = connect(&fx.addr, "alice");
-    sock.write_all(b"ping").unwrap();
-    let (name, echoed) = read_echo(&mut sock, b"ping");
-    assert_eq!(echoed, b"ping");
+    let name = scalar_text(&query(&mut sock, "SELECT debug_worker();"));
 
     // Mutation check (plan T1.5 test review): if the fd were adopted on the
     // housekeeper thread, this name would be cascade-hk-* and the test fails.
@@ -121,17 +151,23 @@ fn least_loaded_routing_spreads_connections() {
     let fx = boot_two_workers();
 
     let mut c1 = connect(&fx.addr, "alice");
-    c1.write_all(b"one").unwrap();
-    let (name1, _) = read_echo(&mut c1, b"one");
+    let name1 = scalar_text(&query(&mut c1, "SELECT debug_worker();"));
 
     // c1 is live: its worker's counter is 1, so the next connection must be
     // routed to the *other* worker.
     let mut c2 = connect(&fx.addr, "bob");
-    c2.write_all(b"two").unwrap();
-    let (name2, _) = read_echo(&mut c2, b"two");
+    let name2 = scalar_text(&query(&mut c2, "SELECT debug_worker();"));
 
-    assert_ne!(name1, name2, "least-loaded routing must pick the idle worker");
-    let loads: Vec<u64> = fx.rt.workers().iter().map(|w| w.active_connections()).collect();
+    assert_ne!(
+        name1, name2,
+        "least-loaded routing must pick the idle worker"
+    );
+    let loads: Vec<u64> = fx
+        .rt
+        .workers()
+        .iter()
+        .map(|w| w.active_connections())
+        .collect();
     assert_eq!(
         loads.iter().filter(|&&l| l >= 1).count(),
         2,
@@ -163,13 +199,27 @@ fn postgres_client_lifecycle_moves_counter() {
     .expect("client connects (auth on housekeeper, then handoff)");
 
     wait_until(
-        || fx.rt.workers().iter().map(|w| w.active_connections()).sum::<u64>() == 1,
+        || {
+            fx.rt
+                .workers()
+                .iter()
+                .map(|w| w.active_connections())
+                .sum::<u64>()
+                == 1
+        },
         "counter to rise to 1",
     );
 
     drop(client);
     wait_until(
-        || fx.rt.workers().iter().map(|w| w.active_connections()).sum::<u64>() == 0,
+        || {
+            fx.rt
+                .workers()
+                .iter()
+                .map(|w| w.active_connections())
+                .sum::<u64>()
+                == 0
+        },
         "counter to fall back to 0",
     );
 }
@@ -187,8 +237,14 @@ fn capacity_cap_refuses_instead_of_overloading() {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![allowed[0]],
-        worker_cores: vec![NumaWorkers { numa: 0, cores: vec![allowed[1]] }],
-        numa_pools: vec![NumaPool { numa: 0, size_mb: 1 }],
+        worker_cores: vec![NumaWorkers {
+            numa: 0,
+            cores: vec![allowed[1]],
+        }],
+        numa_pools: vec![NumaPool {
+            numa: 0,
+            size_mb: 1,
+        }],
         max_conns_per_worker: 1,
         ..RuntimeConfig::default()
     };
@@ -199,17 +255,34 @@ fn capacity_cap_refuses_instead_of_overloading() {
     );
 
     let mut c1 = connect(&addr, "alice");
-    c1.write_all(b"x").unwrap();
-    let _ = read_echo(&mut c1, b"x");
-    wait_until(|| rt.workers()[0].active_connections() == 1, "first conn adopted");
+    let name = scalar_text(&query(&mut c1, "SELECT debug_worker();"));
+    assert!(
+        name.starts_with("cascade-w-"),
+        "first conn adopted and serving"
+    );
+    wait_until(
+        || rt.workers()[0].active_connections() == 1,
+        "first conn counted",
+    );
 
     // Second connection completes the handshake (housekeeper-side) but the
-    // router must refuse it — the socket gets closed without an echo.
+    // router must refuse it — the socket gets closed without a reply. The
+    // write may lose the race with the close (BrokenPipe); either way no
+    // reply may ever arrive.
     let mut c2 = connect(&addr, "bob");
-    c2.write_all(b"y").unwrap();
-    let mut buf = [0u8; 16];
+    let mut frame = vec![b'Q'];
+    let mut payload = b"SELECT debug_worker();".to_vec();
+    payload.push(0);
+    frame.extend_from_slice(&((payload.len() as i32 + 4).to_be_bytes()));
+    frame.extend_from_slice(&payload);
+    let _ = c2.write_all(&frame);
     c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut buf = [0u8; 16];
     let got = c2.read(&mut buf).unwrap_or(0);
-    assert_eq!(got, 0, "refused connection must be closed, not echoed");
-    assert_eq!(rt.workers()[0].active_connections(), 1, "refused conn never adopted");
+    assert_eq!(got, 0, "refused connection must be closed, not answered");
+    assert_eq!(
+        rt.workers()[0].active_connections(),
+        1,
+        "refused conn never adopted"
+    );
 }

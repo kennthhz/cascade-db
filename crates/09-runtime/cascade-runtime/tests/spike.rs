@@ -44,7 +44,11 @@ fn hello_executor_pinned() {
         current_affinity()
     });
 
-    assert_eq!(seen, vec![target as u32], "executor thread must run on core {target} only");
+    assert_eq!(
+        seen,
+        vec![target as u32],
+        "executor thread must run on core {target} only"
+    );
 }
 
 #[test]
@@ -67,9 +71,15 @@ fn fd_adoption_smoke() {
         // adopted by any executor — the T1.5 handoff discipline.
         let mut stream = unsafe { glommio::net::TcpStream::from_raw_fd(fd) };
         let mut buf = [0u8; 4];
-        stream.read_exact(&mut buf).await.expect("read from adopted fd");
+        stream
+            .read_exact(&mut buf)
+            .await
+            .expect("read from adopted fd");
         buf
     });
 
-    assert_eq!(&buf, b"ping", "bytes written by the std client must arrive on the adopted fd");
+    assert_eq!(
+        &buf, b"ping",
+        "bytes written by the std client must arrive on the adopted fd"
+    );
 }

@@ -113,13 +113,19 @@ impl Router {
             .make()
             .expect("housekeeper executor");
         ex.run(async move {
-            let policy = AuthPolicy::from_config(&auth)
-                .expect("auth config validated at boot");
+            let policy = AuthPolicy::from_config(&auth).expect("auth config validated at boot");
             let mut routes = Vec::with_capacity(senders.len());
             for (sender, counter) in senders.into_iter().zip(counters) {
-                routes.push(Route { sender: sender.connect().await, counter });
+                routes.push(Route {
+                    sender: sender.connect().await,
+                    counter,
+                });
             }
-            let router = Router { policy, routes, max_conns_per_worker };
+            let router = Router {
+                policy,
+                routes,
+                max_conns_per_worker,
+            };
 
             let (stats, listener) = listener.into_parts();
             for stream in listener.incoming() {

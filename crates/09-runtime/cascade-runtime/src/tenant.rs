@@ -6,13 +6,10 @@
 //! the counters here are the per-tenant tagging the plan asks for — a real
 //! exporter replaces the map in a later phase without touching call sites.
 
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-};
+use std::{collections::HashMap, sync::Mutex};
 
-use cascade_tenant::TenantContext;
 use cascade_telemetry::Span;
+use cascade_tenant::TenantContext;
 use cascade_types::{DatabaseId, TenantId};
 
 /// Per-tenant query counters, tagged by the exact context received — the
@@ -45,7 +42,10 @@ impl TenantCounters {
 /// A1: one fixed-row table). T1.7 maps real database names to contexts via
 /// the catalog.
 pub const fn dev_context() -> TenantContext {
-    TenantContext { db: DatabaseId(0), tenant: None }
+    TenantContext {
+        db: DatabaseId(0),
+        tenant: None,
+    }
 }
 
 /// The hot-path shape every query-path function carries (FR-20/FR-21): data
