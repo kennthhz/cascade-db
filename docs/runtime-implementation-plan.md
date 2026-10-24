@@ -493,7 +493,7 @@ Run on the new/changed tests; findings block the commit.
 
 | # | Ambiguity | Status |
 |---|---|---|
-| A1 | **SQL surface for the slice** — spec defines none. Debug subset: single fixed-row table (`SELECT` projection, `INSERT`, `BEGIN/COMMIT`). Parser: `cascade-pg-parser` if it builds at T1.0, else micro-parser. | Open — resolved at T1.0 |
+| A1 | **SQL surface for the slice** — spec defines none. Debug subset: single fixed-row table (`SELECT` projection, `INSERT`, `BEGIN/COMMIT`). Parser: `cascade-pg-parser` if it builds at T1.0, else micro-parser. | **Resolved (T1.0)** — `cascade-pg-parser` is an unimplemented stub; hand-rolled micro-parser in `cascade-runtime` for T1.7. Glommio pin findings: `Placement::Fixed(usize)` pins a reactor to one CPU id directly; fd adoption is the std `FromRawFd` impl on `glommio::net::TcpStream` (verified working by `tests/spike.rs`). |
 | A2 | **Load metric** — §5.2 defines a composite but no sampling cadence. Slice: 1 s sample interval, EWMA α=0.5 (recorded in T0.1 backfill). | Default set |
 | A3 | **Refusal shape** — §5.2 says "clear error". Ruled PG `53300` + NUMA named (R10). | Ruled R10 |
 | A4 | **Fan-out vs ack ordering** — §8.4 shows ack after all stores; a stalled reactor would stall DDL. Ruled bounded wait + lazy adoption (R11); flagged as a deliberate spec deviation-with-safety-valve. | Ruled R11 |

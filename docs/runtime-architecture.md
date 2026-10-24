@@ -648,7 +648,7 @@ These are deliberately deferred. Each is small enough to resolve when the releva
 
 | Question | Where it lives |
 |---|---|
-| Specific Glommio version + any required forks; must support adopting an existing fd into a ring (connection handoff, §5.1). → **Interim ruling 2026-10-24:** pin 0.9.x, no forks (plan R3); the ADR at first real code confirms the fd-adoption API. | Future ADR alongside the runtime crate's first real code. |
+| Specific Glommio version + any required forks; must support adopting an existing fd into a ring (connection handoff, §5.1). → **Resolved 2026-10-24:** glommio 0.9.0 pinned, no forks (plan R3); fd adoption verified by `cascade-runtime/tests/spike.rs` — `glommio::net::TcpStream` adopts a `std` fd via the std `FromRawFd` impl, and `Placement::Fixed(usize)` pins a reactor to one CPU id. | Runtime crate (spike committed). |
 | CPU topology discovery: `hwloc-rs` vs hand-rolled `/sys` parser. → **Resolved 2026-10-24:** hand-rolled `/sys` parser behind a `TopologyProvider` trait, no C deps (plan R4). | Runtime crate. |
 | Concurrent hash map for BPM page table: `flurry` vs `scc` vs hand-rolled. | BPM crate ADR. |
 | Reactor stall detection plumbing — sampler thread on housekeeper vs in-band per-reactor self-reporting. → **Resolved 2026-10-24:** per-reactor counters, housekeeper polls them (plan A15; matches §9's assumed row). | Runtime crate. |
