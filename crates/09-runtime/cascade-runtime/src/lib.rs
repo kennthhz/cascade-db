@@ -7,7 +7,9 @@
 pub mod accept;
 pub mod boot;
 pub mod config;
+pub mod handoff;
 pub mod pg;
+pub mod router;
 pub mod pin;
 pub mod scram;
 pub mod topology;

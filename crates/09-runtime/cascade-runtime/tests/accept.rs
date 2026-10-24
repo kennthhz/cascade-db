@@ -8,11 +8,7 @@ use std::{
     time::Duration,
 };
 
-use cascade_runtime::{
-    config::{NumaPool, NumaWorkers},
-    pin,
-    AcceptLoop, Runtime, RuntimeConfig, SyntheticTopology,
-};
+use cascade_runtime::AcceptLoop;
 
 /// A short wait used only to *observe absence* of wakeups. A busy-wait loop
 /// would rack up thousands of counts in this window; a correct blocking
@@ -113,34 +109,4 @@ fn receiver_gone_closes_fd_and_stops() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(handle.is_finished(), "serve() must stop when the router is gone");
-}
-
-/// Full boot integration: housekeeper core serves the listener.
-#[test]
-fn booted_housekeeper_serves_connections() {
-    let mut allowed = pin::current_affinity();
-    assert!(allowed.len() >= 3, "needs at least 3 CPUs");
-    allowed.truncate(3);
-
-    let topo = SyntheticTopology::new(allowed.iter().copied());
-    let cfg = RuntimeConfig {
-        housekeeper_cores: vec![allowed[0]],
-        worker_cores: vec![NumaWorkers { numa: 0, cores: vec![allowed[1], allowed[2]] }],
-        numa_pools: vec![NumaPool { numa: 0, size_mb: 1 }],
-        ..RuntimeConfig::default()
-    };
-
-    let listener = bind_ephemeral();
-    let addr = listener.local_addr().unwrap();
-    let (tx, rx) = mpsc::channel();
-    let _rt = Runtime::boot_with_listener(&cfg, &topo, Some((listener, tx)))
-        .expect("boot with listener");
-
-    let mut c = client_of(addr);
-    c.write_all(b"ping").unwrap();
-    let conn = rx.recv_timeout(Duration::from_secs(5)).expect("conn from booted housekeeper");
-    let mut s = conn.stream;
-    let mut buf = [0u8; 4];
-    s.read_exact(&mut buf).unwrap();
-    assert_eq!(&buf, b"ping");
 }

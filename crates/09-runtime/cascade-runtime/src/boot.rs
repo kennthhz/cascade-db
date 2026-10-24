@@ -8,15 +8,23 @@
 //! failure (FR-1, FR-2).
 
 use std::{
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc,
+    },
     time::Duration,
 };
 
-use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
+use glommio::{
+    channels::shared_channel::{new_bounded, SharedReceiver, SharedSender},
+    ExecutorJoinHandle, LocalExecutorBuilder, Placement,
+};
 
 use crate::{
-    config::{RuntimeConfig, SmtMode},
+    config::{AuthConfig, RuntimeConfig, SmtMode},
+    handoff::Handoff,
     pin::{self, PinError},
+    router::Router,
     topology::{TopologyError, TopologyProvider},
 };
 
@@ -39,7 +47,16 @@ pub struct Housekeeper {
 pub struct Worker {
     pub numa: u32,
     pub core: u32,
+    counter: Arc<AtomicU64>,
     join: ExecutorJoinHandle<()>,
+}
+
+impl Worker {
+    /// Live connections on this reactor — the same counter the router reads
+    /// for least-loaded routing (FR-11 count component; FR-15 decrement).
+    pub fn active_connections(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for Runtime {
@@ -93,16 +110,19 @@ impl Runtime {
         cfg: &RuntimeConfig,
         topology: &dyn TopologyProvider,
     ) -> Result<Runtime, BootError> {
-        Runtime::boot_with_listener(cfg, topology, None)
+        Runtime::boot_routed(cfg, topology, None, AuthConfig::default())
     }
 
-    /// Boot with the housekeeper serving the one listening socket (spec §5.1,
-    /// FR-5): the first housekeeper core runs the blocking accept loop and
-    /// delivers each connection to `conns` (the router lands in T1.5).
-    pub fn boot_with_listener(
+    /// Boot with the full connection path (spec §5.1): the first housekeeper
+    /// accepts, authenticates (FR-9, before routing), and hands each
+    /// connection to the least-loaded worker as a bare fd (FR-13); the worker
+    /// adopts it onto its own ring. Per-worker channels and counters are
+    /// created here in config order.
+    pub fn boot_routed(
         cfg: &RuntimeConfig,
         topology: &dyn TopologyProvider,
-        listener: Option<(crate::accept::AcceptLoop, mpsc::Sender<crate::accept::AcceptedConn>)>,
+        listener: Option<crate::accept::AcceptLoop>,
+        auth: AuthConfig,
     ) -> Result<Runtime, BootError> {
         let online = topology.online_cpus()?;
 
@@ -123,8 +143,22 @@ impl Runtime {
 
         check_smt_mode(cfg, topology)?;
 
-        let housekeepers = spawn_housekeepers(cfg, listener)?;
-        let workers = spawn_workers(cfg)?;
+        // One handoff channel + one live-connection counter per worker,
+        // in config order. The router reads the counters; the workers own
+        // the receivers.
+        let n_workers: usize = cfg.worker_cores.iter().map(|w| w.cores.len()).sum();
+        let mut senders = Vec::with_capacity(n_workers);
+        let mut receivers = Vec::with_capacity(n_workers);
+        let mut counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            let (tx, rx) = new_bounded::<Handoff>(1024);
+            senders.push(tx);
+            receivers.push(rx);
+            counters.push(Arc::new(AtomicU64::new(0)));
+        }
+
+        let housekeepers = spawn_housekeepers(cfg, listener, auth, senders, counters.clone())?;
+        let workers = spawn_workers(cfg, receivers, &counters)?;
 
         Ok(Runtime { housekeepers, workers })
     }
@@ -165,22 +199,26 @@ pub fn check_smt_mode(
 /// Spawn one `std::thread` per housekeeper core (R5); each pins itself and
 /// reports. Boot fails unless every report arrives within the deadline and
 /// matches its core. When a listener is given, the *first* housekeeper core
-/// serves it (spec §5.1: one socket, one housekeeper); the rest park.
+/// runs the router loop (accept → auth → handoff); the rest park.
 fn spawn_housekeepers(
     cfg: &RuntimeConfig,
-    listener: Option<(crate::accept::AcceptLoop, mpsc::Sender<crate::accept::AcceptedConn>)>,
+    listener: Option<crate::accept::AcceptLoop>,
+    auth: AuthConfig,
+    senders: Vec<SharedSender<Handoff>>,
+    counters: Vec<Arc<AtomicU64>>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
-    let mut serving = listener;
+    let max_conns = cfg.max_conns_per_worker;
+    let mut serving = listener.map(|l| (l, auth, senders, counters));
     for &core in &cfg.housekeeper_cores {
         let tx = tx.clone();
         let body: Box<dyn FnOnce() + Send> = match serving.take() {
-            Some((loop_, conns)) => Box::new(move || {
-                // Pin first; the accept loop then blocks in accept(2) —
-                // sleeping between events (FR-5).
+            Some((loop_, auth, senders, counters)) => Box::new(move || {
+                // Pin first; then accept (blocking — sleeps between
+                // events, FR-5) → authenticate → hand off.
                 let _ = tx.send((core, pin::pin_current(core)));
-                loop_.serve(conns);
+                Router::serve(loop_, auth, senders, counters, max_conns);
             }),
             None => Box::new(move || {
                 let _ = tx.send((core, pin::pin_current(core)));
@@ -212,31 +250,47 @@ fn spawn_housekeepers(
 }
 
 /// Spawn one glommio reactor per worker core, pinned via `Placement::Fixed`.
-/// The reactor verifies its own affinity in-task — boot refuses if the pin
-/// did not stick (FR-2) — then parks; the ring stays serviced while parked,
-/// which is how accept loops and sessions will live here from T1.3/T1.7.
-fn spawn_workers(cfg: &RuntimeConfig) -> Result<Vec<Worker>, BootError> {
+/// The reactor verifies its own affinity in-task (FR-2), connects its
+/// handoff-channel receiver, and adopts each handed-off fd onto its own ring
+/// (FR-13). The placeholder session echoes bytes back with the adopting
+/// thread's name — T1.7 replaces it with the real query loop.
+fn spawn_workers(
+    cfg: &RuntimeConfig,
+    receivers: Vec<SharedReceiver<Handoff>>,
+    counters: &[Arc<AtomicU64>],
+) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
-    for workers in &cfg.worker_cores {
-        for &core in &workers.cores {
-            let tx = tx.clone();
-            let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
-                .name(&format!("cascade-w-{core}"))
-                .spawn(move || async move {
-                    let _ = tx.send((core, pin::verify_core(core)));
-                    std::future::pending::<()>().await;
-                })
-                .map_err(|e| BootError::WorkerSpawn {
-                    core,
-                    message: e.to_string(),
-                })?;
-            out.push(Worker {
-                numa: workers.numa,
+    let per_core: Vec<(u32, u32)> = cfg
+        .worker_cores
+        .iter()
+        .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
+        .collect();
+    for (((numa, core), rx), counter) in
+        per_core.into_iter().zip(receivers).zip(counters.iter())
+    {
+        let tx = tx.clone();
+        let task_counter = Arc::clone(counter);
+        let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
+            .name(&format!("cascade-w-{core}"))
+            .spawn(move || async move {
+                let _ = tx.send((core, pin::verify_core(core)));
+                let handoffs = rx.connect().await;
+                while let Some(handoff) = handoffs.recv().await {
+                    let counter = task_counter.clone();
+                    glommio::spawn_local(session_echo(handoff, counter)).detach();
+                }
+            })
+            .map_err(|e| BootError::WorkerSpawn {
                 core,
-                join,
-            });
-        }
+                message: e.to_string(),
+            })?;
+        out.push(Worker {
+            numa,
+            core,
+            counter: Arc::clone(counter),
+            join,
+        });
     }
     drop(tx);
     confirm_pins(
@@ -248,6 +302,35 @@ fn spawn_workers(cfg: &RuntimeConfig) -> Result<Vec<Worker>, BootError> {
         },
     )?;
     Ok(out)
+}
+
+/// Placeholder session (T1.7 replaces it with the Tier A query loop): adopt
+/// the fd, echo every read back prefixed with the adopting thread's name —
+/// the name prefix lets tests prove adoption happened on a worker thread.
+async fn session_echo(handoff: Handoff, counter: Arc<AtomicU64>) {
+    use futures_lite::{AsyncReadExt, AsyncWriteExt};
+    use std::os::unix::io::FromRawFd;
+    counter.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: the fd crossed exactly once via the shared channel and this
+    // task is its sole owner — adopted onto *this* reactor's ring (I2).
+    let mut stream = unsafe { glommio::net::TcpStream::from_raw_fd(handoff.fd) };
+    let name = std::thread::current().name().unwrap_or("unnamed").to_owned();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let ok = stream.write_all(name.as_bytes()).await.is_ok()
+                    && stream.write_all(&[0]).await.is_ok()
+                    && stream.write_all(&buf[..n]).await.is_ok();
+                if !ok {
+                    break;
+                }
+            }
+        }
+    }
+    drop(stream); // disconnect → FR-15's counter half lands here for now
+    counter.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Collect pin reports: every expected core must report `Ok(())` within the

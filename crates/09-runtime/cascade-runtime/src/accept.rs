@@ -72,6 +72,12 @@ impl AcceptLoop {
         &self.stats
     }
 
+    /// Take the stats and the underlying std listener out — the router
+    /// (T1.5) drives the accept loop itself.
+    pub fn into_parts(self) -> (Arc<AcceptStats>, TcpListener) {
+        (self.stats, self.listener)
+    }
+
     /// True iff the socket has `SO_REUSEPORT` — exists so the test can prove
     /// the negative (FR-5).
     pub fn reuses_port(&self) -> io::Result<bool> {
