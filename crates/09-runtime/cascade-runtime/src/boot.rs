@@ -15,7 +15,7 @@ use std::{
 use glommio::{ExecutorJoinHandle, LocalExecutorBuilder, Placement};
 
 use crate::{
-    config::RuntimeConfig,
+    config::{RuntimeConfig, SmtMode},
     pin::{self, PinError},
     topology::{TopologyError, TopologyProvider},
 };
@@ -80,6 +80,8 @@ pub enum BootError {
     },
     #[error("worker pins unconfirmed for cores {cores:?} within {deadline_secs:?}")]
     WorkerUnconfirmed { cores: Vec<u32>, deadline_secs: u64 },
+    #[error("physical SMT mode: cores {a} and {b} share a physical core; assign only one of any sibling pair (FR-3, spec §2.4)")]
+    SmtSiblingsAssigned { a: u32, b: u32 },
 }
 
 impl Runtime {
@@ -107,6 +109,8 @@ impl Runtime {
             }
         }
 
+        check_smt_mode(cfg, topology)?;
+
         let housekeepers = spawn_housekeepers(cfg)?;
         let workers = spawn_workers(cfg)?;
 
@@ -120,6 +124,30 @@ impl Runtime {
     pub fn workers(&self) -> &[Worker] {
         &self.workers
     }
+}
+
+/// FR-3: in `physical` SMT mode (the default) one worker per *physical* core
+/// — HT siblings are excluded from every role, so a config assigning two
+/// sibling cores anywhere refuses boot. `logical` mode has no such rule.
+pub fn check_smt_mode(
+    cfg: &RuntimeConfig,
+    topology: &dyn TopologyProvider,
+) -> Result<(), BootError> {
+    if cfg.topology.mode != SmtMode::Physical {
+        return Ok(());
+    }
+    let mut assigned: Vec<u32> = cfg.housekeeper_cores.clone();
+    for workers in &cfg.worker_cores {
+        assigned.extend_from_slice(&workers.cores);
+    }
+    for (i, &a) in assigned.iter().enumerate() {
+        for &b in &assigned[i + 1..] {
+            if topology.thread_siblings(a).contains(&b) {
+                return Err(BootError::SmtSiblingsAssigned { a, b });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Spawn one `std::thread` per housekeeper core (R5); each pins itself and
