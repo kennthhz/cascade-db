@@ -22,7 +22,7 @@ Thread-per-core executor over Glommio. Glues the kernel-bypass I/O model (§3.1)
 3. **CPU pinning is real** (`sched_setaffinity` on Linux).
 4. **NUMA-local allocation** for every per-reactor structure. Cross-socket hot-path reads are bugs.
 5. **`submit_to` is not used on the OLTP query hot path.** Cross-reactor RPCs are for Tier C writes and background coordination only.
-6. **Cooperative yield contract:** every long-running operator yields at batch boundaries and calls `yield_if_needed()` against the CPU deadline.
+6. **Cooperative yield contract:** every long-running operator yields at batch boundaries and calls the runtime's `yield_point()` against the CPU deadline. (Glommio's `yield_if_needed()` only yields when the run queue is non-empty — the deadline tracking is ours; spec §7.1.)
 
 ## State Tier Model (design spec §4)
 

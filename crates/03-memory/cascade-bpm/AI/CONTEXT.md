@@ -19,7 +19,7 @@ The buffer pool manager. Sits between the storage layer (`cascade-storage`) and 
 | DB affinity (from catalog) | Page placement | Lookup path |
 |---|---|---|
 | `single` (bound to NUMA *k*) | Allocate from NUMA *k*'s BPM only. | `bpm[k].lookup(page_id)` — NUMA-local. |
-| `cross` | Distribute across all NUMAs (round-robin or `hash(PageId) mod num_numas` — TBD, see runtime spec §11). | Check expected NUMA by placement function; cross-NUMA load accepted. |
+| `cross` | Distribute across all NUMAs via `hash(PageId) mod num_numas` (decided — runtime spec §2.5.1 / §8.1: placement is derivable from `PageId`). | Compute home NUMA via the placement function; single direct lookup; cross-NUMA load accepted. |
 
 The BPM does **not** decide affinity; it reads the policy from the catalog (Tier C). The catalog publishes `pg_database.datnumaffinity` + `datnumanode` per DB.
 
@@ -50,5 +50,4 @@ The BPM does **not** decide affinity; it reads the policy from the catalog (Tier
 
 - Eviction algorithm within each NUMA pool: LRU-K vs CLOCK-sweep. Lean LRU-K for OLTP; CLOCK lower overhead.
 - Concrete concurrent hash map: `flurry` vs `scc` vs hand-rolled sharded array. ADR when implementation lands.
-- `cross`-affinity placement function: round-robin vs hash. Tradeoff: hash gives deterministic page-to-NUMA mapping (better for repeat access); RR gives uniform pool fill.
 - How the columnar engine (§3.7) plugs in — same per-NUMA BPM with a separate page-kind tag, or its own pool layer.

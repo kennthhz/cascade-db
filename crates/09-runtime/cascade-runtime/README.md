@@ -15,7 +15,7 @@ Layer **09-runtime**. Implements pillar §3.2 — pins one worker thread per CPU
 - `Runtime::start(config)` — spawns N workers (one per pinned core), housekeeper on core 0.
 - `submit_to(core, async fn) -> T` — cross-reactor coordinator primitive for Tier C writes and background work. Never used on the OLTP hot path.
 - `current_core_id()` / `current_reactor()` — context queries for the active reactor.
-- `yield_if_needed().await` — cooperative yield, no-op unless the CPU deadline has been exceeded.
+- `yield_point().await` — cooperative yield: fires when the reactor-local CPU deadline (default 500 µs, spec D7) has been exceeded; below the deadline it delegates to Glommio's `yield_if_needed()` (no-op unless the run queue is non-empty). Glommio's primitive alone does not track CPU time (spec §7.1).
 - Connection accept + dispatch (housekeeper-side) and the per-reactor handoff.
 
 ## Dependencies
