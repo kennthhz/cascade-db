@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1380" height="520" viewBox="0 0 1380 520">
+<rect width="1380" height="520" fill="white"/>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5f6368"/></marker></defs>
+<text x="24" y="30" font-family="DejaVu Sans, sans-serif" font-size="15" fill="#1a1a1a" text-anchor="start" font-weight="bold">Cascade DB — OLTP hot-path data flow (§7–§8)</text>
+<rect x="30" y="70" width="180" height="60" rx="9" fill="#e8f0fe" stroke="#4a6fa5" stroke-width="1.4"/>
+<text x="120.0" y="96.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">SQL statement</text>
+<text x="120.0" y="112.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">(Tier A, !Send)</text>
+<rect x="250" y="66" width="230" height="64" rx="9" fill="#e8f0fe" stroke="#4a6fa5" stroke-width="1.4"/>
+<text x="365.0" y="94.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">Executor</text>
+<text x="365.0" y="110.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">vectorized operators</text>
+<rect x="250" y="196" width="230" height="52" rx="9" fill="#ffffff" stroke="#5f6368" stroke-width="1.4" stroke-dasharray="5,4"/>
+<text x="365.0" y="218.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">yield_point()</text>
+<text x="365.0" y="234.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">500 µs deadline (§7.1)</text>
+<rect x="520" y="66" width="370" height="64" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="705.0" y="94.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">BPM lookup (§8.1)</text>
+<text x="705.0" y="110.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">single: BPMs[k] · cross: hash(PageId) mod num_numas</text>
+<rect x="960" y="70" width="220" height="60" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="1070.0" y="96.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">pin frame</text>
+<text x="1070.0" y="112.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">(PageGuard RAII)</text>
+<rect x="520" y="200" width="370" height="52" rx="9" fill="#ffffff" stroke="#5f6368" stroke-width="1.4" stroke-dasharray="5,4"/>
+<text x="705.0" y="222.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">cache miss → PageStore read</text>
+<text x="705.0" y="238.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">on this reactor&#x27;s own io_uring ring</text>
+<rect x="1240" y="70" width="120" height="64" rx="9" fill="#ffffff" stroke="#5f6368" stroke-width="1.4"/>
+<text x="1300.0" y="90.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">rows →</text>
+<text x="1300.0" y="106.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">batches →</text>
+<text x="1300.0" y="122.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">results</text>
+<rect x="140" y="322" width="330" height="64" rx="9" fill="#e8f0fe" stroke="#4a6fa5" stroke-width="1.4"/>
+<text x="305.0" y="350.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">COMMIT — append_wal (§8.2)</text>
+<text x="305.0" y="366.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">reserve LSN → caller fills record</text>
+<rect x="540" y="322" width="250" height="64" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="665.0" y="350.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">flush_wal</text>
+<text x="665.0" y="366.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">leader election via atomic CAS</text>
+<rect x="860" y="322" width="270" height="64" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="995.0" y="350.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">io_uring fdatasync</text>
+<text x="995.0" y="366.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">on the leader&#x27;s own ring</text>
+<rect x="1200" y="322" width="160" height="64" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="1280.0" y="350.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">≥ filled watermark</text>
+<text x="1280.0" y="366.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">→ commit ack</text>
+<rect x="560" y="446" width="430" height="48" rx="9" fill="#ffffff" stroke="#5f6368" stroke-width="1.4" stroke-dasharray="5,4"/>
+<text x="775.0" y="466.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">page writeback (shard-home core)</text>
+<text x="775.0" y="482.25" font-family="DejaVu Sans, sans-serif" font-size="12.5" fill="#1a1a1a" text-anchor="middle">I7 WAL-before-data: only after WAL durable</text>
+<polyline points="210,100 250,100" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<polyline points="480,98 520,98" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<polyline points="365,130 365,196" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="375" y="168" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">every batch boundary</text>
+<polyline points="700,130 700,200" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="708" y="170" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">miss</text>
+<polyline points="890,98 960,98" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="915" y="92" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">hit</text>
+<polyline points="890,226 1070,226 1070,130" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="1080" y="184" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">page data</text>
+<polyline points="1180,100 1240,100" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<polyline points="480,118 505,118 505,290 200,290 200,322" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="513" y="278" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">to commit path</text>
+<polyline points="470,354 540,354" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<polyline points="790,354 860,354" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<polyline points="1130,354 1200,354" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<polyline points="305,386 305,470 560,470" fill="none" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ah)"/>
+<text x="320" y="464" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">dirty page flush gated on WAL durability</text>
+</svg>

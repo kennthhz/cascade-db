@@ -687,6 +687,7 @@ The invariants below are the *enforcement contract* for every crate in the works
 - [`AI/GLOSSARY.md`](../AI/GLOSSARY.md) — shared types.
 - [`crates/09-runtime/cascade-runtime/`](../crates/09-runtime/cascade-runtime/) — the crate this design governs.
 - [`crates/09-runtime/cascade-tenant/`](../crates/09-runtime/cascade-tenant/) — Tier A `TenantContext`.
+- [Runtime architecture diagrams](runtime-architecture-diagrams.md) — visual companion (components, hot path, workflow sequences); rendered figures in [`assets/`](assets/).
 - Glommio: https://github.com/DataDog/glommio
 - ScyllaDB / Seastar reactor model: https://seastar.io/shared-nothing/
 - ArcSwap: https://docs.rs/arc-swap

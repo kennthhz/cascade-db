@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="400" viewBox="0 0 1240 400">
+<rect width="1240" height="400" fill="white"/>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5f6368"/></marker></defs>
+<text x="24" y="30" font-family="DejaVu Sans, sans-serif" font-size="15" fill="#1a1a1a" text-anchor="start" font-weight="bold">Cascade DB — workflow: Tier C catalog write (§6.4, §8.4)</text>
+<rect x="80" y="44" width="180" height="40" rx="9" fill="#e8f0fe" stroke="#4a6fa5" stroke-width="1.4"/>
+<text x="170.0" y="68.08" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">Worker reactor</text>
+<line x1="170" y1="84" x2="170" y2="370" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<rect x="470" y="44" width="180" height="40" rx="9" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.4"/>
+<text x="560.0" y="68.08" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">Housekeeper</text>
+<line x1="560" y1="84" x2="560" y2="370" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<rect x="960" y="44" width="180" height="40" rx="9" fill="#f8fafd" stroke="#9aa0a6" stroke-width="1.4"/>
+<text x="1050.0" y="68.08" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">All reactors</text>
+<line x1="1050" y1="84" x2="1050" y2="370" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<polyline points="170,116 560,116" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="365.0" y="109" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">submit_to — catalog change (e.g. CREATE ROLE)</text>
+<polyline points="560,148 594,148 594,172 562,172" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="604" y="164" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">cluster_state.apply() — serialized, single writer</text>
+<polyline points="560,204 594,204 594,228 562,228" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="604" y="220" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">build immutable ClusterSnapshot</text>
+<rect x="480" y="240" width="750" height="66" rx="4" fill="none" stroke="#9aa0a6" stroke-width="1.1" stroke-dasharray="5,4"/>
+<rect x="480" y="240" width="134.8" height="19" rx="4" fill="#ffffff" stroke="#9aa0a6" stroke-width="1.1"/>
+<text x="488" y="254" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#3c4043" text-anchor="start">loop every reactor</text>
+<polyline points="560,282 1050,282" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="805.0" y="275" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">submit_to → ArcSwap::store</text>
+<polyline points="560,340 170,340" fill="none" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ah)"/>
+<text x="540" y="333" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">ack — old snapshot dropped when last reader finishes</text>
+</svg>

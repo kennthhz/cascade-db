@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1290" height="910" viewBox="0 0 1290 910">
+<rect width="1290" height="910" fill="white"/>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5f6368"/></marker></defs>
+<text x="24" y="30" font-family="DejaVu Sans, sans-serif" font-size="15" fill="#1a1a1a" text-anchor="start" font-weight="bold">Cascade DB — workflow: connection lifecycle, query, commit (§5, §7, §8.2)</text>
+<rect x="30" y="44" width="160" height="46" rx="9" fill="#ffffff" stroke="#5f6368" stroke-width="1.4"/>
+<text x="110.0" y="71.08" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">PG client</text>
+<line x1="110" y1="90" x2="110" y2="885" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<rect x="270" y="44" width="160" height="46" rx="9" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.4"/>
+<text x="350.0" y="63.33" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">Housekeeper</text>
+<text x="350.0" y="78.83" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">cores 0..H</text>
+<line x1="350" y1="90" x2="350" y2="885" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<rect x="560" y="44" width="160" height="46" rx="9" fill="#e8f0fe" stroke="#4a6fa5" stroke-width="1.4"/>
+<text x="640.0" y="63.33" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">Worker reactor</text>
+<text x="640.0" y="78.83" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">bound NUMA</text>
+<line x1="640" y1="90" x2="640" y2="885" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<rect x="830" y="44" width="160" height="46" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="910.0" y="63.33" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">BPM pool</text>
+<text x="910.0" y="78.83" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">this NUMA</text>
+<line x1="910" y1="90" x2="910" y2="885" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<rect x="1080" y="44" width="160" height="46" rx="9" fill="#e6f4ea" stroke="#2e7d32" stroke-width="1.4"/>
+<text x="1160.0" y="63.33" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">WalWriter</text>
+<text x="1160.0" y="78.83" font-family="DejaVu Sans, sans-serif" font-size="12" fill="#1a1a1a" text-anchor="middle">Arc, per DB</text>
+<line x1="1160" y1="90" x2="1160" y2="885" stroke="#c0c0c0" stroke-width="1.3" stroke-dasharray="4,4"/>
+<polyline points="110,110 350,110" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="230.0" y="103" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">connect + PG startup</text>
+<polyline points="350,142 384,142 384,166 352,166" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="394" y="158" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">auth · resolve DatabaseId (Tier C snapshot)</text>
+<polyline points="350,198 384,198 384,222 352,222" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="394" y="214" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">affinity → least-loaded (§5.2)</text>
+<polyline points="350,254 640,254" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="495.0" y="247" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">hand off RawFd (§5.1)</text>
+<polyline points="640,286 674,286 674,310 642,310" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="684" y="302" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">build connection (Tier A, !Send — pinned)</text>
+<polyline points="110,352 640,352" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="375.0" y="345" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">query</text>
+<polyline points="640,386 910,386" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="648" y="379" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">BPMs[k].lookup(PageId) — pin frame</text>
+<rect x="600" y="402" width="390" height="68" rx="4" fill="none" stroke="#9aa0a6" stroke-width="1.1" stroke-dasharray="5,4"/>
+<rect x="600" y="402" width="101.8" height="19" rx="4" fill="#ffffff" stroke="#9aa0a6" stroke-width="1.1"/>
+<text x="608" y="416" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#3c4043" text-anchor="start">alt page miss</text>
+<polyline points="910,428 876,428 876,452 908,452" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="866" y="444" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="end">PageStore read (R&#x27;s ring)</text>
+<polyline points="910,486 640,486" fill="none" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ah)"/>
+<text x="775.0" y="479" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">page data</text>
+<polyline points="640,512 674,512 674,536 642,536" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="684" y="528" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">execute batches — yield_point() (§7)</text>
+<polyline points="640,560 110,560" fill="none" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ah)"/>
+<text x="375.0" y="553" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">results</text>
+<polyline points="110,594 640,594" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="375.0" y="587" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">COMMIT</text>
+<polyline points="640,628 1160,628" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="648" y="621" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">append_wal — reserve LSN → fill record</text>
+<polyline points="640,662 1160,662" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="648" y="655" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start" font-style="italic">flush_wal(up_to_lsn)</text>
+<polyline points="1160,694 1126,694 1126,718 1158,718" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="1116" y="710" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="end">leader CAS → fdatasync</text>
+<polyline points="1160,752 640,752" fill="none" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ah)"/>
+<text x="1152" y="745" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="end" font-style="italic">durable ≤ filled watermark → notify</text>
+<polyline points="640,786 110,786" fill="none" stroke="#5f6368" stroke-width="1.5" stroke-dasharray="6,4" marker-end="url(#ah)"/>
+<text x="375.0" y="779" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">commit ack</text>
+<polyline points="110,820 640,820" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="375.0" y="813" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="middle" font-style="italic">disconnect</text>
+<polyline points="640,852 674,852 674,876 642,876" fill="none" stroke="#5f6368" stroke-width="1.5" marker-end="url(#ah)"/>
+<text x="684" y="868" font-family="DejaVu Sans, sans-serif" font-size="10.5" fill="#414141" text-anchor="start">abort txn · release pins (§5.4)</text>
+</svg>
