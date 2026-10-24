@@ -12,6 +12,7 @@ pub mod pg;
 pub mod router;
 pub mod pin;
 pub mod scram;
+pub mod tenant;
 pub mod topology;
 
 pub use accept::{AcceptLoop, AcceptStats, AcceptedConn};

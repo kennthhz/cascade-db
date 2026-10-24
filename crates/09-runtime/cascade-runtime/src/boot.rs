@@ -25,6 +25,7 @@ use crate::{
     handoff::Handoff,
     pin::{self, PinError},
     router::Router,
+    tenant::{dev_context, TenantCounters},
     topology::{TopologyError, TopologyProvider},
 };
 
@@ -48,6 +49,7 @@ pub struct Worker {
     pub numa: u32,
     pub core: u32,
     counter: Arc<AtomicU64>,
+    tenant_counters: Arc<TenantCounters>,
     join: ExecutorJoinHandle<()>,
 }
 
@@ -56,6 +58,11 @@ impl Worker {
     /// for least-loaded routing (FR-11 count component; FR-15 decrement).
     pub fn active_connections(&self) -> u64 {
         self.counter.load(Ordering::Relaxed)
+    }
+
+    /// Per-tenant counters recorded by this reactor's sessions (FR-20).
+    pub fn tenant_counters(&self) -> &TenantCounters {
+        &self.tenant_counters
     }
 }
 
@@ -150,15 +157,17 @@ impl Runtime {
         let mut senders = Vec::with_capacity(n_workers);
         let mut receivers = Vec::with_capacity(n_workers);
         let mut counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n_workers);
+        let mut tenant_counters: Vec<Arc<TenantCounters>> = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
             let (tx, rx) = new_bounded::<Handoff>(1024);
             senders.push(tx);
             receivers.push(rx);
             counters.push(Arc::new(AtomicU64::new(0)));
+            tenant_counters.push(Arc::new(TenantCounters::new()));
         }
 
         let housekeepers = spawn_housekeepers(cfg, listener, auth, senders, counters.clone())?;
-        let workers = spawn_workers(cfg, receivers, &counters)?;
+        let workers = spawn_workers(cfg, receivers, &counters, &tenant_counters)?;
 
         Ok(Runtime { housekeepers, workers })
     }
@@ -258,6 +267,7 @@ fn spawn_workers(
     cfg: &RuntimeConfig,
     receivers: Vec<SharedReceiver<Handoff>>,
     counters: &[Arc<AtomicU64>],
+    tenant_counters: &[Arc<TenantCounters>],
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
@@ -266,11 +276,15 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for (((numa, core), rx), counter) in
-        per_core.into_iter().zip(receivers).zip(counters.iter())
+    for ((((numa, core), rx), counter), tenant_counters) in per_core
+        .into_iter()
+        .zip(receivers)
+        .zip(counters.iter())
+        .zip(tenant_counters.iter())
     {
         let tx = tx.clone();
         let task_counter = Arc::clone(counter);
+        let task_tenants = Arc::clone(tenant_counters);
         let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
             .name(&format!("cascade-w-{core}"))
             .spawn(move || async move {
@@ -278,7 +292,8 @@ fn spawn_workers(
                 let handoffs = rx.connect().await;
                 while let Some(handoff) = handoffs.recv().await {
                     let counter = task_counter.clone();
-                    glommio::spawn_local(session_echo(handoff, counter)).detach();
+                    let tenants = task_tenants.clone();
+                    glommio::spawn_local(session_echo(handoff, counter, tenants)).detach();
                 }
             })
             .map_err(|e| BootError::WorkerSpawn {
@@ -289,6 +304,7 @@ fn spawn_workers(
             numa,
             core,
             counter: Arc::clone(counter),
+            tenant_counters: Arc::clone(tenant_counters),
             join,
         });
     }
@@ -307,7 +323,10 @@ fn spawn_workers(
 /// Placeholder session (T1.7 replaces it with the Tier A query loop): adopt
 /// the fd, echo every read back prefixed with the adopting thread's name —
 /// the name prefix lets tests prove adoption happened on a worker thread.
-async fn session_echo(handoff: Handoff, counter: Arc<AtomicU64>) {
+/// The tenant context and span are constructed once per session and
+/// *borrowed* through every hot-path call (FR-20/FR-21 — no retrofit).
+async fn session_echo(handoff: Handoff, counter: Arc<AtomicU64>, tenants: Arc<TenantCounters>) {
+    use cascade_telemetry::Span;
     use futures_lite::{AsyncReadExt, AsyncWriteExt};
     use std::os::unix::io::FromRawFd;
     counter.fetch_add(1, Ordering::Relaxed);
@@ -315,11 +334,16 @@ async fn session_echo(handoff: Handoff, counter: Arc<AtomicU64>) {
     // task is its sole owner — adopted onto *this* reactor's ring (I2).
     let mut stream = unsafe { glommio::net::TcpStream::from_raw_fd(handoff.fd) };
     let name = std::thread::current().name().unwrap_or("unnamed").to_owned();
+    // Slice scope: the debug engine's fixed dev tenant. T1.7 maps the
+    // session's database to a real context via the catalog.
+    let ctx = dev_context();
+    let span = Span::noop();
     let mut buf = [0u8; 4096];
     loop {
         match stream.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                crate::tenant::debug_hot_path(&ctx, &span, &tenants);
                 let ok = stream.write_all(name.as_bytes()).await.is_ok()
                     && stream.write_all(&[0]).await.is_ok()
                     && stream.write_all(&buf[..n]).await.is_ok();
