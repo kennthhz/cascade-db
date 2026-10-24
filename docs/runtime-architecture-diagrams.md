@@ -51,6 +51,10 @@ flowchart TB
 
     FILES["PageStore data files · WAL segment files"]
 
+    style HK stroke-width:3px
+    style W0 stroke-width:3px
+    style W1 stroke-width:3px
+
     CMD -.->|"constrains"| HK
     CMD -.->|"isolates"| N0
     CMD -.->|"isolates"| N1
@@ -147,6 +151,12 @@ sequenceDiagram
 
 ## Notes
 
+- **Border weight encodes what is a thread** (Figure A): a **thick** border marks the only
+  real threads — the housekeeper band (H threads, one per core) and each worker-reactor box
+  (one pinned thread; the box stands for ×W reactors per NUMA). Thin-bordered boxes —
+  Tier A, Tier C replica, BPM pools, WAL writers, files — are memory or data owned or shared
+  by those threads, not threads themselves. The Mermaid source mirrors this with
+  `style … stroke-width:3px` on the same three subgraphs.
 - `Arc<WalWriter>` and `ArcSwap<ClusterSnapshot>` are HTML-escaped (`&lt;`/`&gt;`) inside
   Mermaid **flowchart** labels because Mermaid strips unknown HTML tags; the sequence
   diagrams sidestep this with participant aliases (`WalWriter (Arc, per DB)`).
