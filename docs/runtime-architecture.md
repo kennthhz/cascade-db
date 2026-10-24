@@ -224,7 +224,7 @@ A separate ADR will record the Glommio decision once we've vendored a specific v
 
 - **Owned (Tier A, `!Send`):** connection state machines, query operators, batch buffers, prepared statements, cursors, in-flight session settings.
 - **Borrowed (Tier B / Tier C, via `Arc<…>`):** buffer pool, WAL writers, XID allocators, catalog snapshots. Accessed but not owned.
-- **Private I/O:** `io_uring` ring. No other reactor sees it.
+- **Private I/O:** `io_uring` ring. No other reactor sees it. Ring defaults: queue depth 64, readahead 128 KiB — configurable (implementation-plan ruling A6).
 
 ---
 
@@ -351,9 +351,13 @@ The housekeeper consults the Tier C catalog snapshot to resolve the connection's
 - Recent CPU utilization (sampled, exponentially-weighted).
 - NUMA proximity to the connection's NIC/socket — **tie-breaker only, and meaningful only for `cross`-affinity DBs**. For `single`-affinity DBs the candidate set is already constrained to one NUMA.
 
-The housekeeper maintains this load view from periodic samples published by each reactor (via Tier C-style snapshot, or a lightweight per-reactor atomic counter polled by housekeeper).
+The housekeeper maintains this load view from periodic samples published by each reactor (via Tier C-style snapshot, or a lightweight per-reactor atomic counter polled by housekeeper). Sampling defaults: 1 s interval, EWMA α = 0.5 (implementation-plan ruling A2).
 
-If a `single`-affinity DB's bound NUMA has no available workers (drained / failed), connection is refused with a clear error — we do **not** silently fall back to another NUMA, since that would silently violate the latency contract the customer chose.
+A worker is *available* while its active connection count is below `max_conns_per_worker` (default 200) — this is the availability test behind the refusal rule below (implementation-plan ruling A7).
+
+If a `single`-affinity DB's bound NUMA has no available workers (drained / failed), connection is refused with a clear error — we do **not** silently fall back to another NUMA, since that would silently violate the latency contract the customer chose. The error is PG `53300` (too_many_connections) with a message naming the bound NUMA (implementation-plan ruling R10).
+
+*Implementation note (implementation plan R9):* the load composite may be delivered in two phases — connection count alone routes first; CPU sampling and the NIC tie-breaker complete it — but the routing behavior above is the requirement either way.
 
 **Considered and rejected for v1:**
 - Round-robin: simpler, ignores load asymmetry from sticky connections.
@@ -561,6 +565,8 @@ for reactor in &all_reactors {
 - Writers don't block readers.
 - Memory reclamation is automatic via `Arc`'s refcount.
 
+**Bounded fan-out wait (implementation-plan ruling R11):** the writer waits at most `tierc_fanout_wait_ms` (default 1 000 ms) for all reactors to store; the ack to the requesting session reports *applied everywhere* or *pending N*. Laggard reactors adopt the new snapshot lazily on their next pointer load, so pending never means lost. The *issuing* reactor stores first, so the session that requested the change always sees its own change.
+
 ---
 
 ## 9. Background work
@@ -642,16 +648,16 @@ These are deliberately deferred. Each is small enough to resolve when the releva
 
 | Question | Where it lives |
 |---|---|
-| Specific Glommio version + any required forks; must support adopting an existing fd into a ring (connection handoff, §5.1). | Future ADR alongside the runtime crate's first real code. |
-| CPU topology discovery: `hwloc-rs` vs hand-rolled `/sys` parser. | Runtime crate. |
+| Specific Glommio version + any required forks; must support adopting an existing fd into a ring (connection handoff, §5.1). → **Interim ruling 2026-10-24:** pin 0.9.x, no forks (plan R3); the ADR at first real code confirms the fd-adoption API. | Future ADR alongside the runtime crate's first real code. |
+| CPU topology discovery: `hwloc-rs` vs hand-rolled `/sys` parser. → **Resolved 2026-10-24:** hand-rolled `/sys` parser behind a `TopologyProvider` trait, no C deps (plan R4). | Runtime crate. |
 | Concurrent hash map for BPM page table: `flurry` vs `scc` vs hand-rolled. | BPM crate ADR. |
-| Reactor stall detection plumbing — sampler thread on housekeeper vs in-band per-reactor self-reporting. | Runtime crate. |
-| Whether `submit_to` is public API to higher crates or restricted (most callers shouldn't need it). | Runtime crate API ADR. |
-| **`cross`-affinity WAL/XID home NUMA selection**: chosen when the DB enters `cross` affinity (creation or migration, §2.5.4); whether to expose as DDL or pick automatically; its catalog column (alongside `datnumaffinity` / `datnumanode`). | Catalog + runtime. |
-| **`single`-affinity DB placement at first activation**: how the housekeeper picks the bound NUMA (least-loaded NUMA, round-robin, admin-pinned). | Catalog + runtime. |
+| Reactor stall detection plumbing — sampler thread on housekeeper vs in-band per-reactor self-reporting. → **Resolved 2026-10-24:** per-reactor counters, housekeeper polls them (plan A15; matches §9's assumed row). | Runtime crate. |
+| Whether `submit_to` is public API to higher crates or restricted (most callers shouldn't need it). → **Interim ruling 2026-10-24:** crate-public for the slice; ADR when the first external caller appears (plan A16). | Runtime crate API ADR. |
+| **`cross`-affinity WAL/XID home NUMA selection**: chosen when the DB enters `cross` affinity (creation or migration, §2.5.4); whether to expose as DDL or pick automatically; its catalog column (alongside `datnumaffinity` / `datnumanode`). → **Partially resolved 2026-10-24:** chosen at creation/migration and persisted; column named in the catalog/WAL ADR (plan A14); auto-pick for the slice. | Catalog + runtime. |
+| **`single`-affinity DB placement at first activation**: how the housekeeper picks the bound NUMA (least-loaded NUMA, round-robin, admin-pinned). → **Resolved 2026-10-24:** least-loaded NUMA at first activation (plan A13). | Catalog + runtime. |
 | **NUMA-affinity migration protocol** (`ALTER DATABASE … SET numa_affinity = …`): drain + full Tier B re-homing choreography (pages, WAL/XID/MVCC home, per-reactor handles — §2.5.4). Phase 7+ implementation; DDL surface in v1. | Future ADR. |
-| **Fallback behavior** when a `single`-affinity DB's bound NUMA has no live workers (drained / failed). v1: refuse connection. Better: admin-driven failover. | Future ADR. |
-| NUMA node selection when the machine has more nodes than worker cores. | Runtime crate. |
+| **Fallback behavior** when a `single`-affinity DB's bound NUMA has no live workers (drained / failed). v1: refuse connection. Better: admin-driven failover. → **v1 shape ruled 2026-10-24:** refuse with PG `53300` naming the bound NUMA (plan R10). | Future ADR. |
+| NUMA node selection when the machine has more nodes than worker cores. → **Resolved 2026-10-24:** validated at boot; a worker-less pool is legal and serves `cross`-affinity placement only (plan A18). | Runtime crate. |
 | Behavior on hot-attach / hot-detach of CPUs in cloud environments (vCPU resize). | Documentation: not supported; requires restart. |
 
 ---
