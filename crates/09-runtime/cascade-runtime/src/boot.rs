@@ -88,9 +88,21 @@ impl Runtime {
     /// Boot exactly as configured (FR-1), with every pin verified after it
     /// happens (FR-2). Housekeepers are `std::thread`s (R5); workers are
     /// glommio reactors pinned via `Placement::Fixed` and verified in-task.
+    /// No listening socket: the process only computes.
     pub fn boot(
         cfg: &RuntimeConfig,
         topology: &dyn TopologyProvider,
+    ) -> Result<Runtime, BootError> {
+        Runtime::boot_with_listener(cfg, topology, None)
+    }
+
+    /// Boot with the housekeeper serving the one listening socket (spec §5.1,
+    /// FR-5): the first housekeeper core runs the blocking accept loop and
+    /// delivers each connection to `conns` (the router lands in T1.5).
+    pub fn boot_with_listener(
+        cfg: &RuntimeConfig,
+        topology: &dyn TopologyProvider,
+        listener: Option<(crate::accept::AcceptLoop, mpsc::Sender<crate::accept::AcceptedConn>)>,
     ) -> Result<Runtime, BootError> {
         let online = topology.online_cpus()?;
 
@@ -111,7 +123,7 @@ impl Runtime {
 
         check_smt_mode(cfg, topology)?;
 
-        let housekeepers = spawn_housekeepers(cfg)?;
+        let housekeepers = spawn_housekeepers(cfg, listener)?;
         let workers = spawn_workers(cfg)?;
 
         Ok(Runtime { housekeepers, workers })
@@ -152,22 +164,35 @@ pub fn check_smt_mode(
 
 /// Spawn one `std::thread` per housekeeper core (R5); each pins itself and
 /// reports. Boot fails unless every report arrives within the deadline and
-/// matches its core.
-fn spawn_housekeepers(cfg: &RuntimeConfig) -> Result<Vec<Housekeeper>, BootError> {
+/// matches its core. When a listener is given, the *first* housekeeper core
+/// serves it (spec §5.1: one socket, one housekeeper); the rest park.
+fn spawn_housekeepers(
+    cfg: &RuntimeConfig,
+    listener: Option<(crate::accept::AcceptLoop, mpsc::Sender<crate::accept::AcceptedConn>)>,
+) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
+    let mut serving = listener;
     for &core in &cfg.housekeeper_cores {
         let tx = tx.clone();
-        let join = std::thread::Builder::new()
-            .name(format!("cascade-hk-{core}"))
-            .spawn(move || {
+        let body: Box<dyn FnOnce() + Send> = match serving.take() {
+            Some((loop_, conns)) => Box::new(move || {
+                // Pin first; the accept loop then blocks in accept(2) —
+                // sleeping between events (FR-5).
                 let _ = tx.send((core, pin::pin_current(core)));
-                // The accept loop and background ticks land in T1.3+; park
-                // until then — no busy-wait (FR-5).
+                loop_.serve(conns);
+            }),
+            None => Box::new(move || {
+                let _ = tx.send((core, pin::pin_current(core)));
+                // Background ticks land later; park — no busy-wait (FR-5).
                 loop {
                     std::thread::park();
                 }
-            })
+            }),
+        };
+        let join = std::thread::Builder::new()
+            .name(format!("cascade-hk-{core}"))
+            .spawn(body)
             .map_err(|e| BootError::HousekeeperSpawn {
                 core,
                 message: e.to_string(),

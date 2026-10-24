@@ -4,11 +4,13 @@
 
 #![allow(dead_code)]
 
+pub mod accept;
 pub mod boot;
 pub mod config;
 pub mod pin;
 pub mod topology;
 
+pub use accept::{AcceptLoop, AcceptStats, AcceptedConn};
 pub use boot::{BootError, Housekeeper, Runtime, Worker};
 pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
 pub use topology::{AllowedCpuTopology, SyntheticTopology, TopologyError, TopologyProvider};
