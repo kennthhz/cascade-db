@@ -4,7 +4,6 @@
 use std::{
     io::{Read, Write},
     net::TcpStream,
-    os::unix::io::FromRawFd,
     sync::mpsc,
     time::Duration,
 };
@@ -48,11 +47,9 @@ fn accepts_and_hands_off_raw_fds() {
     assert_ne!(a.peer.port(), 0);
     assert_ne!(b.peer.port(), 0);
 
-    // The fd is the real connection: adopt and read what each client wrote.
-    // SAFETY: each fd is exclusively owned — accepted by serve() and handed
-    // to exactly this receiver.
-    let mut s1 = unsafe { TcpStream::from_raw_fd(a.fd) };
-    let mut s2 = unsafe { TcpStream::from_raw_fd(b.fd) };
+    // The stream is the real connection: read what each client wrote.
+    let mut s1 = a.stream;
+    let mut s2 = b.stream;
     let mut buf = [0u8; 3];
     s1.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"one");
@@ -142,7 +139,7 @@ fn booted_housekeeper_serves_connections() {
     let mut c = client_of(addr);
     c.write_all(b"ping").unwrap();
     let conn = rx.recv_timeout(Duration::from_secs(5)).expect("conn from booted housekeeper");
-    let mut s = unsafe { TcpStream::from_raw_fd(conn.fd) };
+    let mut s = conn.stream;
     let mut buf = [0u8; 4];
     s.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"ping");

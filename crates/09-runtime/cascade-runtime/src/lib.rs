@@ -7,7 +7,9 @@
 pub mod accept;
 pub mod boot;
 pub mod config;
+pub mod pg;
 pub mod pin;
+pub mod scram;
 pub mod topology;
 
 pub use accept::{AcceptLoop, AcceptStats, AcceptedConn};

@@ -13,7 +13,7 @@
 use std::{
     io,
     net::{SocketAddr, TcpListener},
-    os::unix::io::{AsRawFd, FromRawFd, IntoRawFd},
+    os::unix::io::AsRawFd,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::Sender,
@@ -21,11 +21,12 @@ use std::{
     },
 };
 
-/// A connection accepted on the housekeeper, ready for routing (T1.5).
+/// A connection accepted on the housekeeper, ready for the pre-routing
+/// handshake (auth, FR-9) and then routing (T1.5). It stays a `std::net`
+/// stream here because the housekeeper is a plain thread (R5); the *executor*
+/// handoff later converts it to a bare `RawFd` (FR-13).
 pub struct AcceptedConn {
-    /// Owning descriptor, adopted from `std::net::TcpStream` — the receiver
-    /// takes ownership and must close it (adopt it into a stream and drop).
-    pub fd: std::os::unix::io::RawFd,
+    pub stream: std::net::TcpStream,
     pub peer: SocketAddr,
 }
 
@@ -104,11 +105,9 @@ impl AcceptLoop {
                     let peer = stream
                         .peer_addr()
                         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
-                    let conn = AcceptedConn { fd: stream.into_raw_fd(), peer };
-                    if let Err(dead) = conns.send(conn) {
-                        // Router gone: adopt the fd back into a stream and
-                        // drop it closed — the descriptor must not leak.
-                        drop(unsafe { std::net::TcpStream::from_raw_fd(dead.0.fd) });
+                    // Router gone: dropping the conn closes the socket — no
+                    // descriptor leak.
+                    if conns.send(AcceptedConn { stream, peer }).is_err() {
                         return;
                     }
                 }

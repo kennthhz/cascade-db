@@ -83,6 +83,38 @@ impl Default for StallConfig {
     }
 }
 
+/// Authentication mode (spec §5.1, plan R2; FR-9). `trust` is for dev — it
+/// performs no credential check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    Trust,
+    ScramSha256,
+}
+
+/// One user's SCRAM verifier (A11: verifiers live in config until the
+/// catalog's `pg_authid` exists). Format: PG's
+/// `SCRAM-SHA-256$<iters>:<salt>$<storedkey>:<serverkey>`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthUser {
+    pub name: String,
+    pub verifier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AuthConfig {
+    pub mode: AuthMode,
+    pub users: Vec<AuthUser>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self { mode: AuthMode::Trust, users: Vec::new() }
+    }
+}
+
 /// The `[runtime]` table. Every field has a default except the explicit core
 /// placement lists, which fail validation when missing/empty (plan R6).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -105,6 +137,7 @@ pub struct RuntimeConfig {
     /// Tier C fan-out bounded wait (spec §8.4, plan R11; default 1 000 ms).
     pub tierc_fanout_wait_ms: u64,
     pub stall: StallConfig,
+    pub auth: AuthConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -122,6 +155,7 @@ impl Default for RuntimeConfig {
             max_conns_per_worker: 200,
             tierc_fanout_wait_ms: 1000,
             stall: StallConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
@@ -180,6 +214,10 @@ pub enum ConfigError {
     KillUnsupported,
     #[error("runtime.listen.port must be > 0")]
     InvalidPort,
+    #[error("runtime.auth mode scram_sha256 requires at least one runtime.auth.users entry")]
+    ScramWithoutUsers,
+    #[error("runtime.auth.users names user {name:?} more than once")]
+    DuplicateAuthUser { name: String },
     #[error("config has no [runtime] table")]
     MissingRuntimeTable,
     #[error("invalid config: {0}")]
@@ -278,6 +316,18 @@ impl RuntimeConfig {
                     return Err(ConfigError::CoreInBothRoles { core });
                 }
                 seen_cores.push(core);
+            }
+        }
+        if self.auth.mode == AuthMode::ScramSha256 {
+            if self.auth.users.is_empty() {
+                return Err(ConfigError::ScramWithoutUsers);
+            }
+            let mut seen_users = Vec::new();
+            for user in &self.auth.users {
+                if seen_users.contains(&user.name) {
+                    return Err(ConfigError::DuplicateAuthUser { name: user.name.clone() });
+                }
+                seen_users.push(user.name.clone());
             }
         }
         Ok(())
