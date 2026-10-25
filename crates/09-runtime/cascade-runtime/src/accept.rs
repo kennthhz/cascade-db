@@ -110,6 +110,12 @@ impl AcceptLoop {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
+                    // Transactional request/response traffic is dominated by
+                    // small segments: with Nagle on, each response's second
+                    // segment waits out the peer's delayed ACK (~40–60ms on
+                    // WSL2). Real PostgreSQL sets nodelay on accepted
+                    // sockets too.
+                    let _ = stream.set_nodelay(true);
                     self.stats.accepted.fetch_add(1, Ordering::Relaxed);
                     let peer = stream
                         .peer_addr()

@@ -40,6 +40,7 @@ members = [
     "crates/12-future/cascade-governance",
     # binaries
     "bin/cascade-server",
+    "bin/bench",
 ]
 
 [workspace.package]

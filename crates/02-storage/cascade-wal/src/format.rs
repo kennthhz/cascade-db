@@ -23,7 +23,11 @@ pub(crate) const TYPE_COMMIT: u8 = 2;
 pub(crate) const TYPE_ABORT: u8 = 3;
 pub(crate) const TYPE_INSERT: u8 = 4;
 
-pub(crate) fn encode(rec: &WalRecord) -> Vec<u8> {
+/// Encode one record to the v1 wire/byte format. Public for tools that
+/// *write or dump* WAL bytes outside this crate (benchmarks, `pg_waldump`
+/// equivalents); readers must go through [`crate::WalReader`], which is
+/// the only path that validates CRCs.
+pub fn encode(rec: &WalRecord) -> Vec<u8> {
     let (type_byte, payload): (u8, Vec<u8>) = match rec {
         WalRecord::BeginTxn { .. } => (TYPE_BEGIN, Vec::new()),
         WalRecord::CommitTxn { .. } => (TYPE_COMMIT, Vec::new()),

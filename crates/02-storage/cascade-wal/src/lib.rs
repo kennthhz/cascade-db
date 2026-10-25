@@ -31,7 +31,7 @@
 //! the spec's `O_DIRECT` mandate is for *data pages*; the WAL is fsync'd
 //! sequential I/O, exactly PostgreSQL's model.
 
-mod format;
+pub mod format;
 mod io;
 mod writer;
 

@@ -134,6 +134,12 @@ impl Router {
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return, // listener dead
                 };
+                // Transactional request/response traffic is dominated by
+                // small segments: with Nagle on, each response's later
+                // segments wait out the peer's delayed ACK (tens of ms on
+                // WSL2). Real PostgreSQL sets nodelay on accepted sockets
+                // too.
+                let _ = stream.set_nodelay(true);
                 stats.accepted.fetch_add(1, Ordering::Relaxed);
                 if let Ok(session) = handshake(&mut stream, &router.policy) {
                     router.route(stream, &session);
