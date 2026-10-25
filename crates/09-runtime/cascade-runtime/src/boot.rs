@@ -2,7 +2,7 @@
 //!
 //! Order: validate the placement rules (boot is the enforcement point — a
 //! config built directly, not parsed, never skipped validation) → check
-//! every configured core against the topology → spawn housekeepers (plain
+//! every configured core against the topology → verify the kernel deployment (FR-4, T2.7, warn-only) → spawn housekeepers (plain
 //! `std::thread` per R5) → allocate the per-NUMA BPM pools (§10.1 step 5,
 //! T2.3: node-bound memory, sized per config, before any worker exists) →
 //! construct the per-DB writer on its WAL home NUMA (T2.6, A14) →
@@ -36,6 +36,7 @@ use cascade_wal::WalWriter;
 use crate::{
     config::{AuthConfig, NumaAffinity, RuntimeConfig, SmtMode},
     coop::{self, ReactorStall},
+    deployment,
     handoff::Handoff,
     pin::{self, PinError},
     pools::PoolRegistry,
@@ -242,6 +243,14 @@ impl Runtime {
         }
 
         check_smt_mode(cfg, topology)?;
+
+        // FR-4 (T2.7): verify the kernel's CPU-isolation deployment (§2.4)
+        // against the configured sets — a loud warning per mismatch, never
+        // a refusal (the lists are provisioning-time; the runtime can only
+        // verify). The comparison reads the kernel's own cmdline, not the
+        // config.
+        let cmdline = std::fs::read_to_string("/proc/cmdline").ok();
+        deployment::verify_and_log(cfg, cmdline.as_deref());
 
         // One handoff channel + one live-connection counter per worker,
         // in config order. The router reads the counters; the workers own

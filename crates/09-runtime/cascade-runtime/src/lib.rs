@@ -9,6 +9,7 @@ pub mod arena;
 pub mod boot;
 pub mod config;
 pub mod coop;
+pub mod deployment;
 pub mod handoff;
 mod mapping;
 pub mod pg;
