@@ -278,7 +278,14 @@ impl Runtime {
 
 /// FR-3: in `physical` SMT mode (the default) one worker per *physical* core
 /// — HT siblings are excluded from every role, so a config assigning two
-/// sibling cores anywhere refuses boot. `logical` mode has no such rule.
+/// sibling cores anywhere (worker+worker or housekeeper+worker) refuses
+/// boot. `logical` mode has no such rule: one worker per vCPU, siblings
+/// included. Runs before anything spawns — a refusal never leaves a
+/// half-booted state (T2.2 test-review).
+///
+/// The sibling relation is tested in *both* directions: a provider whose
+/// sibling map is asymmetric (records siblings on one cpu only — malformed
+/// but not impossible) must not slip a pair through (T2.2 code review).
 pub fn check_smt_mode(
     cfg: &RuntimeConfig,
     topology: &dyn TopologyProvider,
@@ -292,7 +299,9 @@ pub fn check_smt_mode(
     }
     for (i, &a) in assigned.iter().enumerate() {
         for &b in &assigned[i + 1..] {
-            if topology.thread_siblings(a).contains(&b) {
+            let siblings_a = topology.thread_siblings(a);
+            let siblings_b = topology.thread_siblings(b);
+            if siblings_a.contains(&b) || siblings_b.contains(&a) {
                 return Err(BootError::SmtSiblingsAssigned { a, b });
             }
         }
