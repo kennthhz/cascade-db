@@ -344,3 +344,60 @@ fn txn_sequence_roundtrips_through_the_reader() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Group commit (the M2 opener fix): a flush leader drains the WHOLE filled
+/// prefix, never just up to its own commit. Session A flushes its one
+/// record while session B's record is already filled: A's barrier must
+/// sweep B's bytes — one fdatasync covering both. The M1 shape capped the
+/// drain at the leader's own boundary, so every barrier synced exactly one
+/// commit and txn throughput sat pinned at the c1 level at any concurrency.
+#[test]
+fn leader_sweeps_the_whole_filled_prefix() {
+    let dir = temp_dir();
+    let w = Arc::new(WalWriter::new());
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let ba = fill(&insert(1, 1, "a"), &w); // session A's commit record
+        let bb = fill(&insert(2, 2, "b"), &w); // session B's, already filled
+
+        let durable = w.flush_wal(&h, ba).await.expect("flush resolves");
+        assert_eq!(durable, bb, "A's barrier covers B's filled record too");
+        assert_eq!(w.durable(), bb);
+        assert_eq!(w.syncs(), 1, "one fdatasync for both commits");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The group-commit window (the `commit_delay` analog): when the leader's
+/// own commit IS the frontier, it holds the window open briefly, and a
+/// record filled during the window joins the same barrier. Fills from
+/// before the window skip it and drain immediately (previous test) — the
+/// wait is paid only by a leader with nothing to batch yet.
+#[test]
+fn frontier_window_lets_a_latecomer_join_the_barrier() {
+    let dir = temp_dir();
+    let w = Arc::new(WalWriter::new());
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let ba = fill(&insert(1, 1, "a"), &w);
+
+        // Leader starts with its commit as the frontier: the window opens.
+        let leader = glommio::spawn_local({
+            let w = Arc::clone(&w);
+            async move {
+                let durable = w.flush_wal(&h, ba).await.expect("flush resolves");
+                (h, durable)
+            }
+        });
+
+        // A latecomer fills 50µs in — well inside the 300µs window.
+        glommio::timer::sleep(Duration::from_micros(50)).await;
+        let bb = fill(&insert(2, 2, "b"), &w);
+
+        let (h, durable) = leader.await;
+        drop(h);
+        assert_eq!(durable, bb, "the latecomer rode the leader's barrier");
+        assert_eq!(w.syncs(), 1, "one fdatasync total");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

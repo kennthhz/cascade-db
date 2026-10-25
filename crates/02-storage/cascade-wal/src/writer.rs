@@ -8,11 +8,21 @@ use std::{
         Mutex,
     },
     task::{Poll, Waker},
+    time::Duration,
 };
 
 use cascade_types::Lsn;
 
 use crate::{format, io::WalHandle, WalError, WalRecord};
+
+/// How long a flush leader holds the window open when its own commit is the
+/// frontier (`filled == up_to`) — the group-commit analog of PostgreSQL's
+/// `commit_delay`. Sessions landing within the window ride one `fdatasync`
+/// instead of each paying a solo barrier; when other records are already
+/// filled, the leader skips the wait and drains immediately. Must stay an
+/// order of magnitude below the fdatasync floor (~4 ms on the M1 bench
+/// disk); revisit against the bare-metal gate before changing.
+const COMMIT_DELAY: Duration = Duration::from_micros(300);
 
 /// Per-database WAL writer (§8.2): `Arc`-shared by every reactor appending
 /// to this DB. Holds *only* shared memory — atomics and the staging map of
@@ -122,8 +132,26 @@ impl WalWriter {
                 // abandoned (dropped) leader future cannot wedge the log.
                 let progressed = {
                     let _leader = LeaderGuard(self);
+                    // Group-commit window ([`COMMIT_DELAY`]): when our own
+                    // commit is the frontier, give concurrent sessions a
+                    // moment to land in this barrier. Without it the leader
+                    // syncs a solo batch and the next leader syncs the next
+                    // batch solo — one fdatasync per commit at any
+                    // concurrency (measured: throughput pinned at the c1
+                    // level, the M1 "txn collapse").
+                    if self.filled().0 <= up_to.0 {
+                        glommio::timer::sleep(COMMIT_DELAY).await;
+                    }
                     let start = self.durable().0;
-                    let target = self.filled().0.min(up_to.0);
+                    // Drain the *whole* contiguous prefix, never just up to
+                    // this caller's `up_to`. `filled` is a record boundary by
+                    // construction (FR-25), so flushing past our own commit
+                    // is always safe — and one barrier covering every filled
+                    // session is the entire point of group commit. Capping at
+                    // `up_to` (the M1 shape) defeated that: each leader
+                    // synced only its own bytes even when other sessions'
+                    // records were already filled and waiting.
+                    let target = self.filled().0;
                     if target > start {
                         let batch = self.take_batch(start, target)?;
                         io.write_batch(start, batch).await?;

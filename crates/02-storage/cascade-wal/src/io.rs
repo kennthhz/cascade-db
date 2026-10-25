@@ -8,12 +8,39 @@
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use cascade_types::{DatabaseId, Lsn};
 use glommio::io::BufferedFile;
 
 use crate::{format, WalError, WalReader};
+
+/// Watchdog bound for one ring op. WSL2 (5.15) + glommio 0.9 has been
+/// observed to never deliver the CQE for a buffered write/fdatasync roughly
+/// once per few thousand multi-session ops; glommio has no timeout of its
+/// own, so the awaiting session — and with it, at low concurrency, the
+/// whole database — hangs forever. Both ops are idempotent (a pwrite at an
+/// explicit offset with the same bytes; a repeated `fdatasync`), so a
+/// bounded wait plus re-issue turns the hang into a retry; a superseded op
+/// that completes late is harmless by the same argument. ~50× the p99 sync
+/// on the M1 bench disk; revisit on bare metal.
+const OP_WATCHDOG: Duration = Duration::from_millis(250);
+/// Give up after this many watchdog firings on one op and surface an error:
+/// the session gets an honest 58000 instead of an unbounded stall.
+const OP_ATTEMPTS: usize = 3;
+
+/// TEMPORARY M2 diagnostic: one line per watchdog firing. Removed with the
+/// M2 bench gate.
+fn waldbg(op: &str, off: u64, attempt: usize) {
+    eprintln!(
+        "WALDBG tid={:?} op={} ev=watchdog off={} attempt={}",
+        std::thread::current().id(),
+        op,
+        off,
+        attempt
+    );
+}
 
 /// Per-reactor append handle for one DB's log file. Not `Send` across
 /// reactors by discipline (the file is bound to the opening ring);
@@ -51,33 +78,57 @@ impl WalHandle {
     }
 
     /// Appends `bytes` at byte offset `offset` (the LSN). Batched: the
-    /// flush leader submits one write for the whole group.
+    /// flush leader submits one write for the whole group. Watchdog-guarded
+    /// (see [`OP_WATCHDOG`]).
     pub(crate) async fn write_batch(&self, offset: u64, bytes: Vec<u8>) -> Result<(), WalError> {
         let len = bytes.len() as u64;
-        let written = self
-            .file
-            .write_at(bytes, offset)
-            .await
-            .map_err(|e| WalError::Io(e.into()))?;
-        if written as u64 != len {
-            return Err(WalError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("short wal write: {written} of {len} bytes"),
-            )));
+        for attempt in 0..OP_ATTEMPTS {
+            if attempt > 0 {
+                waldbg("write", offset, attempt);
+            }
+            match glommio::timer::timeout(OP_WATCHDOG, self.file.write_at(bytes.clone(), offset))
+                .await
+            {
+                Ok(written) => {
+                    if written as u64 != len {
+                        return Err(WalError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!("short wal write: {written} of {len} bytes"),
+                        )));
+                    }
+                    self.written_ops.fetch_add(1, Ordering::Relaxed);
+                    self.written_bytes.fetch_add(len, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(glommio::GlommioError::TimedOut(_)) => continue, // watchdog: re-issue
+                Err(e) => return Err(WalError::Io(e.into())),
+            }
         }
-        self.written_ops.fetch_add(1, Ordering::Relaxed);
-        self.written_bytes.fetch_add(len, Ordering::Relaxed);
-        Ok(())
+        Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("wal write at {offset} missed its completion {OP_ATTEMPTS} times"),
+        )))
     }
 
     /// Durability barrier (FR-26): `fdatasync` on this reactor's own ring,
     /// through this reactor's own handle. `fdatasync` is per-inode, so it
-    /// durably covers records appended by every reactor.
+    /// durably covers records appended by every reactor. Watchdog-guarded
+    /// (see [`OP_WATCHDOG`]).
     pub(crate) async fn sync_data(&self) -> Result<(), WalError> {
-        self.file
-            .fdatasync()
-            .await
-            .map_err(|e| WalError::Io(e.into()))
+        for attempt in 0..OP_ATTEMPTS {
+            if attempt > 0 {
+                waldbg("sync", 0, attempt);
+            }
+            match glommio::timer::timeout(OP_WATCHDOG, self.file.fdatasync()).await {
+                Ok(()) => return Ok(()),
+                Err(glommio::GlommioError::TimedOut(_)) => continue, // watchdog: re-issue
+                Err(e) => return Err(WalError::Io(e.into())),
+            }
+        }
+        Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("wal fdatasync missed its completion {OP_ATTEMPTS} times"),
+        )))
     }
 
     /// `(write operations, bytes written)` — exactly-once assertions in
