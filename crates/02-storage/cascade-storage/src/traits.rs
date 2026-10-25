@@ -4,10 +4,14 @@
 //! when the workspace was restructured. Type definitions (`PageId`, `Lsn`,
 //! `AlignedBuf`) now live in [`cascade-types`].
 
-use std::io::Result;
 use std::path::PathBuf;
 
 use cascade_types::{AlignedBuf, Lsn, PageId};
+
+// NOTE: `Result` here is the prelude's `std::result::Result` — every
+// signature in this file carries an explicit `StorageError`. A previous
+// `use std::io::Result;` (a one-generic alias) shadowed it and broke the
+// build.
 
 #[derive(Debug)]
 pub enum StorageError {
