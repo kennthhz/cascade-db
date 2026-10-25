@@ -112,3 +112,86 @@ fn boots_bare_metal() {
     // against a read-back, not assumed.
     assert_eq!(rt.workers().len(), 2);
 }
+
+/// T2.1: boot is the enforcement point for placement rules — not just the
+/// TOML parser. A `RuntimeConfig` built directly (never through
+/// `from_toml_str`) with two workers on one core must refuse boot: two
+/// reactors on one core silently share time and corrupt every per-core
+/// assumption (FR-1's "one worker per configured core").
+#[test]
+fn refuses_duplicate_worker_core_at_boot() {
+    let allowed = pin::current_affinity();
+    assert!(allowed.len() >= 2, "needs at least 2 CPUs");
+    let topo = SyntheticTopology::new(allowed.iter().copied());
+    let cfg = test_config(allowed[0], &[allowed[1], allowed[1]]);
+    match Runtime::boot(&cfg, &topo).expect_err("duplicate worker core must refuse boot") {
+        BootError::Config(e) => {
+            assert_eq!(e, cascade_runtime::config::ConfigError::DuplicateCore { core: allowed[1] });
+        }
+        other => panic!("expected Config(DuplicateCore), got {other:?}"),
+    }
+}
+
+/// T2.1: the same enforcement for a core assigned to both roles.
+#[test]
+fn refuses_core_in_both_roles_at_boot() {
+    let allowed = pin::current_affinity();
+    assert!(allowed.len() >= 2, "needs at least 2 CPUs");
+    let topo = SyntheticTopology::new(allowed.iter().copied());
+    let mut cfg = test_config(allowed[0], &[allowed[1]]);
+    cfg.housekeeper_cores = vec![allowed[1]];
+    match Runtime::boot(&cfg, &topo).expect_err("cross-role core must refuse boot") {
+        BootError::Config(e) => {
+            assert_eq!(
+                e,
+                cascade_runtime::config::ConfigError::CoreInBothRoles { core: allowed[1] }
+            );
+        }
+        other => panic!("expected Config(CoreInBothRoles), got {other:?}"),
+    }
+}
+
+/// T2.1: workers across multiple NUMA groups boot, each verified on its own
+/// core, with each group carrying its NUMA label (the shape T2.3's per-NUMA
+/// pools and T2.4's affinity routing build on). The synthetic topology is
+/// flat; the grouping here is purely config-level.
+#[test]
+fn boots_workers_across_numa_groups() {
+    let mut allowed = pin::current_affinity();
+    assert!(allowed.len() >= 3, "boot test needs at least 3 CPUs");
+    allowed.truncate(3);
+
+    let topo = SyntheticTopology::new(allowed.iter().copied());
+    let cfg = RuntimeConfig {
+        housekeeper_cores: vec![allowed[0]],
+        worker_cores: vec![
+            NumaWorkers {
+                numa: 0,
+                cores: vec![allowed[1]],
+            },
+            NumaWorkers {
+                numa: 1,
+                cores: vec![allowed[2]],
+            },
+        ],
+        numa_pools: vec![
+            NumaPool {
+                numa: 0,
+                size_mb: 1,
+            },
+            NumaPool {
+                numa: 1,
+                size_mb: 1,
+            },
+        ],
+        ..RuntimeConfig::default()
+    };
+
+    let rt = Runtime::boot(&cfg, &topo).expect("multi-NUMA boot succeeds");
+    let by_numa: Vec<(u32, u32)> = rt.workers().iter().map(|w| (w.numa, w.core)).collect();
+    assert_eq!(
+        by_numa,
+        vec![(0, allowed[1]), (1, allowed[2])],
+        "one worker per group, verified on its configured core"
+    );
+}

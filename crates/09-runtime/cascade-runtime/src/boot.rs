@@ -1,13 +1,19 @@
 //! Boot sequence (spec §10.1; FR-1, FR-2).
 //!
-//! Order: check every configured core against the topology → spawn
-//! housekeepers (plain `std::thread` per R5) → spawn workers (one glommio
-//! reactor per core, `Placement::Fixed`) → each thread reports its observed
-//! affinity and boot refuses unless every report matches its core. There is
-//! no "boot anyway" fallback: an unpinned or unverified thread is a boot
-//! failure (FR-1, FR-2).
+//! Order: validate the placement rules (boot is the enforcement point — a
+//! config built directly, not parsed, never skipped validation) → check
+//! every configured core against the topology → spawn housekeepers (plain
+//! `std::thread` per R5) → spawn workers (one glommio reactor per core,
+//! `Placement::Fixed`; the §10.1 pool-allocation step slots in between
+//! these two when T2.3 lands) → each thread reports its *verified*
+//! affinity and boot refuses unless every report is a singleton equal to
+//! its assignment and no core was verified twice. There is no "boot
+//! anyway" fallback: an unpinned or unverified thread is a boot failure
+//! (FR-1, FR-2), and the exposed `Worker`/`Housekeeper` cores are the
+//! verified values, not the config's intent (T2.1).
 
 use std::{
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -108,6 +114,11 @@ impl std::fmt::Debug for Runtime {
 pub enum BootError {
     #[error("topology unavailable: {0}")]
     Topology(#[from] TopologyError),
+    /// FR-1 makes *boot* the enforcement point for placement rules: a config
+    /// that reached boot unvalidated (built directly, not parsed from TOML)
+    /// is refused here with the same rules the document parse applies.
+    #[error("invalid placement: {0}")]
+    Config(#[from] crate::config::ConfigError),
     #[error("configured core {core} is not online per topology")]
     CoreOffline { core: u32 },
     #[error("housekeeper thread on core {core} failed to spawn: {message}")]
@@ -126,6 +137,12 @@ pub enum BootError {
     WorkerUnconfirmed { cores: Vec<u32>, deadline_secs: u64 },
     #[error("physical SMT mode: cores {a} and {b} share a physical core; assign only one of any sibling pair (FR-3, spec §2.4)")]
     SmtSiblingsAssigned { a: u32, b: u32 },
+    /// Two threads reported verified affinities naming the same core. The
+    /// kernel cannot honestly do this (a verified pin is a singleton set),
+    /// so a collision means the assignment raced or the pin layer lied —
+    /// exactly what the verified-report bookkeeping exists to catch.
+    #[error("more than one thread verified onto core {core}")]
+    CoreVerifiedTwice { core: u32 },
 }
 
 impl Runtime {
@@ -151,6 +168,13 @@ impl Runtime {
         listener: Option<crate::accept::AcceptLoop>,
         auth: AuthConfig,
     ) -> Result<Runtime, BootError> {
+        // FR-1: boot is the enforcement point, not the config parser. A
+        // document that arrived through `from_toml_str` was already
+        // validated; one built directly was not — the rules must hold
+        // regardless of the construction path. Duplicate cores (two workers
+        // on one core, T2.1's review case) and cross-role overlaps are
+        // refused here, before anything spawns.
+        cfg.validate()?;
         let online = topology.online_cpus()?;
 
         // FR-1: an unpinnable (offline) core refuses boot before anything
@@ -188,7 +212,12 @@ impl Runtime {
             stalls.push(Arc::new(ReactorStall::new()));
         }
 
-        let housekeepers = spawn_housekeepers(cfg, listener, auth, senders, counters.clone())?;
+        // Verified affinities, shared across roles so the one-thread-per-core
+        // check spans housekeepers and workers (T2.1: uniqueness over the
+        // verified affinity, not the config's intent).
+        let mut verified = HashSet::new();
+        let housekeepers =
+            spawn_housekeepers(cfg, listener, auth, senders, counters.clone(), &mut verified)?;
         // T1.11: one shared per-DB writer when a WAL directory is configured
         // (the debug engine's fixed dev database). Handles are opened
         // per-reactor, in-task, on each worker's own ring.
@@ -204,6 +233,7 @@ impl Runtime {
             &stalls,
             wal.as_ref(),
             cfg.batch_rows,
+            &mut verified,
         )?;
 
         Ok(Runtime {
@@ -271,15 +301,17 @@ pub fn check_smt_mode(
 }
 
 /// Spawn one `std::thread` per housekeeper core (R5); each pins itself and
-/// reports. Boot fails unless every report arrives within the deadline and
-/// matches its core. When a listener is given, the *first* housekeeper core
-/// runs the router loop (accept → auth → handoff); the rest park.
+/// reports its *verified* affinity. Boot fails unless every report arrives
+/// within the deadline and matches its core. When a listener is given, the
+/// *first* housekeeper core runs the router loop (accept → auth → handoff);
+/// the rest park.
 fn spawn_housekeepers(
     cfg: &RuntimeConfig,
     listener: Option<crate::accept::AcceptLoop>,
     auth: AuthConfig,
     senders: Vec<SharedSender<Handoff>>,
     counters: Vec<Arc<AtomicU64>>,
+    verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
@@ -312,12 +344,16 @@ fn spawn_housekeepers(
         out.push(Housekeeper { core, join });
     }
     drop(tx); // so a dead thread's disconnect is observable
-    confirm_pins(rx, &cfg.housekeeper_cores, |cores, deadline_secs| {
+    let verified = confirm_pins(rx, &cfg.housekeeper_cores, verified_all, |cores, deadline_secs| {
         BootError::HousekeeperUnconfirmed {
             cores,
             deadline_secs,
         }
     })?;
+    // Expose what the kernel verified, not what the config asked for.
+    for h in &mut out {
+        h.core = verified[&h.core];
+    }
     Ok(out)
 }
 
@@ -336,6 +372,7 @@ fn spawn_workers(
     stalls: &[Arc<ReactorStall>],
     wal: Option<&Arc<WalWriter>>,
     batch_rows: u32,
+    verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
@@ -407,32 +444,62 @@ fn spawn_workers(
         });
     }
     drop(tx);
-    confirm_pins(
+    let verified = confirm_pins(
         rx,
         &cfg.worker_cores
             .iter()
             .flat_map(|w| w.cores.clone())
             .collect::<Vec<_>>(),
+        verified_all,
         |cores, deadline_secs| BootError::WorkerUnconfirmed {
             cores,
             deadline_secs,
         },
     )?;
+    // Expose what the kernel verified, not what the config asked for
+    // (T2.1): routing, tests, and diagnostics all read the verified fact.
+    for w in &mut out {
+        w.core = verified[&w.core];
+    }
     Ok(out)
 }
 
-/// Collect pin reports: every expected core must report `Ok(())` within the
-/// deadline. A wrong or missing read-back is a boot failure, not a warning.
+/// Collect pin reports: every expected core must report its *verified*
+/// affinity within the deadline, the set must be a singleton equal to its
+/// assignment, and no two threads — across every role that shares
+/// `verified_all` — may verify onto the same core. Uniqueness is checked
+/// over the kernel's read-back (T2.1), not the config's intent: the
+/// assignment was already validated by `RuntimeConfig::validate`; this is
+/// the layer that catches a pin that landed somewhere else. Returns
+/// assigned → verified core.
 fn confirm_pins(
-    rx: mpsc::Receiver<(u32, Result<(), PinError>)>,
+    rx: mpsc::Receiver<(u32, Result<Vec<u32>, PinError>)>,
     expected: &[u32],
+    verified_all: &mut HashSet<u32>,
     unconfirmed: fn(Vec<u32>, u64) -> BootError,
-) -> Result<(), BootError> {
+) -> Result<HashMap<u32, u32>, BootError> {
     let mut remaining: Vec<u32> = expected.to_vec();
+    let mut verified: HashMap<u32, u32> = HashMap::new();
     let deadline = PIN_CONFIRM_DEADLINE;
     while !remaining.is_empty() {
         match rx.recv_timeout(deadline) {
-            Ok((core, Ok(()))) => remaining.retain(|&c| c != core),
+            Ok((core, Ok(seen))) => {
+                // verify_core only succeeds on a singleton set equal to the
+                // assignment; re-assert so the uniqueness check below is
+                // always over a well-formed value.
+                let &v = seen.first().ok_or_else(|| BootError::PinVerify {
+                    core,
+                    source: PinError::VerifyFailed {
+                        core,
+                        seen: seen.clone(),
+                    },
+                })?;
+                if !verified_all.insert(v) {
+                    return Err(BootError::CoreVerifiedTwice { core: v });
+                }
+                verified.insert(core, v);
+                remaining.retain(|&c| c != core);
+            }
             Ok((core, Err(source))) => return Err(BootError::PinVerify { core, source }),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return Err(unconfirmed(remaining, deadline.as_secs()))
@@ -442,5 +509,5 @@ fn confirm_pins(
             }
         }
     }
-    Ok(())
+    Ok(verified)
 }
