@@ -265,21 +265,24 @@ fn capacity_cap_refuses_instead_of_overloading() {
         "first conn counted",
     );
 
-    // Second connection completes the handshake (housekeeper-side) but the
-    // router must refuse it — the socket gets closed without a reply. The
-    // write may lose the race with the close (BrokenPipe); either way no
-    // reply may ever arrive.
-    let mut c2 = connect(&addr, "bob");
-    let mut frame = vec![b'Q'];
-    let mut payload = b"SELECT debug_worker();".to_vec();
-    payload.push(0);
-    frame.extend_from_slice(&((payload.len() as i32 + 4).to_be_bytes()));
-    frame.extend_from_slice(&payload);
-    let _ = c2.write_all(&frame);
-    c2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut buf = [0u8; 16];
-    let got = c2.read(&mut buf).unwrap_or(0);
-    assert_eq!(got, 0, "refused connection must be closed, not answered");
+    // Second connection completes the handshake (ReadyForQuery is sent
+    // housekeeper-side, before routing), but the router refuses it with PG
+    // 53300 naming the bound NUMA (FR-12, since T2.4; before that it was a
+    // bare close). The refusal surfaces on the client's next read; the
+    // refused conn is never adopted.
+    let url2 = format!("postgres://bob:pw@{addr}/dev");
+    let mut c2 = postgres::Client::connect(&url2, postgres::NoTls)
+        .expect("handshake completes before routing");
+    let err = c2
+        .simple_query("SELECT 1")
+        .expect_err("over-cap connection is refused at first use");
+    let db = err.as_db_error().expect("refusal is a PG error");
+    assert_eq!(db.code().code(), "53300", "FR-12 refusal code");
+    assert!(
+        db.message().contains("NUMA 0"),
+        "refusal names the bound NUMA, got: {}",
+        db.message()
+    );
     assert_eq!(
         rt.workers()[0].active_connections(),
         1,

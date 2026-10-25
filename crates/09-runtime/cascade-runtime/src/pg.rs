@@ -141,7 +141,23 @@ fn write_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> std::i
 }
 
 fn reject(stream: &mut TcpStream, code: &'static str, message: &str) -> HandshakeError {
-    // S (severity), C (code), M (message), each cstring, terminated by \0.
+    let _ = send_fatal(stream, code, message);
+    HandshakeError::Rejected {
+        code,
+        message: message.to_owned(),
+    }
+}
+
+/// Writes a FATAL `ErrorResponse` (severity S/V, code C, message M) and
+/// leaves the stream open for the caller to close. Shared by handshake
+/// rejections and the router's post-handshake refusals (FR-12): by then
+/// the client is in the query protocol, and FATAL-then-close is how
+/// PostgreSQL reports a connection-ending error there too.
+pub(crate) fn send_fatal(
+    stream: &mut TcpStream,
+    code: &'static str,
+    message: &str,
+) -> std::io::Result<()> {
     let mut payload = Vec::new();
     payload.push(b'S');
     payload.extend_from_slice(b"FATAL\0");
@@ -154,11 +170,7 @@ fn reject(stream: &mut TcpStream, code: &'static str, message: &str) -> Handshak
     payload.extend_from_slice(message.as_bytes());
     payload.push(0);
     payload.push(0);
-    let _ = write_message(stream, b'E', &payload);
-    HandshakeError::Rejected {
-        code,
-        message: message.to_owned(),
-    }
+    write_message(stream, b'E', &payload)
 }
 
 /// Read the startup packet (handling SSLRequest by declining), parse params,

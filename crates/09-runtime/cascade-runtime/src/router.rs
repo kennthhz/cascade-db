@@ -1,13 +1,19 @@
-//! Router v0: accept → authenticate → hand off (spec §5.1; FR-9, FR-11, FR-13).
+//! Router v1: accept → authenticate → route by DB NUMA affinity → hand off
+//! (spec §5.1, §5.2; FR-9, FR-10, FR-11, FR-12, FR-13).
 //!
 //! The housekeeper thread runs its own *unpinned* executor
 //! (`Placement::Unbound`): affinity is already set by `pin_current`, so the
 //! thread stays CFS-scheduled (R5) while the executor gives us
 //! `SharedSender::connect()` and the shared channel the fd crosses on.
 //!
-//! Routing v0 is least-loaded by connection count — the count component of
-//! FR-11's composite (CPU sampling + NUMA proximity arrive in M2/M5, as does
-//! per-DB affinity: FR-10/FR-12).
+//! Routing resolves the connection's database placement against the Tier C
+//! snapshot (FR-10 — the snapshot, not boot config), restricts the
+//! candidate set (`single` → the bound NUMA's workers only, `cross` → the
+//! whole machine, I13), and picks least-loaded by connection count — the
+//! count component of FR-11's composite (CPU sampling + NIC tie-breaker
+//! arrive in M5 per R9's two phases). A `single` DB whose bound NUMA has
+//! no available worker is refused with PG `53300` naming the NUMA — never
+//! silently crossed (FR-12, R10).
 
 use std::{
     net::TcpStream,
@@ -20,20 +26,25 @@ use std::{
 
 use glommio::{
     channels::shared_channel::{ConnectedSender, SharedSender},
-    LocalExecutorBuilder, Placement,
+    LocalExecutorBuilder, Placement as ExecutorPlacement,
 };
 
 use crate::{
     accept::AcceptLoop,
-    config::AuthConfig,
+    config::{AuthConfig, NumaAffinity},
     handoff::Handoff,
-    pg::{handshake, AuthPolicy, Session},
+    pg::{handshake, send_fatal, AuthPolicy, Session},
+    tierc::{Placement, TierCSnapshot},
 };
 
-/// One worker's route: a connected sender into that worker's channel plus its
-/// live connection counter (shared with the worker).
+/// PG too_many_connections — the FR-12/R10 refusal code.
+const TOO_MANY_CONNECTIONS: &str = "53300";
+
+/// One worker's route: a connected sender into that worker's channel, its
+/// NUMA node, and its live connection counter (shared with the worker).
 struct Route {
     sender: ConnectedSender<Handoff>,
+    numa: u32,
     counter: Arc<AtomicU64>,
 }
 
@@ -41,14 +52,24 @@ pub struct Router {
     policy: AuthPolicy,
     routes: Vec<Route>,
     max_conns_per_worker: u32,
+    tierc: Arc<TierCSnapshot>,
 }
 
 impl Router {
-    /// Pick the least-loaded worker with capacity (FR-11 count component,
-    /// A7 cap). Ties go to the first route — deterministic.
-    fn choose(&self) -> Option<usize> {
+    /// Pick the least-loaded *candidate* with capacity (FR-11 count
+    /// component, A7 cap, I13 candidate restriction). Ties go to the first
+    /// route — deterministic. Returns `None` when the placement's candidate
+    /// set has no available worker.
+    fn choose(&self, placement: &Placement) -> Option<usize> {
         let mut best: Option<(usize, u64)> = None;
         for (i, route) in self.routes.iter().enumerate() {
+            // I13: single-affinity DBs consider only their bound NUMA's
+            // workers; cross DBs the whole machine.
+            if placement.affinity == NumaAffinity::Single
+                && Some(route.numa) != placement.bound_numa
+            {
+                continue;
+            }
             let load = route.counter.load(Ordering::Relaxed);
             if load >= self.max_conns_per_worker as u64 {
                 continue; // A7: per-worker availability cap
@@ -62,15 +83,34 @@ impl Router {
 
     /// Hand the connection to the chosen worker as a bare fd (FR-13). Takes
     /// ownership of the stream and always disposes of it exactly once: either
-    /// the fd crosses, or it is closed here. Returns the peer address on
-    /// success, for logging.
-    fn route(&self, stream: TcpStream, session: &Session) -> Option<std::net::SocketAddr> {
+    /// the fd crosses, or it is closed here (with a `53300` sent first when
+    /// the refusal is the affinity/cap rule, FR-12). Returns the peer address
+    /// on success, for logging.
+    fn route(&self, mut stream: TcpStream, session: &Session) -> Option<std::net::SocketAddr> {
         let peer = stream
             .peer_addr()
             .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        let Some(idx) = self.choose() else {
+        let placement = self.tierc.resolve(session.startup.database());
+        let Some(idx) = self.choose(&placement) else {
+            // FR-12 (R10): a single-affinity DB with no available worker on
+            // its bound NUMA is refused, naming the NUMA — never silently
+            // crossed. A cross DB with no capacity anywhere gets the same
+            // code without a NUMA (§5.2 rules only the single case).
+            let message = match placement.bound_numa {
+                Some(numa) => format!(
+                    "single-affinity database {:?} is bound to NUMA {numa}, \
+                     which has no available workers",
+                    session.startup.database().unwrap_or("dev")
+                ),
+                None => "all workers are at their connection capacity".to_owned(),
+            };
+            let _ = send_fatal(&mut stream, TOO_MANY_CONNECTIONS, &message);
             return None; // caller drops the stream → closed
         };
+        // Admitted race (T2.4 code review): the count may move between the
+        // check above and the handoff — the cap is best-effort at the
+        // router. A handoff that lands on an over-cap worker is still
+        // served; a full channel (below) closes the fd honestly.
         let fd = stream.into_raw_fd();
         let handoff = Handoff {
             fd,
@@ -105,19 +145,22 @@ impl Router {
         listener: AcceptLoop,
         auth: AuthConfig,
         senders: Vec<SharedSender<Handoff>>,
+        numas: Vec<u32>,
         counters: Vec<Arc<AtomicU64>>,
+        tierc: Arc<TierCSnapshot>,
         max_conns_per_worker: u32,
     ) {
-        let ex = LocalExecutorBuilder::new(Placement::Unbound)
+        let ex = LocalExecutorBuilder::new(ExecutorPlacement::Unbound)
             .name("cascade-hk-ring")
             .make()
             .expect("housekeeper executor");
         ex.run(async move {
             let policy = AuthPolicy::from_config(&auth).expect("auth config validated at boot");
             let mut routes = Vec::with_capacity(senders.len());
-            for (sender, counter) in senders.into_iter().zip(counters) {
+            for ((sender, numa), counter) in senders.into_iter().zip(numas).zip(counters) {
                 routes.push(Route {
                     sender: sender.connect().await,
+                    numa,
                     counter,
                 });
             }
@@ -125,6 +168,7 @@ impl Router {
                 policy,
                 routes,
                 max_conns_per_worker,
+                tierc,
             };
 
             let (stats, listener) = listener.into_parts();

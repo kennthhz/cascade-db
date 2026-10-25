@@ -40,6 +40,7 @@ use crate::{
     pools::PoolRegistry,
     router::Router,
     tenant::TenantCounters,
+    tierc::TierCSnapshot,
     topology::{TopologyError, TopologyProvider},
 };
 
@@ -63,6 +64,9 @@ pub struct Runtime {
     /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
     /// configured NUMA, in config order.
     pools: PoolRegistry,
+    /// The static Tier C placement snapshot routing reads (FR-10, T2.4).
+    /// Live catalog updates arrive with T5.5.
+    tierc: Arc<TierCSnapshot>,
 }
 
 pub struct Housekeeper {
@@ -256,8 +260,29 @@ impl Runtime {
         // check spans housekeepers and workers (T2.1: uniqueness over the
         // verified affinity, not the config's intent).
         let mut verified = HashSet::new();
-        let housekeepers =
-            spawn_housekeepers(cfg, listener, auth, senders, counters.clone(), &mut verified)?;
+        // §10.1 step 7's routing half (FR-10, T2.4): the placement snapshot
+        // routing reads. It is config-derived and immutable, so building it
+        // before the housekeepers (which §10.1 orders at step 4) cannot
+        // race anything; the live Tier C feed replaces this at T5.5.
+        let worker_numas: Vec<u32> = cfg
+            .worker_cores
+            .iter()
+            .flat_map(|w| std::iter::repeat(w.numa).take(w.cores.len()))
+            .collect();
+        let tierc = Arc::new(TierCSnapshot::build(
+            cfg.default_db_numa_affinity,
+            &worker_numas,
+        ));
+        let housekeepers = spawn_housekeepers(
+            cfg,
+            listener,
+            auth,
+            senders,
+            worker_numas.clone(),
+            counters.clone(),
+            Arc::clone(&tierc),
+            &mut verified,
+        )?;
         // T1.11: one shared per-DB writer when a WAL directory is configured
         // (the debug engine's fixed dev database). Handles are opened
         // per-reactor, in-task, on each worker's own ring.
@@ -288,6 +313,7 @@ impl Runtime {
             stall_hard: Duration::from_micros(cfg.stall.hard_us),
             wal,
             pools,
+            tierc,
         })
     }
 
@@ -325,6 +351,12 @@ impl Runtime {
     /// configured NUMA, in config order.
     pub fn pools(&self) -> &PoolRegistry {
         &self.pools
+    }
+
+    /// The Tier C placement snapshot routing reads (FR-10, T2.4) — the
+    /// same `Arc` the router holds. Static until T5.5's live feed.
+    pub fn tierc(&self) -> &Arc<TierCSnapshot> {
+        &self.tierc
     }
 }
 
@@ -366,27 +398,31 @@ pub fn check_smt_mode(
 /// within the deadline and matches its core. When a listener is given, the
 /// *first* housekeeper core runs the router loop (accept → auth → handoff);
 /// the rest park.
+#[allow(clippy::too_many_arguments)]
 fn spawn_housekeepers(
     cfg: &RuntimeConfig,
     listener: Option<crate::accept::AcceptLoop>,
     auth: AuthConfig,
     senders: Vec<SharedSender<Handoff>>,
+    worker_numas: Vec<u32>,
     counters: Vec<Arc<AtomicU64>>,
+    tierc: Arc<TierCSnapshot>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
-    let mut serving = listener.map(|l| (l, auth, senders, counters));
+    let mut serving = listener.map(|l| (l, auth, senders, worker_numas, counters, tierc));
     for &core in &cfg.housekeeper_cores {
         let tx = tx.clone();
         let body: Box<dyn FnOnce() + Send> = match serving.take() {
-            Some((loop_, auth, senders, counters)) => Box::new(move || {
+            Some((loop_, auth, senders, numas, counters, tierc)) => Box::new(move || {
                 // Pin first; then accept (blocking — sleeps between
-                // events, FR-5) → authenticate → hand off. Housekeepers
-                // reserve no arena (the trailing 0 below).
+                // events, FR-5) → authenticate → route by affinity →
+                // hand off. Housekeepers reserve no arena (the trailing
+                // 0 below).
                 let _ = tx.send((core, pin::pin_current(core), 0));
-                Router::serve(loop_, auth, senders, counters, max_conns);
+                Router::serve(loop_, auth, senders, numas, counters, tierc, max_conns);
             }),
             None => Box::new(move || {
                 let _ = tx.send((core, pin::pin_current(core), 0));
