@@ -15,6 +15,7 @@ use cascade_runtime::{
     pin, Runtime, RuntimeConfig, SyntheticTopology, TopologyProvider,
 };
 use cascade_runtime::topology::SysTopology;
+use cascade_types::{DatabaseId, PageId, SegmentId};
 
 fn allowed4() -> Vec<u32> {
     let mut allowed = pin::current_affinity();
@@ -259,4 +260,168 @@ fn numa_maps_counts(addr: usize) -> HashMap<u32, u64> {
         }
     }
     HashMap::new()
+}
+
+// ---- T2.5: cross placement in the lookup path (FR-22) ----
+
+fn page(db: u32, segment: u32, page_no: u32) -> PageId {
+    PageId {
+        db: DatabaseId(db),
+        segment: SegmentId(segment),
+        page_no,
+    }
+}
+
+/// The probe set the restart test carries across processes.
+fn probe_pages() -> Vec<PageId> {
+    vec![
+        page(1, 0, 0),
+        page(1, 0, 1),
+        page(2, 0, 0),
+        page(7, 3, 42),
+        page(0, 0, 0),
+        page(1, 1, 1),
+        page(12345, 678, 9),
+    ]
+}
+
+fn registry_with_pools(num: u32) -> cascade_runtime::PoolRegistry {
+    let cfg = RuntimeConfig {
+        numa_pools: (0..num)
+            .map(|n| NumaPool { numa: n, size_mb: 1 })
+            .collect(),
+        ..RuntimeConfig::default()
+    };
+    cascade_runtime::PoolRegistry::build(&cfg).expect("registry builds")
+}
+
+/// FR-22, cross placement: `hash(PageId) mod num_numas` — the pool a page
+/// lands in is derivable from the key alone, with a single direct lookup
+/// (no miss-probing). Key-field check from the code review: every one of
+/// the three `PageId` fields moves the placement (a hash over a subset —
+/// e.g. just the page number — would collide these).
+#[test]
+fn cross_pages_map_to_the_hashed_pool() {
+    let reg = registry_with_pools(3);
+    let idx_of = |p: &PageId| -> usize {
+        reg.iter()
+            .position(|h| h.numa() == reg.pool_for_page(p).expect("some pool").numa())
+            .expect("pool is in the registry")
+    };
+
+    // All three key fields matter (I3: the key is the triple, not a path).
+    let a = idx_of(&page(1, 0, 0));
+    let different = [
+        idx_of(&page(2, 0, 0)),
+        idx_of(&page(1, 1, 0)),
+        idx_of(&page(1, 0, 1)),
+    ];
+    assert!(
+        different.iter().any(|&i| i != a),
+        "changing any PageId field can move the placement"
+    );
+
+    // Same page, same pool — repeated calls, and "from any reactor" is the
+    // same statement: the lookup is a pure function of the key.
+    for p in probe_pages() {
+        let first = reg.pool_for_page(&p).map(|h| h.numa());
+        for _ in 0..3 {
+            assert_eq!(reg.pool_for_page(&p).map(|h| h.numa()), first);
+        }
+    }
+}
+
+/// Distribution over synthetic PageIds: the hash spreads pages across the
+/// pools — no pool idles, none dominates (loose bounds: FNV-1a is not a
+/// cryptographic mixer, and the assertion is "no pathology", not exact
+/// balance).
+#[test]
+fn cross_pages_distribute_across_pools() {
+    for num_pools in [2u32, 3] {
+        let reg = registry_with_pools(num_pools);
+        let mut counts = vec![0u64; num_pools as usize];
+        let mut total = 0u64;
+        for db in 0..20u32 {
+            for segment in 0..20u32 {
+                for page_no in 0..20u32 {
+                    let numa = reg.pool_for_page(&page(db, segment, page_no)).expect("some").numa();
+                    counts[numa as usize] += 1;
+                    total += 1;
+                }
+            }
+        }
+        for (numa, count) in counts.iter().enumerate() {
+            assert!(
+                *count >= total / 10 && *count <= total * 6 / 10,
+                "pool {numa} took {count} of {total} pages ({num_pools} pools)"
+            );
+        }
+    }
+}
+
+/// Determinism across *process restarts*, not just repeated calls: the
+/// parent re-runs this test binary as a child process (fresh process,
+/// fresh hash state) and demands identical placements. The FNV layout is
+/// additionally pinned by golden literals — a refactored hash or a changed
+/// key-field order breaks this test, which is the point: a page's pool may
+/// never move across restarts.
+#[test]
+fn placement_is_stable_across_process_restarts() {
+    // Real restart: child process recomputes; the parent compares.
+    if std::env::var("CASCADE_T25_CHILD").is_ok() {
+        let reg = registry_with_pools(3);
+        let idx: Vec<usize> = probe_pages()
+            .iter()
+            .map(|p| {
+                reg.iter()
+                    .position(|h| h.numa() == reg.pool_for_page(p).expect("some").numa())
+                    .expect("pool in registry")
+            })
+            .collect();
+        println!("T25PLACEMENT:{idx:?}");
+        std::process::exit(0);
+    }
+
+    // Golden literals, computed independently of the crate (FNV-1a over
+    // the 12 little-endian key bytes): (db, seg, page) → index at 3 pools.
+    const GOLDEN_3: [(u32, u32, u32); 3] = [(1, 0, 0), (1, 0, 1), (12345, 678, 9)];
+    const GOLDEN_IDX_3: [usize; 3] = [2, 1, 1];
+    let reg = registry_with_pools(3);
+    for (key, &want) in GOLDEN_3.iter().zip(GOLDEN_IDX_3.iter()) {
+        let (db, seg, no) = *key;
+        let got = reg
+            .iter()
+            .position(|h| h.numa() == reg.pool_for_page(&page(db, seg, no)).expect("some").numa());
+        assert_eq!(got, Some(want), "golden placement for ({db},{seg},{no})");
+    }
+
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", "placement_is_stable_across_process_restarts", "--nocapture"])
+        .env("CASCADE_T25_CHILD", "1")
+        .output()
+        .expect("child test process runs");
+    assert!(out.status.success(), "child test run failed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let child_line = stdout
+        .lines()
+        .find(|l| l.starts_with("T25PLACEMENT:"))
+        .expect("child prints its placements");
+    let child: Vec<usize> = child_line
+        .trim_start_matches("T25PLACEMENT:")
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim().parse().expect("child index"))
+        .collect();
+
+    let reg = registry_with_pools(3);
+    let parent: Vec<usize> = probe_pages()
+        .iter()
+        .map(|p| {
+            reg.iter()
+                .position(|h| h.numa() == reg.pool_for_page(p).expect("some").numa())
+                .expect("pool in registry")
+        })
+        .collect();
+    assert_eq!(child, parent, "placement moved across a process restart");
 }

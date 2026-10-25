@@ -22,11 +22,32 @@
 
 use std::io;
 
-use cascade_types::PAGE_SIZE;
+use cascade_types::{PageId, PAGE_SIZE};
 
 use crate::{config::RuntimeConfig, mapping::Mapping};
 
 const MIB: u64 = 1 << 20;
+
+/// FR-22's cross-affinity placement hash: FNV-1a over the three `PageId`
+/// fields (I3 — the key is `(DatabaseId, SegmentId, PageNo)`, never a file
+/// path), each fixed-width little-endian in a frozen order. The algorithm
+/// and layout are *frozen*: a page's pool must not move across builds,
+/// processes, or restarts, so this is deliberately not `std`'s
+/// `RandomState`-keyed `Hash` (whose seed differs per process). Golden
+/// literals in `tests/pools.rs` pin the contract.
+fn page_hash(page_id: &PageId) -> u64 {
+    fn mix(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h ^= u64::from(*b);
+            *h = h.wrapping_mul(0x1_0000_0001_b3); // 0x100000001b3, the FNV-1a 64 prime
+        }
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    mix(&mut h, &page_id.db.0.to_le_bytes());
+    mix(&mut h, &page_id.segment.0.to_le_bytes());
+    mix(&mut h, &page_id.page_no.to_le_bytes());
+    h
+}
 
 /// One pool's page RAM: `frames × PAGE_SIZE` bytes in a private mapping
 /// with a `PAGE_SIZE`-aligned base, so frames are directly usable as page
@@ -162,6 +183,16 @@ impl PoolRegistry {
     /// validated configs cannot produce for a worker node.
     pub fn index_for_numa(&self, numa: u32) -> Option<usize> {
         self.pools.iter().position(|p| p.numa == numa)
+    }
+
+    /// FR-22 placement for a `cross`-affinity page: `hash(PageId) mod
+    /// num_numas` — a single direct lookup, no miss-probing (§8.1). The
+    /// result depends only on the page key and the pool count, so the same
+    /// `PageId` lands in the same pool from any reactor and across
+    /// restarts. `None` only for an empty registry (boot never builds one).
+    pub fn pool_for_page(&self, page_id: &PageId) -> Option<&NumaPoolHandle> {
+        let idx = (page_hash(page_id) % self.pools.len() as u64) as usize;
+        self.pools.get(idx)
     }
 }
 
