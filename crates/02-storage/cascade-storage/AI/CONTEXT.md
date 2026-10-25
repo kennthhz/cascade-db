@@ -28,10 +28,14 @@ The bottom of the I/O stack. Owns the `PageStore` trait + a local `O_DIRECT` / `
 
 ## Existing Code
 
-Migrated from `storage/src/{core_storage.rs,traits.rs}` (Phase 1 sketch). The current code contains `todo!()` stubs for many methods — implementations land in Phase 2.
+Migrated from `storage/src/{core_storage.rs,traits.rs}` (Phase 1 sketch). As of T1.9 the glommio implementation is real for `read_page`/`write_page` (file-per-table `<data_dir>/db_<db>/space_<seg>.dat`, page = `[CRC32][payload]` inside 8 KiB, past-EOF reads are zeroes); `read_pages`/`write_pages`/`allocate_extent`/`free_extent` keep the trait shape with `todo!()` bodies until the scan/bulk/space milestones.
+
+## Resolved Design Questions
+
+- Async runtime: **glommio** (the runtime executor, plan R3). `tokio-uring` was removed from this crate in T1.9 — it cannot run on glommio's reactor.
+- Page format: `[4-byte CRC32 of the remainder][payload]` inside one 8 KiB block (keeps `O_DIRECT` offsets aligned); the reserved leading bytes seed the page header `cascade-page` will own.
 
 ## Open Design Questions
 
-- Async runtime choice — `tokio-uring`, `glommio`, or `monoio`? Current code uses `tokio-uring`; revisit when the runtime crate solidifies.
 - Vectored I/O on `io_uring`: submit-N-and-await vs. true SQE chaining. Benchmark needed before committing.
-- WAL flush LSN coordination with data-page writes — needs the WAL crate to be drafted first.
+- WAL flush LSN coordination with data-page writes — WAL crate drafted in M1 (T1.10).

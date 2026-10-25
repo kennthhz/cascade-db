@@ -46,8 +46,12 @@ The BPM does **not** decide affinity; it reads the policy from the catalog (Tier
 - Resource *enforcement* (lives in `cascade-governance`; this crate just provides the counters).
 - Affinity *decisions* (live in the catalog + runtime; BPM only enforces).
 
+## Existing Code (M1 debug slice, T1.9)
+
+The single-pool, single-reactor case is real in `src/lib.rs`: fixed frame array (pre-allocated page RAM), `RefCell` page table, atomic pin count + dirty bit per frame, RAII `PageGuard` (panic-release tested), miss → `PageStore::read_page` on the calling reactor's ring → insert → pin, `PoolFull` until eviction lands. Write access requires the exclusive pin (pin == 1) — the debug stand-in for per-page latching. `PerDbAccounting` counts live pins per DB (invariant 3).
+
 ## Open Design Questions
 
 - Eviction algorithm within each NUMA pool: LRU-K vs CLOCK-sweep. Lean LRU-K for OLTP; CLOCK lower overhead.
-- Concrete concurrent hash map: `flurry` vs `scc` vs hand-rolled sharded array. ADR when implementation lands.
+- Concrete concurrent hash map: `flurry` vs `scc` vs hand-rolled sharded array. ADR when the pool goes cross-core (M3) — the M1 slice uses `RefCell` per reactor.
 - How the columnar engine (§3.7) plugs in — same per-NUMA BPM with a separate page-kind tag, or its own pool layer.

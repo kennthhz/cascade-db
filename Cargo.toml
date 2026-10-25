@@ -52,7 +52,7 @@ authors      = ["Cascade DB Authors"]
 
 [workspace.dependencies]
 # I/O & async
-tokio-uring = "0.5"          # spec §3.2 REJECTED for the runtime; kept only until existing references are removed
+tokio-uring = "0.5"          # spec §3.2 REJECTED for the runtime; kept for cascade-wal until T1.10 rewrites it
 glommio    = "0.9"           # the runtime executor (spec §3.2, plan R3)
 tokio       = { version = "1", features = ["rt", "macros"] }
 

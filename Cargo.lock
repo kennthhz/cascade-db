@@ -140,6 +140,9 @@ dependencies = [
  "cascade-storage",
  "cascade-telemetry",
  "cascade-types",
+ "futures-lite",
+ "glommio",
+ "static_assertions",
 ]
 
 [[package]]
@@ -366,8 +369,8 @@ dependencies = [
  "cascade-telemetry",
  "cascade-types",
  "crc32fast",
- "libc",
- "tokio-uring",
+ "glommio",
+ "static_assertions",
 ]
 
 [[package]]
