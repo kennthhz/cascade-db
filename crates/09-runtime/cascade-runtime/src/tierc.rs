@@ -97,8 +97,13 @@ mod tests {
                 bound_numa: Some(1)
             }
         );
-        // Config order breaks ties: first numa seen with workers.
+        // Fewest workers wins regardless of config order: numa 1 leads the
+        // list with one worker, numa 0 follows with two.
         let snap = TierCSnapshot::build(NumaAffinity::Single, &[1, 0, 0]);
+        assert_eq!(snap.resolve(None).bound_numa, Some(1));
+        // An exact tie (one worker per numa): config order decides — numa 1
+        // was seen first, so numa 1 wins over numa 0.
+        let snap = TierCSnapshot::build(NumaAffinity::Single, &[1, 0]);
         assert_eq!(snap.resolve(None).bound_numa, Some(1));
         // No workers at all: nothing to bind.
         assert_eq!(

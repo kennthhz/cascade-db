@@ -1,7 +1,19 @@
-//! Private anonymous mappings backing the NUMA pool RAM and the
-//! per-reactor arena: owned from `mmap` to `munmap`, one VMA each — which
-//! is what lets `mbind` address exactly this region and lets the bare-metal
-//! locality check attribute its pages in `/proc/self/numa_maps`.
+//! Private anonymous mappings backing all *placed* memory (spec §8.1,
+//! §10.1 steps 5 and 6b; FR-22, FR-37).
+//!
+//! Both boot-time allocations the runtime makes — the per-NUMA BPM pools
+//! ([`crate::pools`], §10.1 step 5) and the per-reactor working arenas
+//! ([`crate::arena`], step 6b) — are built on this one type, and each
+//! allocation is exactly one VMA, owned from `mmap` to `munmap`. That
+//! single-VMA ownership is what makes placement real and checkable:
+//! `mbind` can address exactly this region (pools bind their node here, so
+//! the faulting thread's own node is irrelevant), and the bare-metal
+//! locality checks attribute pages to nodes in `/proc/self/numa_maps`
+//! (pools and arenas alike). Arenas reserve in-task on the verified core;
+//! pools mbind explicitly at boot — two mechanisms, one substrate.
+//!
+//! Not `Clone`/`Send` by discipline: a mapping is created, used, and
+//! dropped on one thread (boot for pools, the reactor for arenas).
 
 use std::io;
 

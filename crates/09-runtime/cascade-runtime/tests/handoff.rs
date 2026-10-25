@@ -5,7 +5,10 @@
 //!
 //! Since T1.7 the worker runs the Tier A query loop, so "which thread owns
 //! this fd" is observed through `SELECT debug_worker()` — the debug engine
-//! answers with the adopting reactor's thread name.
+//! answers with the adopting reactor's thread name. Since T2.4 the
+//! over-cap path sends the full FR-12 refusal (PG 53300 naming the bound
+//! NUMA) before closing — the capacity test here asserts that shape, not
+//! the old bare close.
 
 use std::{
     io::{Read, Write},

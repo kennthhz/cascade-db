@@ -62,7 +62,7 @@ fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
 /// at the boot wiring's own function).
 #[test]
 fn full_match_logs_nothing() {
-    let _guard = SINK_LOCK.lock().unwrap();
+    let _guard = SINK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (records, unlock) = capture();
 
     let cfg = cfg(0, &[2, 3]);
@@ -83,7 +83,7 @@ fn full_match_logs_nothing() {
 /// uncovered cores (the test review's loudness assertion).
 #[test]
 fn mismatch_warns_loudly_with_param_and_cores() {
-    let _guard = SINK_LOCK.lock().unwrap();
+    let _guard = SINK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (records, unlock) = capture();
 
     // Worker 3 is missing from nohz_full; everything else covers its set.
@@ -108,7 +108,7 @@ fn mismatch_warns_loudly_with_param_and_cores() {
 /// not a fake verification.
 #[test]
 fn unreadable_cmdline_logs_info_and_verifies_nothing() {
-    let _guard = SINK_LOCK.lock().unwrap();
+    let _guard = SINK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (records, unlock) = capture();
 
     let mismatches = deployment::verify_and_log(&cfg(0, &[2]), None);
@@ -130,7 +130,7 @@ fn unreadable_cmdline_logs_info_and_verifies_nothing() {
 /// nothing and fail this test.
 #[test]
 fn boot_warns_exactly_as_the_kernel_cmdline_demands_and_never_refuses() {
-    let _guard = SINK_LOCK.lock().unwrap();
+    let _guard = SINK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     // The expectation, from the kernel itself + the same FR-4 comparison.
     let real_cmdline = fs::read_to_string("/proc/cmdline").ok();
@@ -179,7 +179,7 @@ fn boot_warns_exactly_as_the_kernel_cmdline_demands_and_never_refuses() {
 #[test]
 #[ignore = "requires a kernel actually booted with isolcpus (bare metal)"]
 fn provisioned_host_boots_without_warnings() {
-    let _guard = SINK_LOCK.lock().unwrap();
+    let _guard = SINK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let text = fs::read_to_string("/proc/cmdline").expect("bare metal: cmdline readable");
     let kernel = deployment::parse_cmdline(&text);

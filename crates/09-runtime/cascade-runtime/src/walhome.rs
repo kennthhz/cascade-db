@@ -149,7 +149,7 @@ pub fn construct_writer_on(
                     "wal_home_first_touch_fallback",
                     &[
                         ("numa", numa.to_string().as_str()),
-                        ("reason", "pin verification failed; boot-thread placement"),
+                        ("reason", "pin verification failed; placement unverified"),
                     ],
                 );
                 (writer, None)
@@ -220,6 +220,8 @@ pub fn read_homes(wal_dir: &Path) -> HashMap<u32, u32> {
         }
     };
     match toml::from_str::<HomesDoc>(&text) {
+        // A duplicated id row: the last one wins — the same rule the kernel
+        // applies to repeated cmdline parameters.
         Ok(doc) => doc.db.into_iter().map(|row| (row.id, row.numa)).collect(),
         Err(e) => {
             cascade_telemetry::log(

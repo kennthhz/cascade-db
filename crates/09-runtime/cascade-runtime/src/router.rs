@@ -95,14 +95,24 @@ impl Router {
             // FR-12 (R10): a single-affinity DB with no available worker on
             // its bound NUMA is refused, naming the NUMA — never silently
             // crossed. A cross DB with no capacity anywhere gets the same
-            // code without a NUMA (§5.2 rules only the single case).
-            let message = match placement.bound_numa {
-                Some(numa) => format!(
+            // code without a NUMA (§5.2 rules only the single case). The
+            // match is on the whole placement so a `Single` row with no
+            // bound NUMA cannot silently fall into the cross-flavored
+            // message (unreachable for a validated config: A13 binds among
+            // worker NUMAs).
+            let message = match (placement.affinity, placement.bound_numa) {
+                (NumaAffinity::Single, Some(numa)) => format!(
                     "single-affinity database {:?} is bound to NUMA {numa}, \
                      which has no available workers",
                     session.startup.database().unwrap_or("dev")
                 ),
-                None => "all workers are at their connection capacity".to_owned(),
+                (NumaAffinity::Single, None) => format!(
+                    "single-affinity database {:?} has no bound NUMA with available workers",
+                    session.startup.database().unwrap_or("dev")
+                ),
+                (NumaAffinity::Cross, _) => {
+                    "all workers are at their connection capacity".to_owned()
+                }
             };
             let _ = send_fatal(&mut stream, TOO_MANY_CONNECTIONS, &message);
             return None; // caller drops the stream → closed
