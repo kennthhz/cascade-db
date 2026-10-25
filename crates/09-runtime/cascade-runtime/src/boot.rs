@@ -3,17 +3,20 @@
 //! Order: validate the placement rules (boot is the enforcement point — a
 //! config built directly, not parsed, never skipped validation) → check
 //! every configured core against the topology → spawn housekeepers (plain
-//! `std::thread` per R5) → spawn workers (one glommio reactor per core,
-//! `Placement::Fixed`; the §10.1 pool-allocation step slots in between
-//! these two when T2.3 lands) → each thread reports its *verified*
-//! affinity and boot refuses unless every report is a singleton equal to
-//! its assignment and no core was verified twice. There is no "boot
-//! anyway" fallback: an unpinned or unverified thread is a boot failure
-//! (FR-1, FR-2), and the exposed `Worker`/`Housekeeper` cores are the
-//! verified values, not the config's intent (T2.1).
+//! `std::thread` per R5) → allocate the per-NUMA BPM pools (§10.1 step 5,
+//! T2.3: node-bound memory, sized per config, before any worker exists) →
+//! spawn workers (one glommio reactor per core, `Placement::Fixed`; each
+//! verifies its pin, then reserves its NUMA-local arena — §10.1 step 6b)
+//! → each thread reports its *verified* affinity and boot refuses unless
+//! every report is a singleton equal to its assignment and no core was
+//! verified twice. There is no "boot anyway" fallback: an unpinned or
+//! unverified thread is a boot failure (FR-1, FR-2), and the exposed
+//! `Worker`/`Housekeeper` cores are the verified values, not the config's
+//! intent (T2.1).
 
 use std::{
     collections::{HashMap, HashSet},
+    io,
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -34,6 +37,7 @@ use crate::{
     coop::{self, ReactorStall},
     handoff::Handoff,
     pin::{self, PinError},
+    pools::PoolRegistry,
     router::Router,
     tenant::TenantCounters,
     topology::{TopologyError, TopologyProvider},
@@ -56,6 +60,9 @@ pub struct Runtime {
     /// exposes the FR-27 observables (e.g. [`WalWriter::syncs`]) to tests
     /// and, later, diagnostics.
     wal: Option<Arc<WalWriter>>,
+    /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
+    /// configured NUMA, in config order.
+    pools: PoolRegistry,
 }
 
 pub struct Housekeeper {
@@ -66,6 +73,12 @@ pub struct Housekeeper {
 pub struct Worker {
     pub numa: u32,
     pub core: u32,
+    /// §10.1 step 6c: this reactor's pool binding — the index into
+    /// [`Runtime::pools`] of its own NUMA's pool (`single`-affinity home;
+    /// other pools stay reachable for `cross` lookups, §8.1).
+    pool: usize,
+    /// §10.1 step 6b (FR-37): the arena this reactor reserved in-task.
+    arena_bytes: u64,
     counter: Arc<AtomicU64>,
     tenant_counters: Arc<TenantCounters>,
     stall: Arc<ReactorStall>,
@@ -89,6 +102,20 @@ impl Worker {
     pub fn stall(&self) -> &ReactorStall {
         &self.stall
     }
+
+    /// Index into [`Runtime::pools`] of this NUMA's pool (§10.1 step 6c).
+    /// Affinity routing (T2.4) consumes this via `numa`; the in-reactor
+    /// `Arc<[NumaBpm]>` handle lands with the M3 concurrent BPM.
+    pub fn pool_index(&self) -> usize {
+        self.pool
+    }
+
+    /// Bytes this reactor reserved for its NUMA-local working arena
+    /// (FR-37). Virtual until faulted — the reservation is the placement
+    /// contract.
+    pub fn arena_reserved_bytes(&self) -> u64 {
+        self.arena_bytes
+    }
 }
 
 impl std::fmt::Debug for Runtime {
@@ -106,6 +133,7 @@ impl std::fmt::Debug for Runtime {
                     .map(|w| (w.numa, w.core))
                     .collect::<Vec<_>>(),
             )
+            .field("pools", &self.pools.iter().map(|p| p.numa()).collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +171,18 @@ pub enum BootError {
     /// exactly what the verified-report bookkeeping exists to catch.
     #[error("more than one thread verified onto core {core}")]
     CoreVerifiedTwice { core: u32 },
+    /// The pool's `size_mb` implies more frames than the BPM's frame-width
+    /// (u32) can address — refuse rather than wrap (T2.3).
+    #[error("runtime.numa_pools entry for NUMA {numa} with size_mb = {size_mb} needs more frames than the BPM can address")]
+    PoolTooLarge { numa: u32, size_mb: u64 },
+    /// The kernel refused the pool's memory reservation (mmap) — out of
+    /// address space or memory policy limits.
+    #[error("pool memory for NUMA {numa} failed to reserve: {source}")]
+    PoolReserve {
+        numa: u32,
+        #[source]
+        source: io::Error,
+    },
 }
 
 impl Runtime {
@@ -225,6 +265,10 @@ impl Runtime {
             .wal_dir
             .as_ref()
             .map(|_| Arc::new(cascade_wal::WalWriter::new()));
+        // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
+        // config, its memory bound to its node — after topology is resolved
+        // and placement validated, before any worker exists to fault it.
+        let pools = PoolRegistry::build(cfg)?;
         let workers = spawn_workers(
             cfg,
             receivers,
@@ -233,6 +277,7 @@ impl Runtime {
             &stalls,
             wal.as_ref(),
             cfg.batch_rows,
+            &pools,
             &mut verified,
         )?;
 
@@ -242,6 +287,7 @@ impl Runtime {
             stall_soft: Duration::from_micros(cfg.stall.soft_us),
             stall_hard: Duration::from_micros(cfg.stall.hard_us),
             wal,
+            pools,
         })
     }
 
@@ -273,6 +319,12 @@ impl Runtime {
     /// observables.
     pub fn debug_wal(&self) -> Option<&Arc<WalWriter>> {
         self.wal.as_ref()
+    }
+
+    /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
+    /// configured NUMA, in config order.
+    pub fn pools(&self) -> &PoolRegistry {
+        &self.pools
     }
 }
 
@@ -331,12 +383,13 @@ fn spawn_housekeepers(
         let body: Box<dyn FnOnce() + Send> = match serving.take() {
             Some((loop_, auth, senders, counters)) => Box::new(move || {
                 // Pin first; then accept (blocking — sleeps between
-                // events, FR-5) → authenticate → hand off.
-                let _ = tx.send((core, pin::pin_current(core)));
+                // events, FR-5) → authenticate → hand off. Housekeepers
+                // reserve no arena (the trailing 0 below).
+                let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(loop_, auth, senders, counters, max_conns);
             }),
             None => Box::new(move || {
-                let _ = tx.send((core, pin::pin_current(core)));
+                let _ = tx.send((core, pin::pin_current(core), 0));
                 // Background ticks land later; park — no busy-wait (FR-5).
                 loop {
                     std::thread::park();
@@ -353,12 +406,13 @@ fn spawn_housekeepers(
         out.push(Housekeeper { core, join });
     }
     drop(tx); // so a dead thread's disconnect is observable
-    let verified = confirm_pins(rx, &cfg.housekeeper_cores, verified_all, |cores, deadline_secs| {
-        BootError::HousekeeperUnconfirmed {
-            cores,
-            deadline_secs,
-        }
-    })?;
+    let (verified, _arenas) =
+        confirm_pins(rx, &cfg.housekeeper_cores, verified_all, |cores, deadline_secs| {
+            BootError::HousekeeperUnconfirmed {
+                cores,
+                deadline_secs,
+            }
+        })?;
     // Expose what the kernel verified, not what the config asked for.
     for h in &mut out {
         h.core = verified[&h.core];
@@ -367,12 +421,15 @@ fn spawn_housekeepers(
 }
 
 /// Spawn one glommio reactor per worker core, pinned via `Placement::Fixed`.
-/// The reactor verifies its own affinity in-task (FR-2), connects its
-/// handoff-channel receiver, and adopts each handed-off fd onto its own ring
-/// (FR-13), where it becomes a Tier A session (FR-14) running the
+/// The reactor verifies its own affinity in-task (FR-2), reserves its
+/// NUMA-local working arena (§10.1 step 6b, FR-37) — in-task, on the
+/// verified core, so its pages first-touch local by construction — connects
+/// its handoff-channel receiver, and adopts each handed-off fd onto its own
+/// ring (FR-13), where it becomes a Tier A session (FR-14) running the
 /// simple-query loop (FR-16). The debug table is per-reactor: all sessions
 /// on this worker share one `Rc<Table>` — same-thread sharing only, which is
 /// exactly what the `Rc` inside `Session` enforces.
+#[allow(clippy::too_many_arguments)]
 fn spawn_workers(
     cfg: &RuntimeConfig,
     receivers: Vec<SharedReceiver<Handoff>>,
@@ -381,6 +438,7 @@ fn spawn_workers(
     stalls: &[Arc<ReactorStall>],
     wal: Option<&Arc<WalWriter>>,
     batch_rows: u32,
+    pools: &PoolRegistry,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
@@ -396,6 +454,12 @@ fn spawn_workers(
         .zip(counters.iter())
         .zip(tenant_counters.iter().zip(stalls.iter()))
     {
+        // §10.1 step 6c: bind this reactor to its own NUMA's pool. A
+        // validated config gives every worker NUMA a pool
+        // (`ConfigError::MissingPool`), so the index always exists.
+        let pool = pools
+            .index_for_numa(numa)
+            .expect("validated config gives every worker numa a pool");
         let tx = tx.clone();
         let task_counter = Arc::clone(counter);
         let task_tenants = Arc::clone(tenant_counters);
@@ -406,7 +470,16 @@ fn spawn_workers(
         let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
             .name(&format!("cascade-w-{core}"))
             .spawn(move || async move {
-                let _ = tx.send((core, pin::verify_core(core)));
+                let verified = pin::verify_core(core);
+                // §10.1 step 6b (FR-37): reserve this reactor's working
+                // arena here — on the verified core — before anything else
+                // can run on this ring. Kept for the task's lifetime; the
+                // allocator that consumes it is the runtime ADR.
+                let arena = crate::arena::ReactorArena::reserve(
+                    crate::arena::ARENA_RESERVE_BYTES,
+                )
+                .expect("reactor arena reservation");
+                let _ = tx.send((core, verified, arena.len() as u64));
                 // Reactor-local yield/stall state (§7.1/§7.2) — installed
                 // before any session can run on this ring.
                 coop::configure_for_reactor(Arc::clone(&task_stall), deadline);
@@ -446,6 +519,8 @@ fn spawn_workers(
         out.push(Worker {
             numa,
             core,
+            pool,
+            arena_bytes: 0,
             counter: Arc::clone(counter),
             tenant_counters: Arc::clone(tenant_counters),
             stall: Arc::clone(stall),
@@ -453,7 +528,7 @@ fn spawn_workers(
         });
     }
     drop(tx);
-    let verified = confirm_pins(
+    let (verified, arenas) = confirm_pins(
         rx,
         &cfg.worker_cores
             .iter()
@@ -467,11 +542,20 @@ fn spawn_workers(
     )?;
     // Expose what the kernel verified, not what the config asked for
     // (T2.1): routing, tests, and diagnostics all read the verified fact.
+    // The arena reports are keyed by the assigned core — look them up
+    // before the fixup renames it.
     for w in &mut out {
-        w.core = verified[&w.core];
+        let assigned = w.core;
+        w.core = verified[&assigned];
+        w.arena_bytes = arenas[&assigned];
     }
     Ok(out)
 }
+
+/// What a confirmed boot phase reports back: assigned core → verified
+/// core, and assigned core → arena bytes reserved in-task (0 for
+/// housekeepers).
+type Verified = (HashMap<u32, u32>, HashMap<u32, u64>);
 
 /// Collect pin reports: every expected core must report its *verified*
 /// affinity within the deadline, the set must be a singleton equal to its
@@ -479,20 +563,23 @@ fn spawn_workers(
 /// `verified_all` — may verify onto the same core. Uniqueness is checked
 /// over the kernel's read-back (T2.1), not the config's intent: the
 /// assignment was already validated by `RuntimeConfig::validate`; this is
-/// the layer that catches a pin that landed somewhere else. Returns
-/// assigned → verified core.
+/// the layer that catches a pin that landed somewhere else. Each report
+/// also carries the reactor's arena reservation size (0 for housekeepers,
+/// which reserve none). Returns assigned → verified core, and assigned →
+/// arena bytes.
 fn confirm_pins(
-    rx: mpsc::Receiver<(u32, Result<Vec<u32>, PinError>)>,
+    rx: mpsc::Receiver<(u32, Result<Vec<u32>, PinError>, u64)>,
     expected: &[u32],
     verified_all: &mut HashSet<u32>,
     unconfirmed: fn(Vec<u32>, u64) -> BootError,
-) -> Result<HashMap<u32, u32>, BootError> {
+) -> Result<Verified, BootError> {
     let mut remaining: Vec<u32> = expected.to_vec();
     let mut verified: HashMap<u32, u32> = HashMap::new();
+    let mut arenas: HashMap<u32, u64> = HashMap::new();
     let deadline = PIN_CONFIRM_DEADLINE;
     while !remaining.is_empty() {
         match rx.recv_timeout(deadline) {
-            Ok((core, Ok(seen))) => {
+            Ok((core, Ok(seen), arena_bytes)) => {
                 // verify_core only succeeds on a singleton set equal to the
                 // assignment; re-assert so the uniqueness check below is
                 // always over a well-formed value.
@@ -507,9 +594,10 @@ fn confirm_pins(
                     return Err(BootError::CoreVerifiedTwice { core: v });
                 }
                 verified.insert(core, v);
+                arenas.insert(core, arena_bytes);
                 remaining.retain(|&c| c != core);
             }
-            Ok((core, Err(source))) => return Err(BootError::PinVerify { core, source }),
+            Ok((core, Err(source), _)) => return Err(BootError::PinVerify { core, source }),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return Err(unconfirmed(remaining, deadline.as_secs()))
             }
@@ -518,5 +606,5 @@ fn confirm_pins(
             }
         }
     }
-    Ok(verified)
+    Ok((verified, arenas))
 }
