@@ -39,7 +39,7 @@ fn page_hash(page_id: &PageId) -> u64 {
     fn mix(h: &mut u64, bytes: &[u8]) {
         for b in bytes {
             *h ^= u64::from(*b);
-            *h = h.wrapping_mul(0x1_0000_0001_b3); // 0x100000001b3, the FNV-1a 64 prime
+            *h = h.wrapping_mul(0x0100_0000_01b3); // 0x100000001b3, the FNV-1a 64 prime
         }
     }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;

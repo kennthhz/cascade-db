@@ -21,6 +21,7 @@ pub mod sql;
 pub mod tenant;
 pub mod tierc;
 pub mod topology;
+pub mod walhome;
 
 pub use accept::{AcceptLoop, AcceptStats, AcceptedConn};
 pub use arena::{ReactorArena, ARENA_RESERVE_BYTES};
@@ -28,4 +29,5 @@ pub use boot::{BootError, Housekeeper, Runtime, Worker};
 pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
 pub use pools::{NumaPoolHandle, PoolRegistry};
 pub use tierc::{Placement, TierCSnapshot};
+pub use walhome::{WalHome, WalHomeTable};
 pub use topology::{AllowedCpuTopology, SyntheticTopology, TopologyError, TopologyProvider};

@@ -608,8 +608,7 @@ size_mb = 1
     // boots `physical` changes the worker set without notice).
     #[test]
     fn smt_mode_typo_is_an_error_not_a_default() {
-        let doc = format!(
-            r#"
+        let doc = r#"
 [runtime]
 housekeeper_cores = [0]
 [runtime.topology]
@@ -620,9 +619,8 @@ cores = [2, 3]
 [[runtime.numa_pools]]
 numa = 0
 size_mb = 1024
-"#
-        );
-        let err = RuntimeConfig::from_toml_str(&doc).expect_err("typo'd mode must not parse");
+"#;
+        let err = RuntimeConfig::from_toml_str(doc).expect_err("typo'd mode must not parse");
         assert!(
             matches!(err, ConfigError::Parse(_)),
             "expected Parse error, got {err:?}"

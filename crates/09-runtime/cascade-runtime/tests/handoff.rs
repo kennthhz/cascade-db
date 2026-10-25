@@ -10,7 +10,6 @@
 use std::{
     io::{Read, Write},
     net::TcpStream,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -250,9 +249,8 @@ fn capacity_cap_refuses_instead_of_overloading() {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let rt = Arc::new(
-        Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default()).expect("boot"),
-    );
+    let rt =
+        Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default()).expect("boot");
 
     let mut c1 = connect(&addr, "alice");
     let name = scalar_text(&query(&mut c1, "SELECT debug_worker();"));

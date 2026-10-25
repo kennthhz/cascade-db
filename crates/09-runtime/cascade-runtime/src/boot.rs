@@ -5,6 +5,7 @@
 //! every configured core against the topology → spawn housekeepers (plain
 //! `std::thread` per R5) → allocate the per-NUMA BPM pools (§10.1 step 5,
 //! T2.3: node-bound memory, sized per config, before any worker exists) →
+//! construct the per-DB writer on its WAL home NUMA (T2.6, A14) →
 //! spawn workers (one glommio reactor per core, `Placement::Fixed`; each
 //! verifies its pin, then reserves its NUMA-local arena — §10.1 step 6b)
 //! → each thread reports its *verified* affinity and boot refuses unless
@@ -33,7 +34,7 @@ use glommio::{
 use cascade_wal::WalWriter;
 
 use crate::{
-    config::{AuthConfig, RuntimeConfig, SmtMode},
+    config::{AuthConfig, NumaAffinity, RuntimeConfig, SmtMode},
     coop::{self, ReactorStall},
     handoff::Handoff,
     pin::{self, PinError},
@@ -42,6 +43,7 @@ use crate::{
     tenant::TenantCounters,
     tierc::TierCSnapshot,
     topology::{TopologyError, TopologyProvider},
+    walhome::{self, WalHome, WalHomeTable},
 };
 
 /// How long boot waits for a freshly spawned thread to report its pin before
@@ -61,6 +63,9 @@ pub struct Runtime {
     /// exposes the FR-27 observables (e.g. [`WalWriter::syncs`]) to tests
     /// and, later, diagnostics.
     wal: Option<Arc<WalWriter>>,
+    /// The WAL homing table (T2.6, A14): each database's home NUMA as of
+    /// boot. Empty without `runtime.wal_dir` — no writer, no home.
+    wal_homes: WalHomeTable,
     /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
     /// configured NUMA, in config order.
     pools: PoolRegistry,
@@ -283,17 +288,64 @@ impl Runtime {
             Arc::clone(&tierc),
             &mut verified,
         )?;
-        // T1.11: one shared per-DB writer when a WAL directory is configured
-        // (the debug engine's fixed dev database). Handles are opened
-        // per-reactor, in-task, on each worker's own ring.
-        let wal = cfg
-            .wal_dir
-            .as_ref()
-            .map(|_| Arc::new(cascade_wal::WalWriter::new()));
         // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
         // config, its memory bound to its node — after topology is resolved
         // and placement validated, before any worker exists to fault it.
         let pools = PoolRegistry::build(cfg)?;
+        // T2.6 (A14, §8.2): the per-DB writer, homed per affinity —
+        // `single` follows the Tier C bound NUMA (the writers sit with the
+        // only workers allowed to serve the DB, I13); `cross` gets a
+        // designated NUMA, derived on first creation and persisted under
+        // the WAL directory from then on (A14: a reboot re-reads the
+        // choice, it never re-derives — a changed pool layout must not
+        // migrate a database's WAL stream). One shared writer (T1.11):
+        // every reactor's sessions append through it, so it is constructed
+        // once, on its home NUMA — never per-reactor (the multi-home bug).
+        // The per-reactor handle *open* (§10.1 step 8) stays in-task on
+        // each worker's own ring.
+        let (wal, wal_homes) = match cfg.wal_dir.as_ref() {
+            Some(dir) => {
+                let dev = crate::tenant::dev_context().db;
+                let persisted = walhome::read_homes(dir);
+                let placement = tierc.resolve(Some("dev"));
+                let derived = walhome::derive_wal_home(dev, &pools)
+                    .expect("validated config gives every worker numa a pool");
+                let home = match (placement.affinity, placement.bound_numa) {
+                    (NumaAffinity::Single, Some(numa)) => numa,
+                    // `single` with no bound NUMA means no workers (config
+                    // validation forbids it) — fall back to derivation
+                    // rather than panic.
+                    (NumaAffinity::Single, None) => derived,
+                    (NumaAffinity::Cross, _) => match persisted.get(&dev.0).copied() {
+                        Some(numa) if pools.pool_for_numa(numa).is_some() => numa,
+                        Some(numa) => {
+                            cascade_telemetry::log(
+                                cascade_telemetry::Level::Warn,
+                                "wal_home_persisted_invalid",
+                                &[
+                                    ("db", dev.0.to_string().as_str()),
+                                    ("numa", numa.to_string().as_str()),
+                                    ("policy", "re-deriving (NUMA no longer pooled)"),
+                                ],
+                            );
+                            derived
+                        }
+                        None => derived,
+                    },
+                };
+                let (writer, constructed_on) =
+                    walhome::construct_writer_on(cfg, &online, topology, home);
+                let mut table = WalHomeTable::new();
+                table.set(dev, WalHome { numa: home, constructed_on });
+                // Persist whatever this boot decided (A14), preserving any
+                // rows for databases other than the dev one.
+                let mut to_persist = persisted;
+                to_persist.insert(dev.0, home);
+                walhome::write_homes(dir, &to_persist);
+                (Some(writer), table)
+            }
+            None => (None, WalHomeTable::new()),
+        };
         let workers = spawn_workers(
             cfg,
             receivers,
@@ -312,6 +364,7 @@ impl Runtime {
             stall_soft: Duration::from_micros(cfg.stall.soft_us),
             stall_hard: Duration::from_micros(cfg.stall.hard_us),
             wal,
+            wal_homes,
             pools,
             tierc,
         })
@@ -345,6 +398,12 @@ impl Runtime {
     /// observables.
     pub fn debug_wal(&self) -> Option<&Arc<WalWriter>> {
         self.wal.as_ref()
+    }
+
+    /// The WAL homing table (T2.6, A14): each database's home NUMA, plus
+    /// the first-touch probe of where its writer was constructed.
+    pub fn wal_homes(&self) -> &WalHomeTable {
+        &self.wal_homes
     }
 
     /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
