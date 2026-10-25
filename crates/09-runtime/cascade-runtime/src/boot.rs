@@ -23,6 +23,7 @@ use glommio::{
 
 use crate::{
     config::{AuthConfig, RuntimeConfig, SmtMode},
+    coop::{self, ReactorStall},
     handoff::Handoff,
     pin::{self, PinError},
     router::Router,
@@ -39,6 +40,9 @@ const PIN_CONFIRM_DEADLINE: Duration = Duration::from_secs(10);
 pub struct Runtime {
     housekeepers: Vec<Housekeeper>,
     workers: Vec<Worker>,
+    /// §7.2 thresholds captured at boot for [`Runtime::poll_stalls`].
+    stall_soft: Duration,
+    stall_hard: Duration,
 }
 
 pub struct Housekeeper {
@@ -51,6 +55,7 @@ pub struct Worker {
     pub core: u32,
     counter: Arc<AtomicU64>,
     tenant_counters: Arc<TenantCounters>,
+    stall: Arc<ReactorStall>,
     join: ExecutorJoinHandle<()>,
 }
 
@@ -64,6 +69,12 @@ impl Worker {
     /// Per-tenant counters recorded by this reactor's sessions (FR-20).
     pub fn tenant_counters(&self) -> &TenantCounters {
         &self.tenant_counters
+    }
+
+    /// This reactor's stall totals (§7.2) — the per-reactor counters the
+    /// housekeeper poll reads (A15).
+    pub fn stall(&self) -> &ReactorStall {
+        &self.stall
     }
 }
 
@@ -82,7 +93,7 @@ impl std::fmt::Debug for Runtime {
                     .map(|w| (w.numa, w.core))
                     .collect::<Vec<_>>(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -160,20 +171,31 @@ impl Runtime {
         let mut receivers = Vec::with_capacity(n_workers);
         let mut counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n_workers);
         let mut tenant_counters: Vec<Arc<TenantCounters>> = Vec::with_capacity(n_workers);
+        let mut stalls: Vec<Arc<ReactorStall>> = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
             let (tx, rx) = new_bounded::<Handoff>(1024);
             senders.push(tx);
             receivers.push(rx);
             counters.push(Arc::new(AtomicU64::new(0)));
             tenant_counters.push(Arc::new(TenantCounters::new()));
+            stalls.push(Arc::new(ReactorStall::new()));
         }
 
         let housekeepers = spawn_housekeepers(cfg, listener, auth, senders, counters.clone())?;
-        let workers = spawn_workers(cfg, receivers, &counters, &tenant_counters, cfg.batch_rows)?;
+        let workers = spawn_workers(
+            cfg,
+            receivers,
+            &counters,
+            &tenant_counters,
+            &stalls,
+            cfg.batch_rows,
+        )?;
 
         Ok(Runtime {
             housekeepers,
             workers,
+            stall_soft: Duration::from_micros(cfg.stall.soft_us),
+            stall_hard: Duration::from_micros(cfg.stall.hard_us),
         })
     }
 
@@ -183,6 +205,21 @@ impl Runtime {
 
     pub fn workers(&self) -> &[Worker] {
         &self.workers
+    }
+
+    /// One housekeeper-style stall sample over every worker reactor (A15),
+    /// returning `(soft, hard)` totals across all reactors. The tick loop
+    /// that calls this periodically lands with the housekeeper (M4+); this
+    /// method is the poll surface today.
+    pub fn poll_stalls(&self) -> (u64, u64) {
+        let mut soft = 0;
+        let mut hard = 0;
+        for w in &self.workers {
+            coop::poll_stall(w.stall(), self.stall_soft, self.stall_hard);
+            soft += w.stall().soft_total();
+            hard += w.stall().hard_total();
+        }
+        (soft, hard)
     }
 }
 
@@ -273,6 +310,7 @@ fn spawn_workers(
     receivers: Vec<SharedReceiver<Handoff>>,
     counters: &[Arc<AtomicU64>],
     tenant_counters: &[Arc<TenantCounters>],
+    stalls: &[Arc<ReactorStall>],
     batch_rows: u32,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
@@ -282,19 +320,25 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for ((((numa, core), rx), counter), tenant_counters) in per_core
+    for ((((numa, core), rx), counter), (tenant_counters, stall)) in per_core
         .into_iter()
         .zip(receivers)
         .zip(counters.iter())
-        .zip(tenant_counters.iter())
+        .zip(tenant_counters.iter().zip(stalls.iter()))
     {
         let tx = tx.clone();
         let task_counter = Arc::clone(counter);
         let task_tenants = Arc::clone(tenant_counters);
+        let task_stall = Arc::clone(stall);
+        let deadline = Duration::from_micros(cfg.yield_deadline_us);
         let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
             .name(&format!("cascade-w-{core}"))
             .spawn(move || async move {
                 let _ = tx.send((core, pin::verify_core(core)));
+                // Reactor-local yield/stall state (§7.1/§7.2) — installed
+                // before any session can run on this ring.
+                coop::configure_for_reactor(Arc::clone(&task_stall), deadline);
+                coop::spawn_heartbeat();
                 let handoffs = rx.connect().await;
                 let table = Rc::new(crate::session::Table::new());
                 while let Some(handoff) = handoffs.recv().await {
@@ -316,6 +360,7 @@ fn spawn_workers(
             core,
             counter: Arc::clone(counter),
             tenant_counters: Arc::clone(tenant_counters),
+            stall: Arc::clone(stall),
             join,
         });
     }

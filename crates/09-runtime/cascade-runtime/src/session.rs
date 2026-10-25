@@ -433,6 +433,8 @@ async fn execute<W: AsyncWrite + Unpin>(
                 out.row(&fields);
                 if out.should_flush() {
                     out.flush().await.map_err(io_err)?;
+                    // §7.1: every vectorized batch boundary yields.
+                    crate::coop::yield_point().await;
                 }
             }
             out.flush().await.map_err(io_err)?;

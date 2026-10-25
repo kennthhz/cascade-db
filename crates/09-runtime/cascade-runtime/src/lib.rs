@@ -7,6 +7,7 @@
 pub mod accept;
 pub mod boot;
 pub mod config;
+pub mod coop;
 pub mod handoff;
 pub mod pg;
 pub mod pin;
