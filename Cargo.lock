@@ -300,6 +300,7 @@ dependencies = [
  "cascade-telemetry",
  "cascade-tenant",
  "cascade-types",
+ "cascade-wal",
  "futures-lite",
  "glommio",
  "hmac 0.12.1",

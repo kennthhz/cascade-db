@@ -40,11 +40,11 @@ impl Error {
     pub fn sqlstate(&self) -> &'static str {
         match self {
             Error::Storage(_) | Error::Wal(_) => "58000", // system_error
-            Error::Txn(_)                     => "40000", // transaction_rollback (family)
-            Error::Catalog(_)                 => "42000", // syntax_error_or_access_rule_violation
-            Error::Sql(_)                     => "42601", // syntax_error
-            Error::Wire(_)                    => "08000", // connection_exception
-            Error::Internal(_)                => "XX000", // internal_error
+            Error::Txn(_) => "40000",                     // transaction_rollback (family)
+            Error::Catalog(_) => "42000",                 // syntax_error_or_access_rule_violation
+            Error::Sql(_) => "42601",                     // syntax_error
+            Error::Wire(_) => "08000",                    // connection_exception
+            Error::Internal(_) => "XX000",                // internal_error
         }
     }
 }

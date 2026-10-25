@@ -144,6 +144,11 @@ pub struct RuntimeConfig {
     pub drain_deadline_s: u64,
     /// Per-worker availability cap (spec §5.2, plan A7; default 200).
     pub max_conns_per_worker: u32,
+    /// WAL directory for the debug engine's per-DB log (T1.11). `None` keeps
+    /// the session engine in-memory only (COMMIT acks without durability —
+    /// pre-T1.11 behavior). When set, every COMMIT is WAL-appended and
+    /// `fdatasync`ed before its ack (FR-27), one `db_<id>.log` per database.
+    pub wal_dir: Option<std::path::PathBuf>,
     /// Tier C fan-out bounded wait (spec §8.4, plan R11; default 1 000 ms).
     pub tierc_fanout_wait_ms: u64,
     pub stall: StallConfig,
@@ -163,6 +168,7 @@ impl Default for RuntimeConfig {
             batch_rows: 1024,
             drain_deadline_s: 30,
             max_conns_per_worker: 200,
+            wal_dir: None,
             tierc_fanout_wait_ms: 1000,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),

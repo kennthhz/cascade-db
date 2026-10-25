@@ -279,13 +279,13 @@ fn crc_catches_a_torn_record_on_reopen() {
     reactor().run(async {
         let reader = DebugWalReader::open(&dir, DB).await.expect("reader opens");
         // First record is intact.
-        let (at, rec) = reader
+        let entry = reader
             .read_record(Lsn(0))
             .await
             .expect("first read succeeds")
             .expect("first record exists");
-        assert_eq!(at, Lsn(0));
-        assert!(matches!(rec, WalRecord::BeginTxn { xid: 9 }));
+        assert_eq!(entry.lsn, Lsn(0));
+        assert!(matches!(entry.record, WalRecord::BeginTxn { xid: 9 }));
         // Second record carries the flipped byte.
         match reader.read_record(b1).await {
             Err(WalError::Corruption(at)) => assert_eq!(at, b1),
@@ -310,31 +310,35 @@ fn txn_sequence_roundtrips_through_the_reader() {
         assert_eq!(durable, b3);
 
         let reader = DebugWalReader::open(&dir, DB).await.expect("reader opens");
-        let (at1, r1) = reader
+        let e1 = reader
             .read_record(Lsn(0))
             .await
             .expect("read 1 succeeds")
             .expect("rec 1 exists");
-        assert_eq!(at1, Lsn(0));
-        assert!(matches!(r1, WalRecord::BeginTxn { xid: 3 }));
-        let (at2, r2) = reader
+        assert_eq!(e1.lsn, Lsn(0));
+        assert!(matches!(e1.record, WalRecord::BeginTxn { xid: 3 }));
+        let e2 = reader
             .read_record(b1)
             .await
             .expect("read 2 succeeds")
             .expect("rec 2 exists");
-        assert_eq!(at2, b1);
+        assert_eq!(e2.lsn, b1);
         assert_eq!(
-            r2,
+            e2.record,
             insert(3, 1, "alice"),
             "full row image survives the roundtrip"
         );
-        let (at3, r3) = reader
+        let e3 = reader
             .read_record(b2)
             .await
             .expect("read 3 succeeds")
             .expect("rec 3 exists");
-        assert_eq!(at3, b2);
-        assert!(matches!(r3, WalRecord::CommitTxn { xid: 3 }));
+        assert_eq!(e3.lsn, b2);
+        assert!(matches!(e3.record, WalRecord::CommitTxn { xid: 3 }));
+        // The end boundaries chain: e.next is exactly where the next record
+        // was written — how recovery steps without knowing lengths.
+        assert_eq!(e1.next, b1);
+        assert_eq!(e2.next, b2);
         let done = reader.read_record(b3).await.expect("eof check");
         assert!(done.is_none(), "end of log");
     });

@@ -81,6 +81,17 @@ impl std::fmt::Display for WalError {
     }
 }
 
+/// One decoded record and where to continue — the unit recovery walks by.
+#[derive(Debug)]
+pub struct WalEntry {
+    /// The record's LSN (its first byte).
+    pub lsn: Lsn,
+    pub record: WalRecord,
+    /// One past the record's last byte: pass this as the next
+    /// [`WalReader::read_record`] `start` to step through the log.
+    pub next: Lsn,
+}
+
 /// Read-side trait for WAL consumers (recovery, logical CDC).
 ///
 /// Reservation for §6.3: physical recovery is one consumer of this trait;
@@ -89,9 +100,9 @@ impl std::fmt::Display for WalError {
 /// `DatabaseId`), so the draft's `db` parameter lives on the constructor.
 #[allow(async_fn_in_trait)] // readers are reactor-bound, like stores
 pub trait WalReader {
-    /// Read the next record at exactly `start`, returning the decoded
-    /// record and its LSN. Returns `None` at end-of-log.
-    async fn read_record(&self, start: Lsn) -> Result<Option<(Lsn, WalRecord)>, WalError>;
+    /// Read the record starting at exactly `start`. Returns `None` at
+    /// end-of-log; [`WalError::Corruption`] on a torn or bit-rotted record.
+    async fn read_record(&self, start: Lsn) -> Result<Option<WalEntry>, WalError>;
 }
 
 // `DatabaseId` names the log file; kept in scope for the public constructors.

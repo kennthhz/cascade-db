@@ -31,6 +31,10 @@ pub struct WalWriter {
     /// Durable watermark (FR-26): everything at or below this offset is
     /// `fdatasync`ed.
     durable: AtomicU64,
+    /// Completed `fdatasync` barriers — the observable behind
+    /// [`WalWriter::syncs`]: a caller that has *seen an ack* can assert the
+    /// barrier count moved, proving the ack followed durability.
+    syncs: AtomicU64,
     /// Encoded record bytes by start offset, until durable. The lock is the
     /// debug-slice ADR (§8.2's "mutex-free ring" lands with the perf ADR);
     /// the *watermark protocol* above is the production contract. Short
@@ -56,6 +60,7 @@ impl WalWriter {
             reserved: AtomicU64::new(0),
             filled: AtomicU64::new(0),
             durable: AtomicU64::new(0),
+            syncs: AtomicU64::new(0),
             pending: Mutex::new(BTreeMap::new()),
             leader: AtomicBool::new(false),
             wake: Mutex::new(Vec::new()),
@@ -70,6 +75,13 @@ impl WalWriter {
     /// Highest `fdatasync`ed byte offset.
     pub fn durable(&self) -> Lsn {
         Lsn(self.durable.load(Ordering::Acquire))
+    }
+
+    /// How many `fdatasync` barriers have completed. FR-27's
+    /// durable-before-ack ordering, observable: once a COMMIT ack is on the
+    /// wire, this count has already moved.
+    pub fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Acquire)
     }
 
     /// §8.2 `append_wal`: atomically reserve a byte range and return the
@@ -117,6 +129,7 @@ impl WalWriter {
                         io.write_batch(start, batch).await?;
                         io.sync_data().await?;
                         self.durable.store(target, Ordering::Release);
+                        self.syncs.fetch_add(1, Ordering::AcqRel);
                         true
                     } else {
                         false

@@ -98,6 +98,14 @@ impl ReactorStall {
         self.last_beat_us.store(now_us(), Ordering::Relaxed);
     }
 
+    /// Microseconds since the last beat, on this process's monotonic
+    /// [`now_us`] clock — the same quantity [`poll_stall`] classifies,
+    /// readable directly (diagnostics; tests sample it in-reactor where no
+    /// teardown beat can race the measurement).
+    pub fn gap_us(&self) -> u64 {
+        now_us().saturating_sub(self.last_beat_us.load(Ordering::Relaxed))
+    }
+
     /// Gaps that reached the soft threshold (§7.2: ≥ 1 ms).
     pub fn soft_total(&self) -> u64 {
         self.soft_total.load(Ordering::Relaxed)

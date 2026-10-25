@@ -21,6 +21,8 @@ use glommio::{
     ExecutorJoinHandle, LocalExecutorBuilder, Placement,
 };
 
+use cascade_wal::WalWriter;
+
 use crate::{
     config::{AuthConfig, RuntimeConfig, SmtMode},
     coop::{self, ReactorStall},
@@ -43,6 +45,11 @@ pub struct Runtime {
     /// §7.2 thresholds captured at boot for [`Runtime::poll_stalls`].
     stall_soft: Duration,
     stall_hard: Duration,
+    /// The debug engine's shared per-DB writer (T1.11), when
+    /// `runtime.wal_dir` is configured. Workers hold `Arc` clones; this one
+    /// exposes the FR-27 observables (e.g. [`WalWriter::syncs`]) to tests
+    /// and, later, diagnostics.
+    wal: Option<Arc<WalWriter>>,
 }
 
 pub struct Housekeeper {
@@ -182,12 +189,20 @@ impl Runtime {
         }
 
         let housekeepers = spawn_housekeepers(cfg, listener, auth, senders, counters.clone())?;
+        // T1.11: one shared per-DB writer when a WAL directory is configured
+        // (the debug engine's fixed dev database). Handles are opened
+        // per-reactor, in-task, on each worker's own ring.
+        let wal = cfg
+            .wal_dir
+            .as_ref()
+            .map(|_| Arc::new(cascade_wal::WalWriter::new()));
         let workers = spawn_workers(
             cfg,
             receivers,
             &counters,
             &tenant_counters,
             &stalls,
+            wal.as_ref(),
             cfg.batch_rows,
         )?;
 
@@ -196,6 +211,7 @@ impl Runtime {
             workers,
             stall_soft: Duration::from_micros(cfg.stall.soft_us),
             stall_hard: Duration::from_micros(cfg.stall.hard_us),
+            wal,
         })
     }
 
@@ -220,6 +236,13 @@ impl Runtime {
             hard += w.stall().hard_total();
         }
         (soft, hard)
+    }
+
+    /// The debug engine's shared WAL writer, when `runtime.wal_dir` is
+    /// configured (T1.11). Its watermarks and barrier count are the FR-27
+    /// observables.
+    pub fn debug_wal(&self) -> Option<&Arc<WalWriter>> {
+        self.wal.as_ref()
     }
 }
 
@@ -311,6 +334,7 @@ fn spawn_workers(
     counters: &[Arc<AtomicU64>],
     tenant_counters: &[Arc<TenantCounters>],
     stalls: &[Arc<ReactorStall>],
+    wal: Option<&Arc<WalWriter>>,
     batch_rows: u32,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
@@ -330,6 +354,8 @@ fn spawn_workers(
         let task_counter = Arc::clone(counter);
         let task_tenants = Arc::clone(tenant_counters);
         let task_stall = Arc::clone(stall);
+        let task_writer = wal.map(Arc::clone);
+        let task_wal_dir = cfg.wal_dir.clone();
         let deadline = Duration::from_micros(cfg.yield_deadline_us);
         let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
             .name(&format!("cascade-w-{core}"))
@@ -339,14 +365,30 @@ fn spawn_workers(
                 // before any session can run on this ring.
                 coop::configure_for_reactor(Arc::clone(&task_stall), deadline);
                 coop::spawn_heartbeat();
+                // T1.11 (I2): this reactor's WAL handle, opened on — and
+                // owned by — this ring, shared by all its sessions.
+                let wal = match (task_writer, task_wal_dir) {
+                    (Some(writer), Some(dir)) => {
+                        let handle =
+                            cascade_wal::WalHandle::open(&dir, crate::tenant::dev_context().db)
+                                .await
+                                .expect("worker wal handle opens");
+                        Some((writer, Rc::new(handle)))
+                    }
+                    _ => None,
+                };
                 let handoffs = rx.connect().await;
                 let table = Rc::new(crate::session::Table::new());
                 while let Some(handoff) = handoffs.recv().await {
                     let counter = task_counter.clone();
                     let tenants = task_tenants.clone();
                     let table = Rc::clone(&table);
+                    let wal = wal.as_ref().map(|(writer, handle)| crate::session::Wal {
+                        writer: Arc::clone(writer),
+                        handle: Rc::clone(handle),
+                    });
                     glommio::spawn_local(crate::session::run(
-                        handoff, table, counter, tenants, batch_rows,
+                        handoff, table, counter, tenants, wal, batch_rows,
                     ))
                     .detach();
                 }

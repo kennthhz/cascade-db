@@ -13,7 +13,7 @@ use std::{
 use cascade_types::{DatabaseId, Lsn};
 use glommio::io::BufferedFile;
 
-use crate::{format, WalError, WalReader, WalRecord};
+use crate::{format, WalError, WalReader};
 
 /// Per-reactor append handle for one DB's log file. Not `Send` across
 /// reactors by discipline (the file is bound to the opening ring);
@@ -137,7 +137,7 @@ impl WalReader for DebugWalReader {
     /// Decodes the single record starting at `start` (its LSN). `None` at
     /// end-of-log; [`WalError::Corruption`] on a torn or bit-rotted record
     /// (wal invariant 4 — this is the check recovery relies on).
-    async fn read_record(&self, start: Lsn) -> Result<Option<(Lsn, WalRecord)>, WalError> {
+    async fn read_record(&self, start: Lsn) -> Result<Option<crate::WalEntry>, WalError> {
         if start.0 >= self.len {
             return Ok(None);
         }
@@ -160,7 +160,11 @@ impl WalReader for DebugWalReader {
         match format::decode(&bytes) {
             Ok((rec, consumed)) => {
                 debug_assert_eq!(consumed, total);
-                Ok(Some((start, rec)))
+                Ok(Some(crate::WalEntry {
+                    lsn: start,
+                    record: rec,
+                    next: Lsn(start.0 + consumed as u64),
+                }))
             }
             Err(format::DecodeError::Corruption) => Err(WalError::Corruption(start)),
             Err(format::DecodeError::UnknownRecordVersion(v)) => {

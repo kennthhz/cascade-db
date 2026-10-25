@@ -22,6 +22,8 @@ use std::{
 
 use cascade_telemetry::Span;
 use cascade_tenant::TenantContext;
+use cascade_types::{Lsn, SegmentId};
+use cascade_wal::{WalError, WalHandle, WalRecord, WalWriter};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use static_assertions::assert_not_impl_any;
 
@@ -40,6 +42,27 @@ const INT4_OID: i32 = 23;
 const TEXT_OID: i32 = 25;
 
 type Row = (i32, String);
+
+/// The debug table's storage segment in WAL records (one logical table in
+/// the debug slice; the catalog assigns real segments in later milestones).
+const DEV_TABLE_SEG: SegmentId = SegmentId(1);
+
+/// Process-wide transaction-id source for WAL records. The debug slice runs
+/// one process; per-DB xid generators come with the catalog.
+static NEXT_XID: AtomicU64 = AtomicU64::new(1);
+
+fn next_xid() -> u64 {
+    NEXT_XID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Per-connection WAL wiring (T1.11, FR-27): the DB's shared writer plus
+/// *this reactor's* handle. The writer is `Arc`-shared across workers; the
+/// handle is opened on — and stays on — this worker's ring (I2), shared by
+/// all its sessions via `Rc`.
+pub struct Wal {
+    pub writer: Arc<WalWriter>,
+    pub handle: Rc<WalHandle>,
+}
 
 /// The worker-shared debug table: `debug_table(id INT, val TEXT)`, one
 /// instance per worker reactor. Sessions on the same worker see each
@@ -119,6 +142,17 @@ impl PgError {
 impl From<SqlError> for PgError {
     fn from(e: SqlError) -> Self {
         PgError::new(e.code(), e.to_string())
+    }
+}
+
+impl From<WalError> for PgError {
+    fn from(e: WalError) -> Self {
+        match e {
+            WalError::Io(_) => PgError::new("58000", format!("wal flush failed: {e}")),
+            WalError::Corruption(_) | WalError::UnknownRecordVersion(_) => {
+                PgError::new("XX000", format!("wal integrity failure: {e}"))
+            }
+        }
     }
 }
 
@@ -235,6 +269,7 @@ pub async fn run(
     table: Rc<Table>,
     counter: Arc<AtomicU64>,
     tenants: Arc<TenantCounters>,
+    wal: Option<Wal>,
     batch_rows: u32,
 ) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -297,7 +332,17 @@ pub async fn run(
                     }
                     match crate::sql::parse(stmt_sql.trim()) {
                         Ok(stmt) => {
-                            match execute(&mut sess, stmt, &mut out, &ctx, &span, &tenants).await {
+                            match execute(
+                                &mut sess,
+                                stmt,
+                                &mut out,
+                                &ctx,
+                                &span,
+                                &tenants,
+                                wal.as_ref(),
+                            )
+                            .await
+                            {
                                 Ok(()) => {}
                                 Err(e) => {
                                     let _ = out.send_error(&e).await;
@@ -336,12 +381,22 @@ pub async fn run(
             }
         }
     }
+    // Disconnect cleanup (FR-15): a mid-txn disconnect aborts. Pending rows
+    // were never WAL-appended (the WAL write happens at COMMIT, so nothing
+    // of this txn was reserved) — discarding them leaves nothing behind for
+    // replay. Page pins, statements, and the per-query arena arrive with the
+    // buffer-pool-backed engine; scope exit drops them in order regardless.
+    if sess.txn != TxnStatus::Idle {
+        sess.pending.clear();
+        sess.txn = TxnStatus::Idle;
+    }
     drop(out); // closes the fd
     counter.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Execute one parsed statement, writing its full result set. Errors carry
-/// the SQLSTATE the client sees.
+/// the SQLSTATE the client sees. `wal` is the connection's WAL wiring (or
+/// `None` for the in-memory-only debug engine).
 async fn execute<W: AsyncWrite + Unpin>(
     sess: &mut Session,
     stmt: Stmt,
@@ -349,6 +404,7 @@ async fn execute<W: AsyncWrite + Unpin>(
     ctx: &TenantContext,
     span: &Span,
     tenants: &TenantCounters,
+    wal: Option<&Wal>,
 ) -> Result<(), PgError> {
     // The hot-path shape (FR-20/FR-21): context and span borrowed, per
     // statement, nothing global.
@@ -386,6 +442,14 @@ async fn execute<W: AsyncWrite + Unpin>(
                     return Err(PgError::new("25P01", "there is no transaction in progress"))
                 }
                 TxnStatus::InTxn => {
+                    // FR-27 order: WAL append → fdatasync → *then* apply and
+                    // ack. A flush failure errors before the table is
+                    // touched and before the client sees COMMIT — the txn
+                    // becomes Failed, and its COMMIT (or ROLLBACK) discards
+                    // the pending rows.
+                    if let Some(wal) = wal {
+                        durable_commit(wal, &sess.pending).await?;
+                    }
                     for row in sess.pending.drain(..) {
                         sess.table.insert(row);
                     }
@@ -405,10 +469,17 @@ async fn execute<W: AsyncWrite + Unpin>(
         }
         Stmt::Insert { id, val } => {
             let row = (id, val);
-            if sess.txn == TxnStatus::InTxn {
-                sess.pending.push(row);
-            } else {
-                sess.table.insert(row);
+            match sess.txn {
+                TxnStatus::InTxn => sess.pending.push(row),
+                // An autocommit INSERT is its own transaction: same FR-27
+                // order — its WAL record is durable before the ack.
+                TxnStatus::Idle => {
+                    if let Some(wal) = wal {
+                        durable_commit(wal, std::slice::from_ref(&row)).await?;
+                    }
+                    sess.table.insert(row);
+                }
+                TxnStatus::Failed => unreachable!("handled above"),
             }
             send_tag(out, "INSERT 0 1").await
         }
@@ -453,6 +524,41 @@ async fn execute<W: AsyncWrite + Unpin>(
             send_tag(out, "SELECT 1").await
         }
     }
+}
+
+/// Make one transaction durable, in FR-27 order, and return the commit
+/// record's end boundary (⇒ `durable >= boundary` on `Ok`). Every
+/// reservation of the transaction is taken *before* the first fill — the
+/// COMMIT record's byte range exists before any earlier record becomes
+/// flushable — so a crash mid-fill leaves an unfilled hole at the tear
+/// point and the filled watermark (therefore every flush) stops there: no
+/// partial transaction can ever become durable or be acked. The records
+/// need not be contiguous in the log (another reactor's session can
+/// reserve in between); the watermark protocol is indifferent to that.
+async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
+    let xid = next_xid();
+    let writer = &wal.writer;
+    let begin = writer.append_wal(&WalRecord::BeginTxn { xid });
+    let mut inserts = Vec::with_capacity(rows.len());
+    for (id, val) in rows {
+        inserts.push(writer.append_wal(&WalRecord::Insert {
+            xid,
+            table: DEV_TABLE_SEG,
+            id: *id,
+            val: val.clone(),
+        }));
+    }
+    let commit = writer.append_wal(&WalRecord::CommitTxn { xid });
+    let end = commit.end();
+
+    let _ = begin.fill();
+    for r in inserts {
+        let _ = r.fill();
+    }
+    let _ = commit.fill();
+
+    writer.flush_wal(&wal.handle, end).await?;
+    Ok(end)
 }
 
 async fn send_tag<W: AsyncWrite + Unpin>(

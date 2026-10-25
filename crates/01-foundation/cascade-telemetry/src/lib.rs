@@ -79,12 +79,13 @@ pub fn set_log_sink(sink: Option<std::sync::Arc<LogSink>>) -> Option<std::sync::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+
+    type CapturedRecords = Arc<Mutex<Vec<(Level, String, Vec<(String, String)>)>>>;
 
     #[test]
     fn log_records_land_in_the_installed_sink() {
-        let records: Arc<Mutex<Vec<(Level, String, Vec<(String, String)>)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let records: CapturedRecords = Arc::new(Mutex::new(Vec::new()));
         let capture = Arc::clone(&records);
         let prev = set_log_sink(Some(Arc::new(move |level, event, fields| {
             capture.lock().unwrap().push((
