@@ -80,6 +80,18 @@ impl PoolMemory {
     pub fn frame(&self, i: u32) -> &[u8] {
         self.mapping.frame(i as usize, PAGE_SIZE)
     }
+
+    /// Overwrites the `i`th frame with `image` (boot-time population —
+    /// the demo heap is the only writer, and `&mut self` proves it runs
+    /// while the registry is still exclusively held by boot).
+    pub fn write_frame(&mut self, i: u32, image: &[u8]) {
+        assert!(
+            image.len() == PAGE_SIZE,
+            "a frame image is exactly PAGE_SIZE bytes"
+        );
+        let dst = self.mapping.frame_mut(i as usize, PAGE_SIZE);
+        dst.copy_from_slice(image);
+    }
 }
 
 /// One registry entry: a pool's placement + sizing contract (FR-22) and
@@ -115,6 +127,11 @@ impl NumaPoolHandle {
     /// The pool's page RAM.
     pub fn memory(&self) -> &PoolMemory {
         &self.memory
+    }
+
+    /// Exclusive access to the pool's page RAM (boot-time population).
+    pub fn memory_mut(&mut self) -> &mut PoolMemory {
+        &mut self.memory
     }
 }
 
@@ -176,6 +193,13 @@ impl PoolRegistry {
     /// The pool on `numa`, if configured.
     pub fn pool_for_numa(&self, numa: u32) -> Option<&NumaPoolHandle> {
         self.pools.iter().find(|p| p.numa == numa)
+    }
+
+    /// Exclusive access to one pool, by NUMA (boot-time population).
+    pub fn pool_for_numa_mut(&mut self, numa: u32) -> Option<&mut NumaPoolHandle> {
+        self.pools
+            .iter_mut()
+            .find(|p| p.numa() == numa)
     }
 
     /// Registry index of the pool on `numa` (§10.1 step 6c's binding for

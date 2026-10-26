@@ -79,6 +79,21 @@ impl Mapping {
         unsafe { std::slice::from_raw_parts(self.base.add(i * frame_len), frame_len) }
     }
 
+    /// Mutable view of the `i`th frame — boot-time population only (the
+    /// demo heap's initial write). The `&mut self` makes the sole-writer
+    /// claim structural: mutable access requires the same exclusive
+    /// borrow that proves no reader exists.
+    pub(crate) fn frame_mut(&mut self, i: usize, frame_len: usize) -> &mut [u8] {
+        assert!(
+            (i + 1) * frame_len <= self.len,
+            "frame {i} out of range (len {})",
+            self.len
+        );
+        // SAFETY: `base + i*frame_len .. +frame_len` is inside the owned
+        // mapping for any `i` the assert allows.
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(i * frame_len), frame_len) }
+    }
+
     /// Faults every kernel page of the mapping in (one volatile write per
     /// page). Never used on a hot path — tests and the bare-metal locality
     /// check, which needs resident pages to see placement in numa_maps.

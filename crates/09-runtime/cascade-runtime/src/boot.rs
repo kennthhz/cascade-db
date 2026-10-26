@@ -70,6 +70,8 @@ pub struct Runtime {
     /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
     /// configured NUMA, in config order.
     pools: PoolRegistry,
+    /// The perf-demo relation, when `runtime.demo_rows` > 0.
+    demo_heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
     /// The static Tier C placement snapshot routing reads (FR-10, T2.4).
     /// Live catalog updates arrive with T5.5.
     tierc: Arc<TierCSnapshot>,
@@ -183,6 +185,11 @@ pub enum BootError {
     CoreVerifiedTwice { core: u32 },
     /// The pool's `size_mb` implies more frames than the BPM's frame-width
     /// (u32) can address — refuse rather than wrap (T2.3).
+    #[error("demo_rows = {rows} needs {rows} pages but the tightest pool holds only {frame_budget} frames — raise numa_pools size_mb")]
+    DemoTooLarge {
+        rows: u32,
+        frame_budget: usize,
+    },
     #[error("runtime.numa_pools entry for NUMA {numa} with size_mb = {size_mb} needs more frames than the BPM can address")]
     PoolTooLarge { numa: u32, size_mb: u64 },
     /// The kernel refused the pool's memory reservation (mmap) — out of
@@ -300,7 +307,7 @@ impl Runtime {
         // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
         // config, its memory bound to its node — after topology is resolved
         // and placement validated, before any worker exists to fault it.
-        let pools = PoolRegistry::build(cfg)?;
+        let mut pools = PoolRegistry::build(cfg)?;
         // T2.6 (A14, §8.2): the per-DB writer, homed per affinity —
         // `single` follows the Tier C bound NUMA (the writers sit with the
         // only workers allowed to serve the DB, I13); `cross` gets a
@@ -312,6 +319,24 @@ impl Runtime {
         // once, on its home NUMA — never per-reactor (the multi-home bug).
         // The per-reactor handle *open* (§10.1 step 8) stays in-task on
         // each worker's own ring.
+        // Perf-demo relation: populated once, on the boot thread, before
+        // any reactor exists to read it (module-doc discipline).
+        let demo_heap = match cfg.demo_rows {
+            0 => None,
+            rows => {
+                let db = crate::tenant::dev_context().db;
+                match crate::demoheap::DemoHeap::populate(rows, db, &mut pools) {
+                    Ok(heap) => Some(std::sync::Arc::new(heap)),
+                    Err(frame_budget) => {
+                        return Err(BootError::DemoTooLarge {
+                            rows,
+                            frame_budget,
+                        })
+                    }
+                }
+            }
+        };
+
         let (wal, wal_homes) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
@@ -364,6 +389,7 @@ impl Runtime {
             wal.as_ref(),
             cfg.batch_rows,
             &pools,
+            demo_heap.clone(),
             &mut verified,
         )?;
 
@@ -376,6 +402,7 @@ impl Runtime {
             wal_homes,
             pools,
             tierc,
+            demo_heap,
         })
     }
 
@@ -413,6 +440,12 @@ impl Runtime {
     /// the first-touch probe of where its writer was constructed.
     pub fn wal_homes(&self) -> &WalHomeTable {
         &self.wal_homes
+    }
+
+    /// The perf-demo relation (read-only, pool-resident), when booted
+    /// with `demo_rows > 0`.
+    pub fn demo_heap(&self) -> Option<&std::sync::Arc<crate::demoheap::DemoHeap>> {
+        self.demo_heap.as_ref()
     }
 
     /// The §10.1 step-5 pool registry (T2.3): one node-bound BPM pool per
@@ -543,6 +576,7 @@ fn spawn_workers(
     wal: Option<&Arc<WalWriter>>,
     batch_rows: u32,
     pools: &PoolRegistry,
+    demo_heap: Option<Arc<crate::demoheap::DemoHeap>>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
@@ -570,6 +604,7 @@ fn spawn_workers(
         let task_stall = Arc::clone(stall);
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
+        let task_heap = demo_heap.clone();
         let deadline = Duration::from_micros(cfg.yield_deadline_us);
         let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
             .name(&format!("cascade-w-{core}"))
@@ -606,12 +641,13 @@ fn spawn_workers(
                     let counter = task_counter.clone();
                     let tenants = task_tenants.clone();
                     let table = Rc::clone(&table);
+                    let heap = task_heap.clone();
                     let wal = wal.as_ref().map(|(writer, handle)| crate::session::Wal {
                         writer: Arc::clone(writer),
                         handle: Rc::clone(handle),
                     });
                     glommio::spawn_local(crate::session::run(
-                        handoff, table, counter, tenants, wal, batch_rows,
+                        handoff, table, counter, tenants, wal, heap, batch_rows,
                     ))
                     .detach();
                 }

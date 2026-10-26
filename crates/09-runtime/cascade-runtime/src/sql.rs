@@ -46,17 +46,33 @@ impl SqlError {
     }
 }
 
+/// Which fixed relation a SELECT targets (the resolution layer's stand-in
+/// for a catalog lookup).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    /// The debug engine's transactional table (`debug_table(id, val)`).
+    Debug,
+    /// The perf demo's read-only pool-resident heap (`demo(id, payload)`,
+    /// `demoheap`) — present only when booted with `demo_rows > 0`.
+    Demo,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Col {
     Id,
+    /// `debug_table.val`.
     Val,
+    /// `demo.payload`.
+    Payload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
-    /// `SELECT … FROM debug_table [WHERE id = <i32>]` — the point filter
-    /// is the slice's only predicate (the perf demo's lookup shape).
+    /// `SELECT … FROM <fixed table> [WHERE id = <i32>]` — the point
+    /// filter is the slice's only predicate (the perf demo's lookup
+    /// shape).
     Select {
+        table: TableKind,
         cols: Vec<Col>,
         filter: Option<i32>,
     },
@@ -157,9 +173,13 @@ fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
         };
     };
 
-    if table.name != "debug_table" {
-        return Err(SqlError::UndefinedTable { name: table.name.clone() });
-    }
+    // Catalog stand-in: which fixed relation, and which columns exist on
+    // it. A real catalog arrives with Phase 3.
+    let kind = match table.name.as_str() {
+        "debug_table" => TableKind::Debug,
+        "demo" => TableKind::Demo,
+        other => return Err(SqlError::UndefinedTable { name: other.to_owned() }),
+    };
 
     // Target list → projection. `*` expands to the whole fixed schema and
     // must stand alone (PG would allow `SELECT *, id` — unmodeled).
@@ -170,12 +190,19 @@ fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
                 if !cols.is_empty() {
                     return Err(SqlError::Unsupported { command: "select".into() });
                 }
-                cols.extend([Col::Id, Col::Val]);
+                match kind {
+                    TableKind::Debug => cols.extend([Col::Id, Col::Val]),
+                    TableKind::Demo => cols.extend([Col::Id, Col::Payload]),
+                }
             }
-            pgp::Target::Column(name) => match name.as_str() {
-                "id" | "ID" => cols.push(Col::Id),
-                "val" | "VAL" => cols.push(Col::Val),
-                _ => return Err(SqlError::UndefinedColumn { name: name.clone() }),
+            pgp::Target::Column(name) => match (kind, name.as_str()) {
+                (TableKind::Debug, "id") => cols.push(Col::Id),
+                (TableKind::Debug, "val") => cols.push(Col::Val),
+                (TableKind::Demo, "id") => cols.push(Col::Id),
+                (TableKind::Demo, "payload") => cols.push(Col::Payload),
+                // Cross-table columns are exactly what a catalog would
+                // call undefined.
+                (_, other) => return Err(SqlError::UndefinedColumn { name: other.to_owned() }),
             },
             pgp::Target::Function { .. } | pgp::Target::Unsupported => {
                 return Err(SqlError::Unsupported { command: "select".into() });
@@ -212,7 +239,7 @@ fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
         Some(_) => return Err(SqlError::Unsupported { command: "select".into() }),
     };
 
-    Ok(Stmt::Select { cols, filter })
+    Ok(Stmt::Select { table: kind, cols, filter })
 }
 
 #[cfg(test)]
@@ -223,15 +250,29 @@ mod tests {
     fn resolves_the_subset() {
         assert_eq!(
             parse("SELECT * FROM debug_table"),
-            Ok(Stmt::Select { cols: vec![Col::Id, Col::Val], filter: None })
+            Ok(Stmt::Select { table: TableKind::Debug, cols: vec![Col::Id, Col::Val], filter: None })
         );
         assert_eq!(
             parse("select id, val from debug_table"),
-            Ok(Stmt::Select { cols: vec![Col::Id, Col::Val], filter: None })
+            Ok(Stmt::Select { table: TableKind::Debug, cols: vec![Col::Id, Col::Val], filter: None })
         );
         assert_eq!(
             parse("SELECT val FROM debug_table"),
-            Ok(Stmt::Select { cols: vec![Col::Val], filter: None })
+            Ok(Stmt::Select { table: TableKind::Debug, cols: vec![Col::Val], filter: None })
+        );
+        // The demo relation resolves on the same terms.
+        assert_eq!(
+            parse("SELECT payload FROM demo WHERE id = 5"),
+            Ok(Stmt::Select {
+                table: TableKind::Demo,
+                cols: vec![Col::Payload],
+                filter: Some(5)
+            })
+        );
+        assert_eq!(
+            parse("SELECT val FROM demo").unwrap_err().code(),
+            "42703",
+            "debug_table's columns do not exist on demo"
         );
         assert_eq!(parse("SELECT debug_worker()"), Ok(Stmt::DebugWorker));
         assert_eq!(
@@ -261,15 +302,15 @@ mod tests {
         // order, negative constants folded by the grammar.
         assert_eq!(
             parse("SELECT val FROM debug_table WHERE id = 42"),
-            Ok(Stmt::Select { cols: vec![Col::Val], filter: Some(42) })
+            Ok(Stmt::Select { table: TableKind::Debug, cols: vec![Col::Val], filter: Some(42) })
         );
         assert_eq!(
             parse("SELECT * FROM debug_table WHERE 42 = id"),
-            Ok(Stmt::Select { cols: vec![Col::Id, Col::Val], filter: Some(42) })
+            Ok(Stmt::Select { table: TableKind::Debug, cols: vec![Col::Id, Col::Val], filter: Some(42) })
         );
         assert_eq!(
             parse("SELECT id FROM debug_table WHERE id = -7"),
-            Ok(Stmt::Select { cols: vec![Col::Id], filter: Some(-7) })
+            Ok(Stmt::Select { table: TableKind::Debug, cols: vec![Col::Id], filter: Some(-7) })
         );
     }
 

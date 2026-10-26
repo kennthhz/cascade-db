@@ -144,6 +144,11 @@ pub struct RuntimeConfig {
     pub drain_deadline_s: u64,
     /// Per-worker availability cap (spec §5.2, plan A7; default 200).
     pub max_conns_per_worker: u32,
+    /// Rows to populate the perf-demo relation `demo(id INT, payload
+    /// TEXT)` with at boot (read-only, pool-resident — `demoheap`). `0`
+    /// (default) leaves it absent; `SELECT`ing from `demo` then errors
+    /// undefined-table, exactly like a missing relation.
+    pub demo_rows: u32,
     /// WAL directory for the debug engine's per-DB log (T1.11). `None` keeps
     /// the session engine in-memory only (COMMIT acks without durability —
     /// pre-T1.11 behavior). When set, every COMMIT is WAL-appended and
@@ -169,6 +174,7 @@ impl Default for RuntimeConfig {
             drain_deadline_s: 30,
             max_conns_per_worker: 200,
             wal_dir: None,
+            demo_rows: 0,
             tierc_fanout_wait_ms: 1000,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),

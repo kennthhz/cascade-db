@@ -24,6 +24,11 @@ struct Fixture {
 }
 
 fn boot(batch_rows: u32) -> Fixture {
+    boot_demo(batch_rows, 0)
+}
+
+/// `demo_rows > 0` boots with the perf-demo relation populated.
+fn boot_demo(batch_rows: u32, demo_rows: u32) -> Fixture {
     let mut allowed = pin::current_affinity();
     assert!(allowed.len() >= 3, "needs at least 3 CPUs");
     allowed.truncate(3);
@@ -40,6 +45,7 @@ fn boot(batch_rows: u32) -> Fixture {
             size_mb: 1,
         }],
         batch_rows,
+        demo_rows,
         ..RuntimeConfig::default()
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
@@ -441,4 +447,71 @@ fn raw_startup_trust(sock: &mut TcpStream) {
             break;
         }
     }
+}
+
+/// The perf demo's read path over the wire: the pool-resident `demo`
+/// relation answers point selects with the generated payload, honors the
+/// filter in either written order, and reports the row count.
+#[test]
+fn demo_relation_answers_point_selects_over_the_wire() {
+    let fx = boot_demo(1024, 500);
+    let mut c = postgres::Client::connect(&fx.url, postgres::NoTls).expect("connect");
+
+    let rows = rows_of(
+        &c.simple_query("SELECT payload FROM demo WHERE id = 1")
+            .expect("first row"),
+    );
+    assert_eq!(rows, vec![vec![Some("payload-00000001".into())]]);
+
+    // A page-boundary id (65 = first row of the second page) and the
+    // last populated row.
+    for id in [64u32, 65, 500] {
+        let rows = rows_of(
+            &c.simple_query(&format!("SELECT id, payload FROM demo WHERE id = {id}"))
+                .expect("point hit"),
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some(id.to_string()),
+                Some(format!("payload-{id:08}")),
+            ]]
+        );
+    }
+
+    // Reversed written order — the resolution normalizes it.
+    let rows = rows_of(
+        &c.simple_query("SELECT payload FROM demo WHERE 42 = id").expect("reversed"),
+    );
+    assert_eq!(rows, vec![vec![Some("payload-00000042".into())]]);
+
+    // A miss returns zero rows and a truthful count.
+    let msgs = c
+        .simple_query("SELECT payload FROM demo WHERE id = 9999")
+        .expect("point miss");
+    assert!(rows_of(&msgs).is_empty());
+    assert!(msgs.iter().any(|m| matches!(
+        m,
+        postgres::SimpleQueryMessage::CommandComplete(0)
+    )));
+
+    // Unfiltered reads scan the whole relation.
+    let msgs = c.simple_query("SELECT payload FROM demo").expect("full scan");
+    assert_eq!(
+        rows_of(&msgs).len(),
+        500,
+        "every populated row comes back"
+    );
+}
+
+/// Without `demo_rows`, the relation simply does not exist (42P01) —
+/// the catalog stand-in, not a crash.
+#[test]
+fn demo_relation_absent_without_demo_rows() {
+    let fx = boot(1024);
+    let mut c = postgres::Client::connect(&fx.url, postgres::NoTls).expect("connect");
+    let err = c
+        .simple_query("SELECT payload FROM demo")
+        .expect_err("no demo relation");
+    assert_eq!(err.as_db_error().expect("pg error").code().code(), "42P01");
 }

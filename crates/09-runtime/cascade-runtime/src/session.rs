@@ -29,7 +29,7 @@ use static_assertions::assert_not_impl_any;
 
 use crate::{
     handoff::Handoff,
-    sql::{Col, SqlError, Stmt},
+    sql::{Col, SqlError, Stmt, TableKind},
     tenant::{dev_context, TenantCounters},
 };
 
@@ -270,6 +270,7 @@ pub async fn run(
     counter: Arc<AtomicU64>,
     tenants: Arc<TenantCounters>,
     wal: Option<Wal>,
+    heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
     batch_rows: u32,
 ) {
     counter.fetch_add(1, Ordering::Relaxed);
@@ -340,6 +341,7 @@ pub async fn run(
                                 &span,
                                 &tenants,
                                 wal.as_ref(),
+                                heap.as_ref(),
                             )
                             .await
                             {
@@ -396,7 +398,9 @@ pub async fn run(
 
 /// Execute one parsed statement, writing its full result set. Errors carry
 /// the SQLSTATE the client sees. `wal` is the connection's WAL wiring (or
-/// `None` for the in-memory-only debug engine).
+/// `None` for the in-memory-only debug engine); `heap` the demo relation
+/// when booted with one.
+#[allow(clippy::too_many_arguments)] // each param is a distinct concern; a bag struct would only hide that
 async fn execute<W: AsyncWrite + Unpin>(
     sess: &mut Session,
     stmt: Stmt,
@@ -405,6 +409,7 @@ async fn execute<W: AsyncWrite + Unpin>(
     span: &Span,
     tenants: &TenantCounters,
     wal: Option<&Wal>,
+    heap: Option<&std::sync::Arc<crate::demoheap::DemoHeap>>,
 ) -> Result<(), PgError> {
     // The hot-path shape (FR-20/FR-21): context and span borrowed, per
     // statement, nothing global.
@@ -483,38 +488,51 @@ async fn execute<W: AsyncWrite + Unpin>(
             }
             send_tag(out, "INSERT 0 1").await
         }
-        Stmt::Select { cols, filter } => {
-            out.send(b'T', &row_description(&cols))
-                .await
-                .map_err(io_err)?;
-            // Own uncommitted inserts are visible inside the transaction;
-            // committed rows come from the table. (Insertion order across
-            // the two sources is not interleaved — accepted slice cut.)
-            let mut rows = sess.pending.clone();
-            rows.extend(sess.table.snapshot());
-            // The point filter (WHERE id = <i32>) — the demo's lookup shape.
-            if let Some(id) = filter {
-                rows.retain(|(rid, _)| *rid == id);
-            }
-            for (id, val) in &rows {
-                let id = id.to_string();
-                let fields: Vec<&[u8]> = cols
-                    .iter()
-                    .map(|c| match c {
-                        Col::Id => id.as_bytes(),
-                        Col::Val => val.as_bytes(),
-                    })
-                    .collect();
-                out.row(&fields);
-                if out.should_flush() {
-                    out.flush().await.map_err(io_err)?;
-                    // §7.1: every vectorized batch boundary yields.
-                    crate::coop::yield_point().await;
+        Stmt::Select { table, cols, filter } => match table {
+            TableKind::Debug => {
+                out.send(b'T', &row_description(&cols))
+                    .await
+                    .map_err(io_err)?;
+                // Own uncommitted inserts are visible inside the
+                // transaction; committed rows come from the table.
+                // (Insertion order across the two sources is not
+                // interleaved — accepted slice cut.)
+                let mut rows = sess.pending.clone();
+                rows.extend(sess.table.snapshot());
+                // The point filter (WHERE id = <i32>) — the demo's lookup
+                // shape.
+                if let Some(id) = filter {
+                    rows.retain(|(rid, _)| *rid == id);
                 }
+                for (id, val) in &rows {
+                    let id = id.to_string();
+                    let fields: Vec<&[u8]> = cols
+                        .iter()
+                        .map(|c| match c {
+                            Col::Id => id.as_bytes(),
+                            Col::Val => val.as_bytes(),
+                            Col::Payload => unreachable!("debug_table has no payload"),
+                        })
+                        .collect();
+                    out.row(&fields);
+                    if out.should_flush() {
+                        out.flush().await.map_err(io_err)?;
+                        // §7.1: every vectorized batch boundary yields.
+                        crate::coop::yield_point().await;
+                    }
+                }
+                out.flush().await.map_err(io_err)?;
+                send_tag(out, &format!("SELECT {}", rows.len())).await
             }
-            out.flush().await.map_err(io_err)?;
-            send_tag(out, &format!("SELECT {}", rows.len())).await
-        }
+            TableKind::Demo => {
+                // Catalog presence: the relation exists only when the
+                // runtime was booted with demo_rows > 0.
+                let Some(heap) = heap else {
+                    return Err(PgError::new("42P01", "relation \"demo\" does not exist"));
+                };
+                demo_select(heap, &cols, filter, out).await
+            }
+        },
         Stmt::DebugWorker => {
             out.send(b'T', &debug_worker_description())
                 .await
@@ -597,9 +615,52 @@ fn row_description(cols: &[Col]) -> Vec<u8> {
         match c {
             Col::Id => payload.extend(field("id", INT4_OID, 4)),
             Col::Val => payload.extend(field("val", TEXT_OID, -2)),
+            Col::Payload => payload.extend(field("payload", TEXT_OID, -2)),
         }
     }
     payload
+}
+
+/// The perf demo's read path (the measurement instrument, not the
+/// engine): parse already paid (ADR 0002); what remains is the point
+/// arithmetic — `id → page,slot → pool-resident bytes → decode` — and
+/// the wire. Same batching/yield discipline as the debug select.
+async fn demo_select<W: AsyncWrite + Unpin>(
+    heap: &crate::demoheap::DemoHeap,
+    cols: &[Col],
+    filter: Option<i32>,
+    out: &mut RowBatcher<W>,
+) -> Result<(), PgError> {
+    out.send(b'T', &row_description(cols))
+        .await
+        .map_err(io_err)?;
+    let (first, last) = match filter {
+        Some(id) => (id.max(0) as u32, (id.max(0) as u32).min(heap.rows())),
+        None => (1, heap.rows()),
+    };
+    let mut sent = 0u64;
+    if first != 0 {
+        for id in first..=last {
+            let Some((rid, payload)) = heap.row(id) else { continue };
+            let rid = rid.to_string();
+            let fields: Vec<&[u8]> = cols
+                .iter()
+                .map(|c| match c {
+                    Col::Id => rid.as_bytes(),
+                    Col::Val => unreachable!("demo has no val"),
+                    Col::Payload => payload.as_bytes(),
+                })
+                .collect();
+            out.row(&fields);
+            sent += 1;
+            if out.should_flush() {
+                out.flush().await.map_err(io_err)?;
+                crate::coop::yield_point().await;
+            }
+        }
+    }
+    out.flush().await.map_err(io_err)?;
+    send_tag(out, &format!("SELECT {sent}")).await
 }
 
 fn debug_worker_description() -> Vec<u8> {
