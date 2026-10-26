@@ -14,6 +14,7 @@ cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-tenant    = { workspace = true }
 cascade-wal       = { workspace = true }
+cascade-pg-parser = { workspace = true }
 
 libc        = { workspace = true }
 glommio      = { workspace = true }

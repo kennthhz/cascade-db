@@ -484,7 +484,7 @@ Run on the new/changed tests; findings block the commit.
 
 - **Transaction layer**: XID allocators (§8.3), MVCC visibility, undo — Tier B rows in spec §4; lands with `cascade-mvcc`/`cascade-undo` milestones. The slice's debug engine is single-writer-per-row.
 - **Full access methods**: heap/B+tree/columnar (§4) — `cascade-heap`/`cascade-btree` milestones; the slice has a fixed-row debug table.
-- **Real SQL surface**: planner/extended protocol/prepared statements/cursors (§3.3 Tier A rows) — post-slice; parser decision at T1.0 (A1).
+- **Real SQL surface**: planner/extended protocol/prepared statements/cursors (§3.3 Tier A rows) — post-slice; parser decision made and landed (A1).
 - **NUMA-affinity migration runner** (§2.5.4): Phase 7+; v1 ships the DDL surface returning `unsupported_feature` (FR-38) — exactly as the spec prescribes.
 - **Parallel query**: absent from the spec by design; the escape-hatch shape (coordinator + per-shard scans + Tier B queues) is sketched in conversation only, not planned here.
 - **Logical CDC decoder** (§9 future row), resource-group *enforcement* (only TenantContext plumbing per I5), TLS (A9), multi-DB parallel replay (A8 — single-DB replay until M5), hot-attach/detach of CPUs (spec: unsupported, docs only).
@@ -493,7 +493,7 @@ Run on the new/changed tests; findings block the commit.
 
 | # | Ambiguity | Status |
 |---|---|---|
-| A1 | **SQL surface for the slice** — spec defines none. Debug subset: single fixed-row table (`SELECT` projection, `INSERT`, `BEGIN/COMMIT`). Parser: `cascade-pg-parser` if it builds at T1.0, else micro-parser. | **Resolved (T1.0)** — `cascade-pg-parser` is an unimplemented stub; hand-rolled micro-parser in `cascade-runtime` for T1.7. Glommio pin findings: `Placement::Fixed(usize)` pins a reactor to one CPU id directly; fd adoption is the std `FromRawFd` impl on `glommio::net::TcpStream` (verified working by `tests/spike.rs`). |
+| A1 | **SQL surface for the slice** — spec defines none. Debug subset: single fixed-row table (`SELECT` projection, `INSERT`, `BEGIN/COMMIT`). Parser: `cascade-pg-parser` if it builds at T1.0, else micro-parser. | **Resolved (T1.0), superseded (2026-10-26)** — T1.7 shipped a hand-rolled micro-parser while `cascade-pg-parser` was a stub. The perf-demo ruling (ADR 0002, re-confirmed 2026-10-25) then landed the real binding: libpg_query vendored in-tree (`cascade-pg-parser-sys`, see VENDORED.md; gcc-only build), and the runtime's `sql.rs` now parses with PG's grammar + resolves against the fixed schema (42P01/42703 semantics stay runtime-side; parsed-but-unmodeled → 0A000). Glommio pin findings: `Placement::Fixed(usize)` pins a reactor to one CPU id directly; fd adoption is the std `FromRawFd` impl on `glommio::net::TcpStream` (verified working by `tests/spike.rs`). |
 | A2 | **Load metric** — §5.2 defines a composite but no sampling cadence. Slice: 1 s sample interval, EWMA α=0.5 (recorded in T0.1 backfill). | Default set |
 | A3 | **Refusal shape** — §5.2 says "clear error". Ruled PG `53300` + NUMA named (R10). | Ruled R10 |
 | A4 | **Fan-out vs ack ordering** — §8.4 shows ack after all stores; a stalled reactor would stall DDL. Ruled bounded wait + lazy adoption (R11); flagged as a deliberate spec deviation-with-safety-valve. | Ruled R11 |

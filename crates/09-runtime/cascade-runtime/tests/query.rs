@@ -117,6 +117,25 @@ fn insert_then_select_roundtrips_with_projection() {
         })
         .collect();
     assert_eq!(tags, vec![2], "CommandComplete reports the row count");
+
+    // The demo's query shape through the wire: the point filter parsed by
+    // libpg_query, resolved against the fixed schema, applied in the
+    // engine. Either written order must hit the same row.
+    let point = rows_of(
+        &c.simple_query("SELECT id, val FROM debug_table WHERE id = 2")
+            .expect("point select"),
+    );
+    assert_eq!(point, vec![vec![Some("2".into()), Some("two".into())]]);
+    let reversed = rows_of(
+        &c.simple_query("SELECT val FROM debug_table WHERE 2 = id")
+            .expect("reversed point select"),
+    );
+    assert_eq!(reversed, vec![vec![Some("two".into())]]);
+    let miss = rows_of(
+        &c.simple_query("SELECT val FROM debug_table WHERE id = 99")
+            .expect("point miss"),
+    );
+    assert!(miss.is_empty(), "no match → no rows, got {miss:?}");
 }
 
 #[test]
@@ -166,9 +185,12 @@ fn subset_errors_carry_pg_sqlstates_and_failed_txn_refuses() {
     let fx = boot(1024);
     let mut c = client(&fx);
 
+    // DROP parses cleanly under the real grammar (libpg_query since the
+    // demo); the engine refuses it as *unsupported*, not malformed —
+    // 0A000, the code a PG extension would raise.
     assert_eq!(
         sqlstate(c.simple_query("DROP TABLE x").unwrap_err()),
-        "42601"
+        "0A000"
     );
     assert_eq!(
         sqlstate(c.simple_query("SELECT * FROM nope").unwrap_err()),

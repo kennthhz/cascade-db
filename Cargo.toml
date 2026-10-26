@@ -79,6 +79,10 @@ sha2   = "0.10"
 base64 = "0.22"
 rand   = "0.8"
 
+# libpg_query build/deps (ADR 0002 — vendored C in cascade-pg-parser-sys).
+cc    = "1"
+prost = "0.13.5"
+
 # internal crates (declared here so members reference by `{ workspace = true }`)
 cascade-types     = { path = "crates/01-foundation/cascade-types" }
 cascade-error     = { path = "crates/01-foundation/cascade-error" }

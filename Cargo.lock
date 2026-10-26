@@ -29,6 +29,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "async-trait"
 version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -258,16 +264,16 @@ dependencies = [
 name = "cascade-pg-parser"
 version = "0.1.0"
 dependencies = [
- "cascade-error",
  "cascade-pg-parser-sys",
- "cascade-types",
 ]
 
 [[package]]
 name = "cascade-pg-parser-sys"
 version = "0.1.0"
 dependencies = [
- "libc",
+ "cc",
+ "prost",
+ "serde",
 ]
 
 [[package]]
@@ -309,6 +315,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "cascade-error",
+ "cascade-pg-parser",
  "cascade-telemetry",
  "cascade-tenant",
  "cascade-types",
@@ -603,6 +610,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "either"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
+
+[[package]]
 name = "enclose"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -855,6 +868,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "189d0897e4cbe8c75efedf3502c18c887b05046e59d28404d4d8e46cbc4d1e86"
 dependencies = [
  "memoffset",
+]
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
 ]
 
 [[package]]
@@ -1157,6 +1179,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

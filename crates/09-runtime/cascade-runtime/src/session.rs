@@ -483,7 +483,7 @@ async fn execute<W: AsyncWrite + Unpin>(
             }
             send_tag(out, "INSERT 0 1").await
         }
-        Stmt::Select { cols } => {
+        Stmt::Select { cols, filter } => {
             out.send(b'T', &row_description(&cols))
                 .await
                 .map_err(io_err)?;
@@ -492,6 +492,10 @@ async fn execute<W: AsyncWrite + Unpin>(
             // the two sources is not interleaved — accepted slice cut.)
             let mut rows = sess.pending.clone();
             rows.extend(sess.table.snapshot());
+            // The point filter (WHERE id = <i32>) — the demo's lookup shape.
+            if let Some(id) = filter {
+                rows.retain(|(rid, _)| *rid == id);
+            }
             for (id, val) in &rows {
                 let id = id.to_string();
                 let fields: Vec<&[u8]> = cols

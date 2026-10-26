@@ -31,3 +31,31 @@ No other crate may FFI into the parser. No other crate may FFI into PG C code at
 - **`sqlparser-rs`.** Pure Rust, but PG dialect coverage lags PG and will silently fail on ORM queries. Long-term compatibility risk outweighs the purity gain.
 - **Hand-rolled parser.** Many months of work; will still drift from PG.
 - **Embed full Postgres binary.** Defeats the entire premise of Cascade DB.
+
+## Amendment (2026-10-26) — binding implementation: vendored C, hand-written bindings
+
+The two-crate isolation (`cascade-pg-parser-sys` + `cascade-pg-parser`) is
+unchanged and in force. The *binding mechanism* resolved differently from
+the original sketch (bindgen over in-tree sources): bindgen requires
+libclang on every build machine, which makes every fresh clone of the
+workspace depend on a heavy toolchain for one C header. Instead:
+
+- The libpg_query C sources (17-latest, from the pinned `pg_query` 6.2.1
+  crates.io package, sha256 recorded) are vendored in-tree under
+  `crates/07-sql/cascade-pg-parser-sys/libpg_query/`.
+- The C API surface used is one parse entry point + its free function;
+  the bindings are hand-written `#[repr(C)]` mirrors of `pg_query.h` —
+  as the "alternatives considered" already anticipated ("hand-written is
+  small enough to maintain").
+- The protobuf tree types are checked-in prost-generated code
+  (`src/pb.rs`), regenerated on re-vendoring.
+- Provenance and the re-vendoring procedure: `VENDORED.md` next to the
+  sources. Re-vendoring remains a deliberate, reviewed action (invariant 4).
+
+Consequence update: CI needs a C compiler (gcc/clang), *not* libclang or
+protobuf tooling.
+
+Ruling re-confirmed 2026-10-25 (perf-demo fairness work): cascade parses
+with PG's real grammar so the frontend parse cost is identical to
+PostgreSQL's in comparisons; parse-only ≠ planner, stated rather than
+implied wherever the claim is made.

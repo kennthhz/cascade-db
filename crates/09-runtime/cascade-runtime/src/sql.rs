@@ -1,20 +1,34 @@
-//! Micro-SQL parser for the debug engine (plan A1: the slice's fixed SQL
-//! surface — one fixed-row table `debug_table(id INT, val TEXT)`,
-//! `SELECT` projection, `INSERT`, `BEGIN`/`COMMIT`/`ROLLBACK`, and the
-//! debug function `debug_worker()` used by tests to prove placement).
+//! SQL front end for the debug engine: real PG-dialect parsing via
+//! `cascade-pg-parser` (libpg_query — ADR 0002, the user's 2026-10-25
+//! ruling), then *fixed-schema resolution* against the slice's one table
+//! `debug_table(id INT, val TEXT)` and the debug function `debug_worker()`.
 //!
-//! This is deliberately not a real parser: `cascade-pg-parser` is an
-//! unimplemented stub, and the slice needs exactly this subset. Errors carry
-//! PG SQLSTATE codes so the session can emit real ErrorResponse messages.
+//! The split is deliberate and is the honest shape of "parse-only ≠
+//! planner": the parser (PG's grammar, byte-exact dialect) answers *what
+//! the text says*; this module answers *what it means here* — the two
+//! SQLSTATEs a real catalog would produce (42P01 undefined table, 42703
+//! undefined column) come from comparing the parsed shape against the
+//! fixed schema, not from the parser. Everything parsed-but-unmodeled is
+//! refused with 0A000 (feature not supported), never mislabeled a syntax
+//! error.
+//!
+//! Resolution results feed [`Stmt`], the same enum the session executed
+//! before this was a real parser — the engine below it is unchanged.
+
+use cascade_pg_parser as pgp;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SqlError {
-    #[error("syntax error in: {sql}")]
-    Syntax { sql: String },
-    #[error("undefined table: {name}")]
+    /// The parser refused the text — PG's own message (e.g.
+    /// `syntax error at or near "SELEC"`).
+    #[error("{message}")]
+    Syntax { message: String },
+    #[error("relation \"{name}\" does not exist")]
     UndefinedTable { name: String },
-    #[error("column {name} does not exist")]
+    #[error("column \"{name}\" does not exist")]
     UndefinedColumn { name: String },
+    #[error("{command} is not supported by this engine")]
+    Unsupported { command: String },
     #[error("{0}")]
     Protocol(&'static str),
 }
@@ -26,6 +40,7 @@ impl SqlError {
             SqlError::Syntax { .. } => "42601",
             SqlError::UndefinedTable { .. } => "42P01",
             SqlError::UndefinedColumn { .. } => "42703",
+            SqlError::Unsupported { .. } => "0A000",
             SqlError::Protocol(_) => "08P01",
         }
     }
@@ -39,8 +54,11 @@ pub enum Col {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
+    /// `SELECT … FROM debug_table [WHERE id = <i32>]` — the point filter
+    /// is the slice's only predicate (the perf demo's lookup shape).
     Select {
         cols: Vec<Col>,
+        filter: Option<i32>,
     },
     DebugWorker,
     Insert {
@@ -54,108 +72,9 @@ pub enum Stmt {
     Empty,
 }
 
-/// Token stream: identifiers/keywords, integers, quoted strings, punctuation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Tok {
-    Word(String),
-    Int(i64),
-    Str(String),
-    Comma,
-    LParen,
-    RParen,
-    Semi,
-    Star,
-}
-
-fn tokenize(sql: &str) -> Result<Vec<Tok>, SqlError> {
-    let mut toks = Vec::new();
-    let bytes: Vec<char> = sql.chars().collect();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match c {
-            c if c.is_whitespace() => i += 1,
-            ';' => {
-                toks.push(Tok::Semi);
-                i += 1;
-            }
-            ',' => {
-                toks.push(Tok::Comma);
-                i += 1;
-            }
-            '(' => {
-                toks.push(Tok::LParen);
-                i += 1;
-            }
-            ')' => {
-                toks.push(Tok::RParen);
-                i += 1;
-            }
-            '*' => {
-                toks.push(Tok::Star);
-                i += 1;
-            }
-            '\'' => {
-                // Single-quoted string with '' escape.
-                let mut s = String::new();
-                i += 1;
-                loop {
-                    if i >= bytes.len() {
-                        return Err(SqlError::Syntax {
-                            sql: sql.to_owned(),
-                        });
-                    }
-                    if bytes[i] == '\'' {
-                        if i + 1 < bytes.len() && bytes[i + 1] == '\'' {
-                            s.push('\'');
-                            i += 2;
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        s.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-                toks.push(Tok::Str(s));
-            }
-            c if c.is_ascii_digit() || c == '-' => {
-                let start = i;
-                if c == '-' {
-                    i += 1;
-                }
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                let text: String = bytes[start..i].iter().collect();
-                let n: i64 = text.parse().map_err(|_| SqlError::Syntax {
-                    sql: sql.to_owned(),
-                })?;
-                toks.push(Tok::Int(n));
-            }
-            c if c.is_alphabetic() || c == '_' => {
-                let start = i;
-                while i < bytes.len() && (bytes[i].is_alphanumeric() || bytes[i] == '_') {
-                    i += 1;
-                }
-                toks.push(Tok::Word(bytes[start..i].iter().collect()));
-            }
-            _ => {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                })
-            }
-        }
-    }
-    Ok(toks)
-}
-
-fn keyword(tok: Option<&Tok>, kw: &str) -> bool {
-    matches!(tok, Some(Tok::Word(w)) if w.eq_ignore_ascii_case(kw))
-}
-
 /// Split a simple-query batch into statements on `;` (outside quotes).
+/// Wire-level text handling, upstream of the parser (libpg_query sees one
+/// statement at a time, exactly like a prepared statement would).
 pub fn split_statements(sql: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -178,180 +97,122 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     out
 }
 
-fn peek(toks: &[Tok], pos: usize) -> Option<&Tok> {
-    toks.get(pos)
-}
-
-fn next(toks: &[Tok], pos: &mut usize) -> Option<Tok> {
-    let t = toks.get(*pos).cloned();
-    *pos += 1;
-    t
-}
-
-/// Parse one statement (no trailing `;` — callers strip it).
+/// Parses one statement (no trailing `;` — callers strip it) and resolves
+/// it against the fixed schema.
 pub fn parse(sql: &str) -> Result<Stmt, SqlError> {
-    let toks = tokenize(sql)?;
-    let mut pos = 0;
-
-    if toks.is_empty() {
-        return Ok(Stmt::Empty);
+    let tree = pgp::parse(sql).map_err(|e| SqlError::Syntax { message: e.message })?;
+    match tree.stmts() {
+        [] => Ok(Stmt::Empty),
+        [stmt] => resolve(stmt),
+        [..] => Err(SqlError::Syntax {
+            message: "one statement at a time — split on ';' first".into(),
+        }),
     }
+}
 
-    let stmt = if keyword(peek(&toks, pos), "select") {
-        pos += 1;
-        // `*`, a column list, or the debug function call.
-        if keyword(peek(&toks, pos), "debug_worker") {
-            pos += 1;
-            if !matches!(next(&toks, &mut pos), Some(Tok::LParen)) {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                });
-            }
-            if !matches!(next(&toks, &mut pos), Some(Tok::RParen)) {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                });
-            }
-            if pos != toks.len() {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                });
-            }
-            Stmt::DebugWorker
-        } else {
-            let mut cols = Vec::new();
-            if matches!(peek(&toks, pos), Some(Tok::Star)) {
-                pos += 1;
-                cols = vec![Col::Id, Col::Val];
-            } else {
-                loop {
-                    match next(&toks, &mut pos) {
-                        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("id") => cols.push(Col::Id),
-                        Some(Tok::Word(w)) if w.eq_ignore_ascii_case("val") => cols.push(Col::Val),
-                        Some(Tok::Word(w)) => return Err(SqlError::UndefinedColumn { name: w }),
-                        _ => {
-                            return Err(SqlError::Syntax {
-                                sql: sql.to_owned(),
-                            })
-                        }
-                    }
-                    if matches!(peek(&toks, pos), Some(Tok::Comma)) {
-                        pos += 1;
-                    } else {
-                        break;
-                    }
-                }
-            }
-            if !keyword(peek(&toks, pos), "from") {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                });
-            }
-            pos += 1;
-            match next(&toks, &mut pos) {
-                Some(Tok::Word(w)) if w.eq_ignore_ascii_case("debug_table") => {}
-                Some(Tok::Word(w)) => return Err(SqlError::UndefinedTable { name: w }),
-                _ => {
-                    return Err(SqlError::Syntax {
-                        sql: sql.to_owned(),
-                    })
-                }
-            }
-            if pos != toks.len() {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                });
-            }
-            Stmt::Select { cols }
+/// Fixed-schema resolution: turns the parser's syntactic view into the
+/// engine's [`Stmt`], producing catalog-flavored SQLSTATEs where the real
+/// PG would consult `pg_class`/`pg_attribute`.
+fn resolve(stmt: &pgp::Stmt) -> Result<Stmt, SqlError> {
+    match stmt {
+        pgp::Stmt::Empty => Ok(Stmt::Empty),
+        pgp::Stmt::Begin => Ok(Stmt::Begin),
+        pgp::Stmt::Commit => Ok(Stmt::Commit),
+        pgp::Stmt::Rollback => Ok(Stmt::Rollback),
+        pgp::Stmt::Unsupported { command } => Err(SqlError::Unsupported {
+            command: command.clone(),
+        }),
+        pgp::Stmt::Insert(ins) => resolve_insert(ins),
+        pgp::Stmt::Select(sel) => resolve_select(sel),
+    }
+}
+
+fn resolve_insert(ins: &pgp::Insert) -> Result<Stmt, SqlError> {
+    if ins.table != "debug_table" {
+        return Err(SqlError::UndefinedTable { name: ins.table.clone() });
+    }
+    match ins.values.as_slice() {
+        [pgp::Value::Int(id), pgp::Value::Text(val)] if *id >= i32::MIN as i64 && *id <= i32::MAX as i64 => {
+            Ok(Stmt::Insert {
+                id: *id as i32,
+                val: val.clone(),
+            })
         }
-    } else if keyword(peek(&toks, pos), "insert") {
-        pos += 1;
-        for kw in ["into", "debug_table", "values"] {
-            if !keyword(peek(&toks, pos), kw) {
-                return Err(if kw == "debug_table" {
-                    // A different table name is a defined error, not syntax.
-                    match peek(&toks, pos) {
-                        Some(Tok::Word(w)) => SqlError::UndefinedTable { name: w.clone() },
-                        _ => SqlError::Syntax {
-                            sql: sql.to_owned(),
-                        },
-                    }
-                } else {
-                    SqlError::Syntax {
-                        sql: sql.to_owned(),
-                    }
-                });
+        _ => Err(SqlError::Unsupported { command: "insert".into() }),
+    }
+}
+
+fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
+    let Some(table) = &sel.from else {
+        // A bare SELECT (no FROM): the slice knows one — the debug
+        // function call. `SELECT 1` and friends parse; they are just not
+        // executable here.
+        return match (sel.targets.as_slice(), &sel.filter) {
+            ([pgp::Target::Function { name }], None)
+                if name.eq_ignore_ascii_case("debug_worker") =>
+            {
+                Ok(Stmt::DebugWorker)
             }
-            pos += 1;
-        }
-        if !matches!(next(&toks, &mut pos), Some(Tok::LParen)) {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        let id = match next(&toks, &mut pos) {
-            Some(Tok::Int(n)) if n >= i32::MIN as i64 && n <= i32::MAX as i64 => n as i32,
-            _ => {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                })
-            }
+            _ => Err(SqlError::Unsupported { command: "select".into() }),
         };
-        if !matches!(next(&toks, &mut pos), Some(Tok::Comma)) {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        let val = match next(&toks, &mut pos) {
-            Some(Tok::Str(s)) => s,
-            _ => {
-                return Err(SqlError::Syntax {
-                    sql: sql.to_owned(),
-                })
-            }
-        };
-        if !matches!(next(&toks, &mut pos), Some(Tok::RParen)) {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        if pos != toks.len() {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        Stmt::Insert { id, val }
-    } else if keyword(peek(&toks, pos), "begin") {
-        pos += 1;
-        if pos != toks.len() {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        Stmt::Begin
-    } else if keyword(peek(&toks, pos), "commit") {
-        pos += 1;
-        if pos != toks.len() {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        Stmt::Commit
-    } else if keyword(peek(&toks, pos), "rollback") {
-        pos += 1;
-        if pos != toks.len() {
-            return Err(SqlError::Syntax {
-                sql: sql.to_owned(),
-            });
-        }
-        Stmt::Rollback
-    } else {
-        return Err(SqlError::Syntax {
-            sql: sql.to_owned(),
-        });
     };
 
-    Ok(stmt)
+    if table.name != "debug_table" {
+        return Err(SqlError::UndefinedTable { name: table.name.clone() });
+    }
+
+    // Target list → projection. `*` expands to the whole fixed schema and
+    // must stand alone (PG would allow `SELECT *, id` — unmodeled).
+    let mut cols = Vec::new();
+    for target in &sel.targets {
+        match target {
+            pgp::Target::Star => {
+                if !cols.is_empty() {
+                    return Err(SqlError::Unsupported { command: "select".into() });
+                }
+                cols.extend([Col::Id, Col::Val]);
+            }
+            pgp::Target::Column(name) => match name.as_str() {
+                "id" | "ID" => cols.push(Col::Id),
+                "val" | "VAL" => cols.push(Col::Val),
+                _ => return Err(SqlError::UndefinedColumn { name: name.clone() }),
+            },
+            pgp::Target::Function { .. } | pgp::Target::Unsupported => {
+                return Err(SqlError::Unsupported { command: "select".into() });
+            }
+        }
+    }
+
+    let filter = match &sel.filter {
+        None => None,
+        Some(pgp::Condition::Eq { left, right }) => {
+            // Normalize either written order to (column, constant).
+            let (column, value) = match (left, right) {
+                (pgp::Operand::Column(c), pgp::Operand::Const(v))
+                | (pgp::Operand::Const(v), pgp::Operand::Column(c)) => (c, v),
+                _ => return Err(SqlError::Unsupported { command: "select".into() }),
+            };
+            let col = column.to_ascii_lowercase();
+            match (col.as_str(), value) {
+                ("id", pgp::Value::Int(n))
+                    if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 =>
+                {
+                    Some(*n as i32)
+                }
+                // Known column, unmodelable comparison (e.g. val = 'x'):
+                // unsupported, not a column error.
+                ("id", _) | ("val", _) => {
+                    Err(SqlError::Unsupported { command: "select".into() })?
+                }
+                // Not a column of the fixed schema: the 42703 a real
+                // catalog would raise.
+                (_, _) => Err(SqlError::UndefinedColumn { name: column.clone() })?,
+            }
+        }
+        Some(_) => return Err(SqlError::Unsupported { command: "select".into() }),
+    };
+
+    Ok(Stmt::Select { cols, filter })
 }
 
 #[cfg(test)]
@@ -359,46 +220,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_subset() {
+    fn resolves_the_subset() {
         assert_eq!(
             parse("SELECT * FROM debug_table"),
-            Ok(Stmt::Select {
-                cols: vec![Col::Id, Col::Val]
-            })
+            Ok(Stmt::Select { cols: vec![Col::Id, Col::Val], filter: None })
         );
         assert_eq!(
             parse("select id, val from debug_table"),
-            Ok(Stmt::Select {
-                cols: vec![Col::Id, Col::Val]
-            })
+            Ok(Stmt::Select { cols: vec![Col::Id, Col::Val], filter: None })
         );
         assert_eq!(
             parse("SELECT val FROM debug_table"),
-            Ok(Stmt::Select {
-                cols: vec![Col::Val]
-            })
+            Ok(Stmt::Select { cols: vec![Col::Val], filter: None })
         );
         assert_eq!(parse("SELECT debug_worker()"), Ok(Stmt::DebugWorker));
         assert_eq!(
             parse("INSERT INTO debug_table VALUES (1, 'hello')"),
-            Ok(Stmt::Insert {
-                id: 1,
-                val: "hello".into()
-            })
+            Ok(Stmt::Insert { id: 1, val: "hello".into() })
         );
         assert_eq!(
             parse("insert into debug_table values (-2, 'it''s')"),
-            Ok(Stmt::Insert {
-                id: -2,
-                val: "it's".into()
-            })
+            Ok(Stmt::Insert { id: -2, val: "it's".into() })
         );
         assert_eq!(parse("BEGIN"), Ok(Stmt::Begin));
         assert_eq!(parse("COMMIT"), Ok(Stmt::Commit));
         assert_eq!(parse("ROLLBACK"), Ok(Stmt::Rollback));
         assert_eq!(parse("   "), Ok(Stmt::Empty));
-        // Trailing semicolon is stripped by the caller; single-statement
-        // parse must not see it.
         assert_eq!(
             split_statements("SELECT 1; INSERT INTO debug_table VALUES (1, 'a;b')"),
             vec![
@@ -409,29 +256,66 @@ mod tests {
     }
 
     #[test]
+    fn resolves_the_point_filter() {
+        // The demo's query shape: a point lookup by id, either written
+        // order, negative constants folded by the grammar.
+        assert_eq!(
+            parse("SELECT val FROM debug_table WHERE id = 42"),
+            Ok(Stmt::Select { cols: vec![Col::Val], filter: Some(42) })
+        );
+        assert_eq!(
+            parse("SELECT * FROM debug_table WHERE 42 = id"),
+            Ok(Stmt::Select { cols: vec![Col::Id, Col::Val], filter: Some(42) })
+        );
+        assert_eq!(
+            parse("SELECT id FROM debug_table WHERE id = -7"),
+            Ok(Stmt::Select { cols: vec![Col::Id], filter: Some(-7) })
+        );
+    }
+
+    #[test]
     fn rejects_with_pg_error_codes() {
+        // 42P01/42703: the fixed schema plays the catalog's role.
         assert_eq!(parse("SELECT * FROM other").unwrap_err().code(), "42P01");
         assert_eq!(
             parse("SELECT nope FROM debug_table").unwrap_err().code(),
             "42703"
         );
-        assert_eq!(parse("DROP TABLE users").unwrap_err().code(), "42601");
         assert_eq!(
-            parse("INSERT INTO other VALUES (1, 'x')")
-                .unwrap_err()
-                .code(),
+            parse("INSERT INTO other VALUES (1, 'x')").unwrap_err().code(),
             "42P01"
         );
+        // 0A000: parsed cleanly, outside the modeled surface.
+        assert_eq!(parse("DROP TABLE users").unwrap_err().code(), "0A000");
+        assert_eq!(parse("UPDATE debug_table SET id = 2").unwrap_err().code(), "0A000");
         assert_eq!(
-            parse("SELECT * FROM debug_table WHERE x=1")
-                .unwrap_err()
-                .code(),
-            "42601",
-            "WHERE is not in the A1 subset"
+            parse("SELECT * FROM debug_table WHERE val = 'x'").unwrap_err().code(),
+            "0A000",
+            "typed predicates are unmodeled"
         );
         assert_eq!(
-            parse("UPDATE debug_table SET id = 2").unwrap_err().code(),
-            "42601"
+            parse("SELECT * FROM debug_table WHERE id > 1").unwrap_err().code(),
+            "0A000"
+        );
+        assert_eq!(
+            parse("SELECT * FROM debug_table WHERE x=1").unwrap_err().code(),
+            "42703",
+            "unknown filter column is a column error, not syntax"
+        );
+        assert_eq!(
+            parse("SELECT * FROM debug_table WHERE id = 'x'").unwrap_err().code(),
+            "0A000"
+        );
+        assert_eq!(parse("SELECT 1").unwrap_err().code(), "0A000");
+    }
+
+    #[test]
+    fn syntax_errors_carry_pg_text() {
+        let err = parse("SELEC 1").unwrap_err();
+        assert_eq!(err.code(), "42601");
+        assert!(
+            err.to_string().contains("syntax error at or near"),
+            "PG's own wording: {err}"
         );
     }
 }

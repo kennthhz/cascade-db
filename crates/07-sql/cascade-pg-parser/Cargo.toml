@@ -9,6 +9,4 @@ authors.workspace      = true
 description = "Safe Rust wrapper over cascade-pg-parser-sys (libpg_query). The only crate downstream code touches."
 
 [dependencies]
-cascade-types     = { workspace = true }
-cascade-error     = { workspace = true }
 cascade-pg-parser-sys = { workspace = true }

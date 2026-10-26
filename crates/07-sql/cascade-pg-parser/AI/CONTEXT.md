@@ -22,7 +22,20 @@ The safe Rust API over `libpg_query`. The boundary between the FFI exception (§
 - Type checking — `cascade-pgtypes` + `cascade-catalog`.
 - Anything that requires resolving identifiers — that's a planner concern.
 
-## Open Design Questions
+## Resolved Design Questions
 
-- Should we re-emit the AST as native Rust enums (cleaner but ties us to libpg_query's tree shape) or expose the protobuf parse tree directly (more flexible, more annoying to traverse)?
-- Caching of parse results — fingerprint-based, sharing across sessions. Phase 4 follow-up.
+- Tree representation: **native Rust enums, syntactic view** — `parse`
+  lowers the protobuf tree into owned `Stmt`/`Select`/`Insert` types that
+  mirror what the grammar saw, resolving nothing. Anything parsed but
+  unmodeled comes back as `Unsupported` (0A000 downstream), so the bound
+  view never masquerades as a syntax error. The full protobuf tree stays
+  reachable through `cascade-pg-parser-sys::pb` if a future layer needs
+  more than the view.
+- Caching: still a Phase 4 follow-up (fingerprint-keyed, per the perf-demo
+  design), not needed for the demo slice.
+
+## Slice State (2026-10-26)
+
+Implemented and live in the runtime's query path: SELECT (projection +
+`WHERE col = const`), INSERT (single-row VALUES), BEGIN/COMMIT/ROLLBACK,
+debug functions. Parse errors carry PG's own message text.
