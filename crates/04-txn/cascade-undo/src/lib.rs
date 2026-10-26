@@ -20,7 +20,11 @@ pub struct UndoSegmentMgr {
 }
 
 impl UndoSegmentMgr {
-    pub async fn write_pre_image(&self, _db: DatabaseId, _payload: &[u8]) -> Result<(UndoRef, Lsn), UndoError> {
+    pub async fn write_pre_image(
+        &self,
+        _db: DatabaseId,
+        _payload: &[u8],
+    ) -> Result<(UndoRef, Lsn), UndoError> {
         todo!()
     }
 }

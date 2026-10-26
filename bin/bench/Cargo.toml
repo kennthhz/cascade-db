@@ -1,0 +1,28 @@
+[package]
+name        = "bench"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Runtime-architecture benchmark: cascade (thread-per-core) vs the PG model (postmaster + fork-per-backend, blocking)."
+
+[[bin]]
+name = "bench-pgmodel"
+path = "src/bin/bench-pgmodel.rs"
+
+[[bin]]
+name = "bench-harness"
+path = "src/bin/bench-harness.rs"
+
+[dependencies]
+cascade-types     = { workspace = true }
+cascade-runtime   = { workspace = true }
+cascade-wal       = { workspace = true }
+
+libc        = { workspace = true }
+
+[dev-dependencies]
+glommio  = { workspace = true }
+postgres = "0.19"

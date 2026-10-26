@@ -29,4 +29,4 @@ Real `pg_catalog` + `information_schema`. The compatibility-critical layer for O
 - OID assignment: copy PG's exact built-in OIDs (compatibility) or assign our own with a translation map. Lean toward exact match for well-known types.
 - `information_schema` — implemented as views over `pg_catalog`? PG does this; we can too.
 - NUMA-affinity DDL surface: where does `WITH (numa_affinity = …)` parse / live? Likely a Cascade-prefixed reloption (e.g., `cascade.numa_affinity`) so it doesn't collide with PG syntax. Confirm before Phase 4.
-- `single`-affinity DB placement at first activation: how the housekeeper picks the bound NUMA — least-loaded-NUMA at creation, round-robin, admin-pinned via `WITH (numa_node = N)`. (See runtime spec §11.)
+- `single`-affinity DB placement at first activation: **resolved 2026-10-24** (runtime spec §11) — the housekeeper picks the least-loaded NUMA at first activation; round-robin and admin-pinned (`WITH (numa_node = N)`) are not in v1. The chosen binding persists in `datnumanode`.

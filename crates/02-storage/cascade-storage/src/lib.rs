@@ -2,8 +2,8 @@
 //!
 //! See `README.md` and `AI/CONTEXT.md` for the design contract.
 
-pub mod traits;
 pub mod core_storage;
+pub mod traits;
 
-pub use traits::{PageStore, StorageError, StorageConfig, StorageManager};
 pub use core_storage::CoreStorage;
+pub use traits::{PageStore, StorageConfig, StorageError, StorageManager};

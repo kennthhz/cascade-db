@@ -13,3 +13,8 @@ cascade-types     = { workspace = true }
 cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-storage   = { workspace = true }
+
+[dev-dependencies]
+futures-lite      = { workspace = true }
+glommio           = { workspace = true }
+static_assertions = { workspace = true }

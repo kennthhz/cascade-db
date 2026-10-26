@@ -1,0 +1,29 @@
+[package]
+name        = "cascade-server"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The Cascade DB server binary."
+
+[[bin]]
+name = "cascade-server"
+path = "src/main.rs"
+
+[dependencies]
+libc            = { workspace = true }
+cascade-error     = { workspace = true }
+cascade-telemetry = { workspace = true }
+cascade-runtime   = { workspace = true }
+cascade-pgwire    = { workspace = true }
+cascade-storage   = { workspace = true }
+cascade-wal       = { workspace = true }
+cascade-bpm       = { workspace = true }
+cascade-catalog   = { workspace = true }
+cascade-sql-planner = { workspace = true }
+cascade-sql-exec  = { workspace = true }
+
+[dev-dependencies]
+bench = { path = "../bench" }
