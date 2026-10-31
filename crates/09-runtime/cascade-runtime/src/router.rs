@@ -162,8 +162,9 @@ impl Router {
         counters: Vec<Arc<AtomicU64>>,
         tierc: Arc<TierCSnapshot>,
         max_conns_per_worker: u32,
-        mut orchestrator: crate::orchestrator::Orchestrator,
-        wakeups: Arc<AtomicU64>,
+        tick_init: crate::orchestrator::OrchestratorInit,
+        designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
+        checkpoint: crate::checkpointer::CheckpointStats,
     ) {
         let ex = LocalExecutorBuilder::new(ExecutorPlacement::Unbound)
             .name("cascade-hk-ring")
@@ -185,6 +186,31 @@ impl Router {
                 max_conns_per_worker,
                 tierc,
             };
+
+            // The orchestrator is serving-thread-local (its jobs may hold
+            // executor-bound state). Assemble it here, before the accept
+            // loop, so the first tick can never fire into an unregistered
+            // job: the stall watch first (T4.1), then the checkpointer's
+            // fanout (T4.2, FR-31) over this executor-connected control
+            // senders.
+            let wakeups = tick_init.wakeups;
+            let mut orchestrator = crate::orchestrator::Orchestrator::from_counters(
+                tick_init.interval,
+                tick_init.ticks,
+                tick_init.max_late_us,
+            );
+            orchestrator.register(Box::new(crate::orchestrator::StallWatch::new(
+                tick_init.stalls,
+                tick_init.stall_soft,
+                tick_init.stall_hard,
+            )));
+            let mut sites = Vec::with_capacity(designated.len());
+            for (numa, tx) in designated {
+                sites.push((numa, tx.connect().await));
+            }
+            orchestrator.register(Box::new(crate::checkpointer::CheckpointFanout::new(
+                sites, checkpoint,
+            )));
 
             let (stats, listener) = listener.into_parts();
             loop {

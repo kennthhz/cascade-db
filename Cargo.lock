@@ -317,6 +317,7 @@ dependencies = [
  "cascade-bpm",
  "cascade-error",
  "cascade-pg-parser",
+ "cascade-storage",
  "cascade-telemetry",
  "cascade-tenant",
  "cascade-types",

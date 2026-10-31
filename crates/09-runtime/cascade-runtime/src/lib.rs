@@ -7,6 +7,7 @@
 pub mod accept;
 pub mod arena;
 pub mod boot;
+pub mod checkpointer;
 pub mod config;
 pub mod coop;
 pub mod demoheap;
@@ -31,6 +32,9 @@ pub mod walhome;
 pub use accept::{AcceptLoop, AcceptStats, AcceptedConn};
 pub use arena::{ReactorArena, ARENA_RESERVE_BYTES};
 pub use boot::{BootError, Housekeeper, Runtime, Worker};
+pub use checkpointer::{
+    CheckpointFanout, CheckpointSite, CheckpointStats, FlushReport, TruncatableLsn,
+};
 pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
 pub use orchestrator::{Orchestrator, OrchestratorStats, StallWatch, Tick, TickJob};
 pub use pools::{NumaPoolHandle, PoolRegistry};

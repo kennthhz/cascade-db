@@ -112,7 +112,36 @@ registered at boot; `StallWatch` wraps the §7.2 `coop::poll_stall` pass
 (each accept return = 1; idle wakeups ≈ ticks — a busy-wait shows ~10⁶).
 `tick_ms` config knob (default 1000). A listenerless boot never ticks
 (`orchestrator() == None`); the plan's T4.4 shutdown drain builds on this
-loop.
+loop. The orchestrator is serving-thread-local by construction —
+`TickJob` has no `Send` bound (jobs may hold executor-bound state);
+boot ships an all-`Send` `OrchestratorInit` bundle and the serving
+thread assembles via `Orchestrator::from_counters` + `register`.
+
+**Checkpointer (T4.2, FR-31) — orchestrates only.** `src/checkpointer.rs`:
+the housekeeper-side `CheckpointFanout` (a `TickJob`) `try_send`s
+`ControlMsg::FlushPass` over each NUMA pool's *designated* reactor's
+dedicated control channel (`new_bounded::<ControlMsg>(64)`, separate
+from the connection handoff channel; the formal `submit_to` is T5.1 —
+this is the staged stand-in with the same topology). A full channel
+refuses (counted in `CheckpointStats::refused`); the next tick
+re-signals — the housekeeper never blocks on a worker. The worker side
+runs `control_loop` as a sibling task on its own ring; `flush_pass`
+iterates the reactor-local BPM's `dirty_pages()` (filter: this DB),
+writes each back through the T3.2 gate, and advances the per-DB
+`TruncatableLsn` (monotonic `fetch_max`). The frontier rule is
+PostgreSQL-conservative: advance to the **minimum stamp over all pages
+dirty at pass start** (refused pages' stamps still constrain — their
+state lives only in the log), only when something stamped was dirty;
+nothing-dirty ⇒ no advance. Live engine truth: workers host no BPM yet,
+so live passes scan nothing and the frontier stays `Lsn(0)` — the whole
+WAL stays reclaimable-by-nothing, which the T4.3 recycler must respect.
+Observables on `Runtime`: `checkpoint_stats()` (requested/refused/
+passes; `None` without a listener) and `truncatable_lsn()` (`Some`
+whenever `wal_dir` is configured — the recycler reads it even on a
+compute boot). The no-housekeeper-I/O property is tested at the
+*syscall* layer: kernel per-task accounting
+(`/proc/self/task/<tid>/io`; network never appears there), threads
+located by comm name via `tid_named`.
 
 ## Open Design Questions
 

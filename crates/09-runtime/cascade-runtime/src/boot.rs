@@ -34,10 +34,11 @@ use glommio::{
 use cascade_wal::WalWriter;
 
 use crate::{
+    checkpointer::{CheckpointSite, CheckpointStats, TruncatableLsn},
     config::{AuthConfig, NumaAffinity, RuntimeConfig, SmtMode},
     coop::{self, ReactorStall},
     deployment,
-    handoff::Handoff,
+    handoff::{ControlMsg, Handoff},
     pin::{self, PinError},
     pools::PoolRegistry,
     router::Router,
@@ -79,6 +80,16 @@ pub struct Runtime {
     /// listener was given — D9 centralizes background work on the
     /// *serving* housekeeper, so a compute-only boot never ticks.
     orchestrator: Option<crate::orchestrator::OrchestratorStats>,
+    /// The checkpointer's orchestration counters (T4.2, FR-31), same
+    /// presence rule as `orchestrator`: nothing orchestrates without a
+    /// serving housekeeper.
+    checkpoint: Option<CheckpointStats>,
+    /// The per-DB WAL-truncatable frontier (T4.3's recycler reads it),
+    /// present whenever a WAL was configured. Stays at 0 until passes
+    /// actually flush stamped pages — which, with no live worker BPM yet,
+    /// means the whole log stays reclaimable-by-nothing (the module doc's
+    /// safety argument).
+    truncatable: Option<Arc<TruncatableLsn>>,
 }
 
 pub struct Housekeeper {
@@ -278,13 +289,18 @@ impl Runtime {
         let n_workers: usize = cfg.worker_cores.iter().map(|w| w.cores.len()).sum();
         let mut senders = Vec::with_capacity(n_workers);
         let mut receivers = Vec::with_capacity(n_workers);
+        let mut control_tx = Vec::with_capacity(n_workers);
+        let mut control_rx = Vec::with_capacity(n_workers);
         let mut counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n_workers);
         let mut tenant_counters: Vec<Arc<TenantCounters>> = Vec::with_capacity(n_workers);
         let mut stalls: Vec<Arc<ReactorStall>> = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
             let (tx, rx) = new_bounded::<Handoff>(1024);
+            let (ctx, crx) = new_bounded::<ControlMsg>(64);
             senders.push(tx);
             receivers.push(rx);
+            control_tx.push(ctx);
+            control_rx.push(crx);
             counters.push(Arc::new(AtomicU64::new(0)));
             tenant_counters.push(Arc::new(TenantCounters::new()));
             stalls.push(Arc::new(ReactorStall::new()));
@@ -309,23 +325,62 @@ impl Runtime {
         ));
         // T4.1 (D9, FR-5, FR-31's frame): when serving, the first
         // housekeeper owns the orchestrator tick loop — §M4 background jobs
-        // (stall sampling now; checkpointer, recycler, reaper, statistics
-        // later) run on its thread between accepts. Without a listener
+        // (stall sampling, checkpointer fanout now; recycler, reaper,
+        // statistics later) run on its thread between accepts. Boot ships
+        // only the Send ingredient bundle; the serving thread assembles
+        // the orchestrator and registers its jobs (some hold
+        // executor-bound state — connected control senders — so the
+        // orchestrator itself never crosses a thread). Without a listener
         // nothing serves and nothing ticks: the compute-only `boot` shape.
-        let (orchestrator, wakeups, orchestrator_stats) = if listener.is_some() {
-            let mut orch =
-                crate::orchestrator::Orchestrator::new(Duration::from_millis(cfg.tick_ms));
-            orch.register(Box::new(crate::orchestrator::StallWatch::new(
-                stalls.clone(),
-                Duration::from_micros(cfg.stall.soft_us),
-                Duration::from_micros(cfg.stall.hard_us),
-            )));
+        let (tick_init, orchestrator_stats) = if listener.is_some() {
+            let ticks = Arc::new(AtomicU64::new(0));
+            let max_late_us = Arc::new(AtomicU64::new(0));
             let wakeups = Arc::new(AtomicU64::new(0));
-            let stats = orch.stats(Arc::clone(&wakeups));
-            (Some(orch), Some(wakeups), Some(stats))
+            let stats = crate::orchestrator::OrchestratorStats::new(
+                Duration::from_millis(cfg.tick_ms),
+                Arc::clone(&ticks),
+                Arc::clone(&max_late_us),
+                Arc::clone(&wakeups),
+            );
+            let init = crate::orchestrator::OrchestratorInit {
+                interval: Duration::from_millis(cfg.tick_ms),
+                ticks,
+                max_late_us,
+                wakeups,
+                stalls: stalls.clone(),
+                stall_soft: Duration::from_micros(cfg.stall.soft_us),
+                stall_hard: Duration::from_micros(cfg.stall.hard_us),
+            };
+            (Some(init), Some(stats))
         } else {
-            (None, None, None)
+            (None, None)
         };
+        // T4.2 (FR-31): the checkpointer. The truncatable frontier exists
+        // whenever a WAL exists (the recycler reads it, T4.3); the fanout
+        // job exists only when something orchestrates (D9: the serving
+        // housekeeper — it registers on that thread, once the control
+        // senders are connected against its executor). Designated reactor
+        // per NUMA pool = the first worker on that pool's NUMA; the other
+        // workers' control senders drop here (their loops end quietly;
+        // nothing can signal them).
+        let truncatable = cfg
+            .wal_dir
+            .is_some()
+            .then(|| Arc::new(TruncatableLsn::new()));
+        let checkpoint_passes = Arc::new(AtomicU64::new(0));
+        let mut designated: Vec<(u32, glommio::channels::shared_channel::SharedSender<ControlMsg>)> =
+            Vec::new();
+        {
+            let mut seen = HashSet::new();
+            for (numa, tx) in worker_numas.iter().zip(control_tx) {
+                if seen.insert(*numa) {
+                    designated.push((*numa, tx));
+                }
+            }
+        }
+        let checkpoint_stats = listener
+            .is_some()
+            .then(|| CheckpointStats::new(Arc::clone(&checkpoint_passes)));
         let housekeepers = spawn_housekeepers(
             cfg,
             listener,
@@ -334,8 +389,9 @@ impl Runtime {
             worker_numas.clone(),
             counters.clone(),
             Arc::clone(&tierc),
-            orchestrator,
-            wakeups,
+            tick_init,
+            designated,
+            checkpoint_stats.clone(),
             &mut verified,
         )?;
         // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
@@ -441,6 +497,8 @@ impl Runtime {
         let workers = spawn_workers(
             cfg,
             receivers,
+            control_rx,
+            &checkpoint_passes,
             &counters,
             &tenant_counters,
             &stalls,
@@ -463,6 +521,8 @@ impl Runtime {
             tierc,
             demo_heap,
             orchestrator: orchestrator_stats,
+            checkpoint: checkpoint_stats,
+            truncatable,
         })
     }
 
@@ -479,6 +539,21 @@ impl Runtime {
     /// listener — nothing serves, nothing ticks (D9).
     pub fn orchestrator(&self) -> Option<&crate::orchestrator::OrchestratorStats> {
         self.orchestrator.as_ref()
+    }
+
+    /// The checkpointer's orchestration counters (T4.2, FR-31): pass
+    /// signals sent / dropped-full / passes workers ran. `None` when
+    /// nothing orchestrates (no listener, D9).
+    pub fn checkpoint_stats(&self) -> Option<&CheckpointStats> {
+        self.checkpoint.as_ref()
+    }
+
+    /// The WAL-truncatable frontier (T4.2/FR-31, consumed by the T4.3
+    /// recycler): WAL strictly below this LSN is reclaimable. `None`
+    /// without a WAL; `Some(Lsn(0))` means nothing is reclaimable — the
+    /// live engine's standing truth until durable page images exist.
+    pub fn truncatable_lsn(&self) -> Option<cascade_types::Lsn> {
+        self.truncatable.as_ref().map(|t| t.get())
     }
 
     /// One housekeeper-style stall sample over every worker reactor (A15),
@@ -577,36 +652,45 @@ fn spawn_housekeepers(
     worker_numas: Vec<u32>,
     counters: Vec<Arc<AtomicU64>>,
     tierc: Arc<TierCSnapshot>,
-    orchestrator: Option<crate::orchestrator::Orchestrator>,
-    wakeups: Option<Arc<AtomicU64>>,
+    tick_init: Option<crate::orchestrator::OrchestratorInit>,
+    designated: Vec<(u32, SharedSender<ControlMsg>)>,
+    checkpoint: Option<CheckpointStats>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
-    let mut serving = match (listener, orchestrator, wakeups) {
-        (Some(loop_), Some(orch), Some(wake)) => {
-            Some((loop_, auth, senders, worker_numas, counters, tierc, orch, wake))
+    let mut serving = match (listener, tick_init, checkpoint) {
+        (Some(loop_), Some(init), Some(stats)) => {
+            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats))
         }
         _ => None,
     };
     for &core in &cfg.housekeeper_cores {
         let tx = tx.clone();
         let body: Box<dyn FnOnce() + Send> = match serving.take() {
-            Some((loop_, auth, senders, numas, counters, tierc, orchestrator, wakeups)) => {
-                Box::new(move || {
-                    // Pin first; then accept (blocking, bounded by the next
-                    // tick deadline — sleeps between events, FR-5) →
-                    // authenticate → route by affinity → hand off; due
-                    // ticks fire between accepts (T4.1, D9). Housekeepers
-                    // reserve no arena (the trailing 0 below).
-                    let _ = tx.send((core, pin::pin_current(core), 0));
-                    Router::serve(
-                        loop_, auth, senders, numas, counters, tierc, max_conns, orchestrator,
-                        wakeups,
-                    );
-                })
-            }
+            Some((
+                loop_,
+                auth,
+                senders,
+                numas,
+                counters,
+                tierc,
+                tick_init,
+                designated,
+                stats,
+            )) => Box::new(move || {
+                // Pin first; then accept (blocking, bounded by the next
+                // tick deadline — sleeps between events, FR-5) →
+                // authenticate → route by affinity → hand off; due
+                // ticks fire between accepts (T4.1, D9). Housekeepers
+                // reserve no arena (the trailing 0 below).
+                let _ = tx.send((core, pin::pin_current(core), 0));
+                Router::serve(
+                    loop_, auth, senders, numas, counters, tierc, max_conns, tick_init,
+                    designated, stats,
+                );
+            }),
             None => Box::new(move || {
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 // The orchestrator ticks on the *serving* housekeeper (D9,
@@ -654,6 +738,8 @@ fn spawn_housekeepers(
 fn spawn_workers(
     cfg: &RuntimeConfig,
     receivers: Vec<SharedReceiver<Handoff>>,
+    control_receivers: Vec<SharedReceiver<ControlMsg>>,
+    checkpoint_passes: &Arc<AtomicU64>,
     counters: &[Arc<AtomicU64>],
     tenant_counters: &[Arc<TenantCounters>],
     stalls: &[Arc<ReactorStall>],
@@ -671,9 +757,10 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for ((((numa, core), rx), counter), (tenant_counters, stall)) in per_core
+    for (((((numa, core), rx), ctrl_rx), counter), (tenant_counters, stall)) in per_core
         .into_iter()
         .zip(receivers)
+        .zip(control_receivers)
         .zip(counters.iter())
         .zip(tenant_counters.iter().zip(stalls.iter()))
     {
@@ -687,6 +774,7 @@ fn spawn_workers(
         let task_counter = Arc::clone(counter);
         let task_tenants = Arc::clone(tenant_counters);
         let task_stall = Arc::clone(stall);
+        let task_site = CheckpointSite::new(Arc::clone(checkpoint_passes));
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
@@ -722,6 +810,15 @@ fn spawn_workers(
                     _ => None,
                 };
                 let handoffs = rx.connect().await;
+                // The control plane (T4.2): checkpoint signals arrive on
+                // their own channel and run as a sibling task on this
+                // same ring — never queued behind connection handoffs.
+                let controls = ctrl_rx.connect().await;
+                glommio::spawn_local(crate::checkpointer::control_loop(
+                    controls,
+                    task_site,
+                ))
+                .detach();
                 let table = Rc::new(crate::session::Table::new());
                 // T3.3: replayed committed rows land in every worker's
                 // table before the first session — the debug slice has no

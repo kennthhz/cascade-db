@@ -39,11 +39,30 @@ pub struct Tick {
     pub late: Duration,
 }
 
-/// One piece of background work. Registered at boot, called in
-/// registration order, once per tick, on the housekeeper thread.
-pub trait TickJob: Send {
+/// One piece of background work. Registered before the serving loop
+/// starts, called in registration order, once per tick, on the
+/// housekeeper thread. No `Send` bound on purpose: the orchestrator is
+/// serving-thread-local by construction (boot ships [`OrchestratorInit`],
+/// the serving thread assembles), so a job may hold executor-bound state
+/// — the checkpointer's fanout holds connected channel senders.
+pub trait TickJob {
     fn name(&self) -> &str;
     fn tick(&mut self, info: &Tick);
+}
+
+/// The `Send` ingredient set boot hands the serving thread: everything
+/// the orchestrator and its boot-time jobs need, minus the orchestrator
+/// itself (which the serving thread assembles via
+/// [`Orchestrator::from_counters`] and populates — stall watch, then the
+/// checkpointer's fanout).
+pub struct OrchestratorInit {
+    pub interval: Duration,
+    pub ticks: Arc<AtomicU64>,
+    pub max_late_us: Arc<AtomicU64>,
+    pub wakeups: Arc<AtomicU64>,
+    pub stalls: Vec<Arc<crate::coop::ReactorStall>>,
+    pub stall_soft: Duration,
+    pub stall_hard: Duration,
 }
 
 /// The tick schedule plus its observables. Owned by the serving
@@ -72,25 +91,31 @@ impl Orchestrator {
         }
     }
 
+    /// The boot path's constructor: over counters `Runtime` already holds
+    /// the stats view of (see [`OrchestratorStats::new`]). The orchestrator
+    /// itself never crosses a thread; only these `Arc`s do.
+    pub fn from_counters(
+        interval: Duration,
+        ticks: Arc<AtomicU64>,
+        max_late_us: Arc<AtomicU64>,
+    ) -> Self {
+        assert!(interval > Duration::ZERO, "tick interval must be positive");
+        Orchestrator {
+            interval,
+            jobs: Vec::new(),
+            next: None,
+            ordinal: 0,
+            ticks,
+            max_late_us,
+        }
+    }
+
     pub fn register(&mut self, job: Box<dyn TickJob>) {
         self.jobs.push(job);
     }
 
     pub fn interval(&self) -> Duration {
         self.interval
-    }
-
-    /// Cloneable view of the tick observables for `Runtime`. The wakeups
-    /// counter counts `accept(2)` returns on the serving housekeeper — owned
-    /// by the router loop, not the orchestrator — so boot stitches it in
-    /// here: one stats surface for the whole tick loop.
-    pub fn stats(&self, wakeups: Arc<AtomicU64>) -> OrchestratorStats {
-        OrchestratorStats {
-            interval: self.interval,
-            ticks: Arc::clone(&self.ticks),
-            max_late_us: Arc::clone(&self.max_late_us),
-            wakeups,
-        }
     }
 
     /// How long the caller may sleep before a tick could be due. Arming the
@@ -187,6 +212,24 @@ pub struct OrchestratorStats {
 }
 
 impl OrchestratorStats {
+    /// The boot path's constructor: over the same counter arcs the serving
+    /// thread's [`Orchestrator::from_counters`] will adopt — stats and
+    /// orchestrator are views over one counter set, assembled on
+    /// different threads.
+    pub fn new(
+        interval: Duration,
+        ticks: Arc<AtomicU64>,
+        max_late_us: Arc<AtomicU64>,
+        wakeups: Arc<AtomicU64>,
+    ) -> Self {
+        OrchestratorStats {
+            interval,
+            ticks,
+            max_late_us,
+            wakeups,
+        }
+    }
+
     /// The configured tick interval.
     pub fn interval(&self) -> Duration {
         self.interval

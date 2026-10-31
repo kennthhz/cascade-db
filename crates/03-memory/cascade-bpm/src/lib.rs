@@ -329,6 +329,22 @@ impl<S: PageStore> Bpm<S> {
             .map(|&idx| self.frames[idx as usize].page_lsn.get())
     }
 
+    /// Every resident page carrying the dirty bit, in stable (sorted)
+    /// order — the checkpointer's scan set (T4.2). The bit is re-checked at
+    /// flush time: a page dirtied after this enumeration is simply missed
+    /// until the next pass (checkpoints are periodic; the scan is a
+    /// snapshot, not a lock).
+    pub fn dirty_pages(&self) -> Vec<PageId> {
+        let table = self.table.borrow();
+        let mut pages: Vec<PageId> = table
+            .iter()
+            .filter(|(_, &idx)| self.frames[idx as usize].is_dirty())
+            .map(|(&page_id, _)| page_id)
+            .collect();
+        pages.sort_by_key(|p| (p.db.0, p.segment.0, p.page_no));
+        pages
+    }
+
     /// Writeback for one page (T3.2, FR-24): a dirty page is written
     /// through the store only after the WAL gate reports durability of the
     /// boundary its latest logged modification was stamped with — never

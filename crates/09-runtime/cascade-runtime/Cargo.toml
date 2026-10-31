@@ -15,6 +15,7 @@ cascade-telemetry = { workspace = true }
 cascade-tenant    = { workspace = true }
 cascade-wal       = { workspace = true }
 cascade-bpm       = { workspace = true }
+cascade-storage   = { workspace = true }
 cascade-pg-parser = { workspace = true }
 
 libc        = { workspace = true }
