@@ -35,7 +35,7 @@ use cascade_wal::WalWriter;
 
 use crate::{
     checkpointer::{CheckpointSite, CheckpointStats, TruncatableLsn},
-    config::{AuthConfig, NumaAffinity, RuntimeConfig, SmtMode},
+    config::{AuthConfig, RuntimeConfig, SmtMode},
     coop::{self, ReactorStall},
     deployment,
     handoff::{ControlMsg, Handoff},
@@ -84,6 +84,10 @@ pub struct Runtime {
     /// presence rule as `orchestrator`: nothing orchestrates without a
     /// serving housekeeper.
     checkpoint: Option<CheckpointStats>,
+    /// The recycler's orchestration counters (T4.3, FR-32). Present only
+    /// when something serves AND a WAL exists — no listener means nothing
+    /// orchestrates; no `wal_dir` means there is nothing to recycle.
+    recycle: Option<crate::recycler::RecycleStats>,
     /// The per-DB WAL-truncatable frontier (T4.3's recycler reads it),
     /// present whenever a WAL was configured. Stays at 0 until passes
     /// actually flush stamped pages — which, with no live worker BPM yet,
@@ -368,6 +372,8 @@ impl Runtime {
             .is_some()
             .then(|| Arc::new(TruncatableLsn::new()));
         let checkpoint_passes = Arc::new(AtomicU64::new(0));
+        let recycle_passes = Arc::new(AtomicU64::new(0));
+        let recycle_reclaimed = Arc::new(AtomicU64::new(0));
         let mut designated: Vec<(u32, glommio::channels::shared_channel::SharedSender<ControlMsg>)> =
             Vec::new();
         {
@@ -381,6 +387,53 @@ impl Runtime {
         let checkpoint_stats = listener
             .is_some()
             .then(|| CheckpointStats::new(Arc::clone(&checkpoint_passes)));
+        // T4.3 (FR-32): the recycler's target — the dev DB's WAL-home
+        // NUMA — is resolved HERE, before the housekeepers spawn. Tick
+        // time is too late: resolution reads the persisted-homes file,
+        // and the housekeeper must never touch I/O (the syscall-layer
+        // tests would catch it). The writer-construction step below
+        // reuses the same decision, so the two can never drift.
+        let (persisted_homes, dev_home) = match cfg.wal_dir.as_ref() {
+            Some(dir) => {
+                let dev = crate::tenant::dev_context().db;
+                let persisted = walhome::read_homes(dir);
+                let pool_numas: Vec<u32> = cfg.numa_pools.iter().map(|p| p.numa).collect();
+                let home = walhome::resolve_wal_home(
+                    dev,
+                    &tierc.resolve(Some("dev")),
+                    &persisted,
+                    &pool_numas,
+                );
+                (persisted, Some(home))
+            }
+            None => (HashMap::new(), None),
+        };
+        let recycle_stats = (listener.is_some() && cfg.wal_dir.is_some()).then(|| {
+            crate::recycler::RecycleStats::new(
+                Arc::clone(&recycle_passes),
+                Arc::clone(&recycle_reclaimed),
+            )
+        });
+        // The recycler's dedicated channel (T4.3): SPSC means it cannot
+        // share a sender with the checkpoint fanout, and that is the
+        // point — the fanout's set stays whole while the recycle signal
+        // is structurally unable to reach any reactor but the home one.
+        let (recycle_tx, recycle_rx) = recycle_stats
+            .is_some()
+            .then(|| new_bounded::<crate::recycler::RecycleSignal>(64))
+            .unzip();
+        let recycle_init = match (recycle_tx, dev_home, recycle_stats.clone()) {
+            (Some(sender), Some(_home), Some(stats)) => {
+                let trunc = Arc::clone(truncatable.as_ref().expect("wal dir implies a frontier"));
+                Some(crate::recycler::RecycleInit {
+                    db: crate::tenant::dev_context().db,
+                    sender,
+                    truncatable: trunc,
+                    stats,
+                })
+            }
+            _ => None,
+        };
         let housekeepers = spawn_housekeepers(
             cfg,
             listener,
@@ -392,6 +445,7 @@ impl Runtime {
             tick_init,
             designated,
             checkpoint_stats.clone(),
+            recycle_init,
             &mut verified,
         )?;
         // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
@@ -430,33 +484,10 @@ impl Runtime {
         let (wal, wal_homes) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
-                let persisted = walhome::read_homes(dir);
-                let placement = tierc.resolve(Some("dev"));
-                let derived = walhome::derive_wal_home(dev, &pools)
-                    .expect("validated config gives every worker numa a pool");
-                let home = match (placement.affinity, placement.bound_numa) {
-                    (NumaAffinity::Single, Some(numa)) => numa,
-                    // `single` with no bound NUMA means no workers (config
-                    // validation forbids it) — fall back to derivation
-                    // rather than panic.
-                    (NumaAffinity::Single, None) => derived,
-                    (NumaAffinity::Cross, _) => match persisted.get(&dev.0).copied() {
-                        Some(numa) if pools.pool_for_numa(numa).is_some() => numa,
-                        Some(numa) => {
-                            cascade_telemetry::log(
-                                cascade_telemetry::Level::Warn,
-                                "wal_home_persisted_invalid",
-                                &[
-                                    ("db", dev.0.to_string().as_str()),
-                                    ("numa", numa.to_string().as_str()),
-                                    ("policy", "re-deriving (NUMA no longer pooled)"),
-                                ],
-                            );
-                            derived
-                        }
-                        None => derived,
-                    },
-                };
+                // The same home the recycler targets (resolved above,
+                // before the housekeepers spawned) — one decision, two
+                // consumers.
+                let home = dev_home.expect("wal dir implies a resolved home");
                 // T3.3: the writer resumes at the replayed log end —
                 // seeding it at 0 after a recovery would overwrite durable
                 // history with this boot's first flush.
@@ -487,18 +518,37 @@ impl Runtime {
                 table.set(dev, WalHome { numa: home, constructed_on });
                 // Persist whatever this boot decided (A14), preserving any
                 // rows for databases other than the dev one.
-                let mut to_persist = persisted;
+                let mut to_persist = persisted_homes;
                 to_persist.insert(dev.0, home);
                 walhome::write_homes(dir, &to_persist);
                 (Some(writer), table)
             }
             None => (None, WalHomeTable::new()),
         };
+        // The recycle channel's receiving end lands on the FIRST worker of
+        // the WAL-home NUMA — the same per-NUMA designated-reactor rule the
+        // checkpoint fanout's senders follow. A boot with no recycler (no
+        // listener, or no WAL) hands every worker `None`: no loop, no
+        // channel, nothing to drain.
+        let mut recycle_rx_slot = recycle_rx;
+        let recycle_receivers: Vec<Option<_>> = worker_numas
+            .iter()
+            .map(|numa| {
+                if recycle_rx_slot.is_some() && Some(*numa) == dev_home {
+                    recycle_rx_slot.take()
+                } else {
+                    None
+                }
+            })
+            .collect();
         let workers = spawn_workers(
             cfg,
             receivers,
             control_rx,
+            recycle_receivers,
             &checkpoint_passes,
+            &recycle_passes,
+            &recycle_reclaimed,
             &counters,
             &tenant_counters,
             &stalls,
@@ -522,6 +572,7 @@ impl Runtime {
             demo_heap,
             orchestrator: orchestrator_stats,
             checkpoint: checkpoint_stats,
+            recycle: recycle_stats,
             truncatable,
         })
     }
@@ -546,6 +597,13 @@ impl Runtime {
     /// nothing orchestrates (no listener, D9).
     pub fn checkpoint_stats(&self) -> Option<&CheckpointStats> {
         self.checkpoint.as_ref()
+    }
+
+    /// The recycler's orchestration counters (T4.3, FR-32): recycle
+    /// signals to the WAL-home reactor / dropped-full / recycles run /
+    /// bytes computed reclaimable. `None` without a listener or a WAL.
+    pub fn recycle_stats(&self) -> Option<&crate::recycler::RecycleStats> {
+        self.recycle.as_ref()
     }
 
     /// The WAL-truncatable frontier (T4.2/FR-31, consumed by the T4.3
@@ -655,14 +713,15 @@ fn spawn_housekeepers(
     tick_init: Option<crate::orchestrator::OrchestratorInit>,
     designated: Vec<(u32, SharedSender<ControlMsg>)>,
     checkpoint: Option<CheckpointStats>,
+    recycle: Option<crate::recycler::RecycleInit>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
-    let mut serving = match (listener, tick_init, checkpoint) {
-        (Some(loop_), Some(init), Some(stats)) => {
-            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats))
+    let mut serving = match (listener, tick_init, checkpoint, recycle) {
+        (Some(loop_), Some(init), Some(stats), recycle) => {
+            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats, recycle))
         }
         _ => None,
     };
@@ -679,6 +738,7 @@ fn spawn_housekeepers(
                 tick_init,
                 designated,
                 stats,
+                recycle,
             )) => Box::new(move || {
                 // Pin first; then accept (blocking, bounded by the next
                 // tick deadline — sleeps between events, FR-5) →
@@ -688,7 +748,7 @@ fn spawn_housekeepers(
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
                     loop_, auth, senders, numas, counters, tierc, max_conns, tick_init,
-                    designated, stats,
+                    designated, stats, recycle,
                 );
             }),
             None => Box::new(move || {
@@ -739,7 +799,10 @@ fn spawn_workers(
     cfg: &RuntimeConfig,
     receivers: Vec<SharedReceiver<Handoff>>,
     control_receivers: Vec<SharedReceiver<ControlMsg>>,
+    recycle_receivers: Vec<Option<SharedReceiver<crate::recycler::RecycleSignal>>>,
     checkpoint_passes: &Arc<AtomicU64>,
+    recycle_passes: &Arc<AtomicU64>,
+    recycle_reclaimed: &Arc<AtomicU64>,
     counters: &[Arc<AtomicU64>],
     tenant_counters: &[Arc<TenantCounters>],
     stalls: &[Arc<ReactorStall>],
@@ -757,12 +820,14 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for (((((numa, core), rx), ctrl_rx), counter), (tenant_counters, stall)) in per_core
-        .into_iter()
-        .zip(receivers)
-        .zip(control_receivers)
-        .zip(counters.iter())
-        .zip(tenant_counters.iter().zip(stalls.iter()))
+    for ((((((numa, core), rx), ctrl_rx), recycle_rx), counter), (tenant_counters, stall)) in
+        per_core
+            .into_iter()
+            .zip(receivers)
+            .zip(control_receivers)
+            .zip(recycle_receivers)
+            .zip(counters.iter())
+            .zip(tenant_counters.iter().zip(stalls.iter()))
     {
         // §10.1 step 6c: bind this reactor to its own NUMA's pool. A
         // validated config gives every worker NUMA a pool
@@ -775,6 +840,10 @@ fn spawn_workers(
         let task_tenants = Arc::clone(tenant_counters);
         let task_stall = Arc::clone(stall);
         let task_site = CheckpointSite::new(Arc::clone(checkpoint_passes));
+        let task_recycle = crate::recycler::RecycleSite::new(
+            Arc::clone(recycle_passes),
+            Arc::clone(recycle_reclaimed),
+        );
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
@@ -814,11 +883,15 @@ fn spawn_workers(
                 // their own channel and run as a sibling task on this
                 // same ring — never queued behind connection handoffs.
                 let controls = ctrl_rx.connect().await;
-                glommio::spawn_local(crate::checkpointer::control_loop(
-                    controls,
-                    task_site,
-                ))
-                .detach();
+                glommio::spawn_local(crate::checkpointer::control_loop(controls, task_site))
+                    .detach();
+                // The recycle plane (T4.3): its own channel, its own loop,
+                // on the WAL-home NUMA's first worker only.
+                if let Some(recycle_rx) = recycle_rx {
+                    let recycles = recycle_rx.connect().await;
+                    glommio::spawn_local(crate::recycler::recycle_loop(recycles, task_recycle))
+                        .detach();
+                }
                 let table = Rc::new(crate::session::Table::new());
                 // T3.3: replayed committed rows land in every worker's
                 // table before the first session — the debug slice has no

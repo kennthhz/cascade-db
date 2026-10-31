@@ -33,11 +33,13 @@
 
 pub mod format;
 mod io;
+mod recycle;
 mod writer;
 
 pub use io::{
     log_len, read_clean_marker, truncate_log, write_clean_marker, DebugWalReader, WalHandle,
 };
+pub use recycle::{recycle_decision, RecycleDecision, RECYCLE_SEGMENT_BYTES};
 pub use writer::{Reservation, WalWriter};
 
 use cascade_types::{DatabaseId, Lsn};

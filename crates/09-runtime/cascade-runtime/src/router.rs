@@ -165,6 +165,7 @@ impl Router {
         tick_init: crate::orchestrator::OrchestratorInit,
         designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
         checkpoint: crate::checkpointer::CheckpointStats,
+        recycle: Option<crate::recycler::RecycleInit>,
     ) {
         let ex = LocalExecutorBuilder::new(ExecutorPlacement::Unbound)
             .name("cascade-hk-ring")
@@ -208,9 +209,25 @@ impl Router {
             for (numa, tx) in designated {
                 sites.push((numa, tx.connect().await));
             }
+            // The recycler (T4.3, FR-32) registers AFTER the fanout (T4.2):
+            // it consumes the frontier the checkpointer's passes advance,
+            // so on one tick the recycler observes the fresh value. It
+            // rides its OWN channel — SPSC means it cannot share the
+            // fanout's senders — whose receiving end sits on the WAL-home
+            // NUMA's designated reactor; the targeting is the isolation,
+            // and the fanout's set stays exactly the T4.2 full one.
             orchestrator.register(Box::new(crate::checkpointer::CheckpointFanout::new(
                 sites, checkpoint,
             )));
+            if let Some(init) = recycle {
+                let sender = init.sender.connect().await;
+                orchestrator.register(Box::new(crate::recycler::WalRecycler::new(
+                    init.db,
+                    sender,
+                    init.truncatable,
+                    init.stats,
+                )));
+            }
 
             let (stats, listener) = listener.into_parts();
             loop {

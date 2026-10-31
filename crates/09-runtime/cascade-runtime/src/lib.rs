@@ -19,6 +19,7 @@ pub mod pg;
 pub mod pin;
 pub mod recovery;
 pub mod pools;
+pub mod recycler;
 pub mod router;
 pub mod scram;
 pub mod session;
@@ -36,6 +37,9 @@ pub use checkpointer::{
     CheckpointFanout, CheckpointSite, CheckpointStats, FlushReport, TruncatableLsn,
 };
 pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
+pub use recycler::{
+    recycle_loop, RecycleInit, RecycleSignal, RecycleSite, RecycleStats, WalRecycler,
+};
 pub use orchestrator::{Orchestrator, OrchestratorStats, StallWatch, Tick, TickJob};
 pub use pools::{NumaPoolHandle, PoolRegistry};
 pub use tierc::{Placement, TierCSnapshot};

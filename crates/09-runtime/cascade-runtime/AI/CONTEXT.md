@@ -143,6 +143,40 @@ compute boot). The no-housekeeper-I/O property is tested at the
 (`/proc/self/task/<tid>/io`; network never appears there), threads
 located by comm name via `tid_named`.
 
+**WAL recycler (T4.3, FR-32) — orchestrates only, own channel.**
+`src/recycler.rs`: the housekeeper-side `WalRecycler` (a `TickJob`)
+`try_send`s a `RecycleSignal { db, below }` — the frontier snapshot —
+down the DB's **dedicated recycle channel** to the designated reactor
+of the DB's WAL-home NUMA. The channel is the design: SPSC means the
+recycler cannot share a sender with the checkpoint fanout, so the
+fanout's set stays exactly the T4.2 whole one while a recycle signal is
+*structurally* unable to reach any reactor but its DB's home one
+(cross-DB isolation is topology, not a filter a refactor could drop).
+The receiving end lands on the first worker of the home NUMA (boot
+assigns it via `recycle_receivers`, mirroring the per-NUMA designated
+rule); that worker runs `recycle_loop` as a sibling task next to
+`control_loop` — no dispatch, the channel carries nothing else. The
+home NUMA is resolved at boot **before the housekeepers spawn**
+(`walhome::resolve_wal_home`, extracted so the recycler target and the
+writer construction consume one decision): tick-time resolution would
+read the persisted-homes file on the housekeeper and break the no-I/O
+property. Registration order in the serving orchestrator: StallWatch →
+CheckpointFanout → WalRecycler — consumer after producer, so a tick's
+recycle observes the same tick's frontier advance. The worker-side
+`RecycleSite` computes `cascade_wal::recycle_decision` (strictly-below
+the snapshot, quantized to whole 16 MB windows, saturating at seg=0)
+and never touches the frontier — only the checkpointer writes it.
+Refusals (full channel) are counted; recycle is idempotent per
+snapshot, so a drop costs one tick of staleness. Live engine truth:
+frontier pinned at 0 (no worker BPM), so a live recycle reclaims zero
+bytes and `db_<db>.log` stays **byte-identical** across a full second
+of ticks while recovery still replays every committed row — the
+boundary math itself (±1 at exactly the truncatable LSN) is pinned at
+the cascade-wal level. The physical rotate-and-retire lands with the
+segmented WAL (§8.2). Observable: `Runtime::recycle_stats()`
+(signals/refused/passes/reclaimed_bytes; `None` without a listener or
+a WAL).
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

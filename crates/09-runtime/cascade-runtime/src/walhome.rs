@@ -90,8 +90,59 @@ impl WalHomeTable {
 /// keeps it stable across *changed* layouts. `None` for an empty registry
 /// (validated configs never produce one).
 pub fn derive_wal_home(db: DatabaseId, pools: &PoolRegistry) -> Option<u32> {
-    let idx = (db_hash(db) % pools.num_numas() as u64) as usize;
-    pools.iter().nth(idx).map(|p| p.numa())
+    derive_wal_home_from_numas(db, &pools.iter().map(|p| p.numa()).collect::<Vec<_>>())
+}
+
+/// The registry-free form of [`derive_wal_home`]: same hash, same order,
+/// over bare pool NUMA numbers. Boot needs this BEFORE the pool registry
+/// exists — the T4.3 recycler's target (`db` → home NUMA) must be
+/// resolved before the housekeepers spawn, because resolution reads the
+/// persisted-homes file and the housekeeper must never touch I/O at tick
+/// time (the syscall-layer no-I/O tests would catch it).
+pub fn derive_wal_home_from_numas(db: DatabaseId, pool_numas: &[u32]) -> Option<u32> {
+    if pool_numas.is_empty() {
+        return None;
+    }
+    let idx = (db_hash(db) % pool_numas.len() as u64) as usize;
+    pool_numas.get(idx).copied()
+}
+
+/// The per-DB WAL home decision (T2.6, A14) in ONE place: `single`
+/// follows the Tier C bound NUMA; `cross` honors the persisted choice
+/// when it is still a pooled NUMA (else warns and re-derives), falling
+/// back to derivation on first boot. Boot resolves each DB's home once,
+/// early — the recycler's target and the writer construction both
+/// consume the same value, so the two can never drift.
+pub fn resolve_wal_home(
+    db: DatabaseId,
+    placement: &crate::tierc::Placement,
+    persisted: &HashMap<u32, u32>,
+    pool_numas: &[u32],
+) -> u32 {
+    let derived = derive_wal_home_from_numas(db, pool_numas)
+        .expect("validated config gives every worker numa a pool");
+    match (placement.affinity, placement.bound_numa) {
+        (crate::config::NumaAffinity::Single, Some(numa)) => numa,
+        // `single` with no bound NUMA means no workers (config validation
+        // forbids it) — fall back to derivation rather than panic.
+        (crate::config::NumaAffinity::Single, None) => derived,
+        (crate::config::NumaAffinity::Cross, _) => match persisted.get(&db.0).copied() {
+            Some(numa) if pool_numas.contains(&numa) => numa,
+            Some(numa) => {
+                cascade_telemetry::log(
+                    cascade_telemetry::Level::Warn,
+                    "wal_home_persisted_invalid",
+                    &[
+                        ("db", db.0.to_string().as_str()),
+                        ("numa", numa.to_string().as_str()),
+                        ("policy", "re-deriving (NUMA no longer pooled)"),
+                    ],
+                );
+                derived
+            }
+            None => derived,
+        },
+    }
 }
 
 /// Constructs the home writer on its home NUMA: a pinned constructor

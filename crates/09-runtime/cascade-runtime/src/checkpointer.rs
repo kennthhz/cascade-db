@@ -428,32 +428,46 @@ mod tests {
             passes: Arc::new(AtomicU64::new(0)),
         };
         let rx_thread = spawn_rx(rx, 16);
-        // The main thread's tid == pid on Linux; the fanout ticks only
-        // push to a channel buffer, so the kernel's storage counters must
-        // not move a byte.
-        let tid = std::process::id();
-        let before = task_io_bytes(tid).expect("task io readable");
-        let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
-            .name("fanout-io-test")
-            .make()
-            .expect("executor builds");
-        let requested = ex.run(async move {
-            let mut job = CheckpointFanout::new(vec![(0, tx.connect().await)], stats);
-            for _ in 0..16 {
-                crate::orchestrator::TickJob::tick(
-                    &mut job,
-                    &crate::orchestrator::Tick {
-                        ordinal: 1,
-                        late: std::time::Duration::ZERO,
-                    },
-                );
-            }
-            assert_eq!(job.stats.refused(), 0, "the buffer held every signal");
-            job.stats.requested()
-        });
-        let after = task_io_bytes(tid).expect("task io readable");
-        assert_eq!(after.read_bytes, before.read_bytes, "no storage reads");
-        assert_eq!(after.write_bytes, before.write_bytes, "no storage writes");
+        // A dedicated runner thread, not the test runner's main thread:
+        // the harness prints results from the main thread, and its
+        // block-buffered stdout flushes (4 KiB pages) land in the
+        // kernel's write_bytes accounting — one such flush mid-window
+        // flaked this test once the lib suite's output volume crossed a
+        // page boundary. The runner's only job is the ticks, so its
+        // counters move for exactly one reason: a storage syscall the
+        // fanout must not make. The ticks run on the executor the
+        // runner drives (ex.run executes its future on the calling
+        // thread), so the measured thread is the real tick caller.
+        let runner = std::thread::Builder::new()
+            .name("fanout-io-probe".into())
+            .spawn(move || {
+                let tid = tid_named("fanout-io-probe").expect("runner finds its own tid");
+                let before = task_io_bytes(tid).expect("task io readable");
+                let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+                    .name("fanout-io-test")
+                    .make()
+                    .expect("executor builds");
+                let requested = ex.run(async move {
+                    let mut job = CheckpointFanout::new(vec![(0, tx.connect().await)], stats);
+                    for _ in 0..16 {
+                        crate::orchestrator::TickJob::tick(
+                            &mut job,
+                            &crate::orchestrator::Tick {
+                                ordinal: 1,
+                                late: std::time::Duration::ZERO,
+                            },
+                        );
+                    }
+                    assert_eq!(job.stats.refused(), 0, "the buffer held every signal");
+                    job.stats.requested()
+                });
+                let after = task_io_bytes(tid).expect("task io readable");
+                assert_eq!(after.read_bytes, before.read_bytes, "no storage reads");
+                assert_eq!(after.write_bytes, before.write_bytes, "no storage writes");
+                requested
+            })
+            .expect("runner thread spawns");
+        let requested = runner.join().expect("runner joins");
         assert_eq!(requested, 16);
         assert_eq!(rx_thread.join().expect("rx thread joins"), 16);
     }
