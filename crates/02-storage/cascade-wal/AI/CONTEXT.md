@@ -29,6 +29,17 @@ Per-database WAL. The single most consequential crate for §6.3 (logical CDC) be
 ## Open Design Questions
 
 - Record format: protobuf vs. hand-rolled binary. Leaning hand-rolled for hot-path speed; protobuf is tempting for the CDC side. Compromise: hand-rolled physical format, with a CDC-event protobuf produced by the decoder downstream.
-- Group-commit strategy under thread-per-core (§3.2).
 - Where DDL records sit in the sequence — interleaved or sidechannel?
 - Whether *un-replicated* operations (e.g., temp tables) get a logged-but-undecoded marker, or skip the WAL entirely.
+
+## Group Commit (T3.1, answered)
+
+Leader CAS elects one flusher per barrier; the leader drains the *whole*
+filled prefix (never just its own commit) after a short `COMMIT_DELAY`
+window when its own commit is the frontier — 16 commits, one `fdatasync`.
+Leadership and the staged batch are both drop-safe: an abandoned leader
+future re-stages its unpublished batch (`StagedBatch`), because re-writing
+identical bytes at identical offsets is idempotent — the "leader dying
+mid-sync" case re-leads instead of wedging the log. Staging keeps encoded
+bytes until durable (a `BTreeMap`, the debug-slice ADR; the mutex-free ring
+is the perf ADR's business).

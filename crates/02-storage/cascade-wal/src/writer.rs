@@ -77,6 +77,13 @@ impl WalWriter {
         }
     }
 
+    /// Next byte offset [`WalWriter::append_wal`] will hand out — the
+    /// reserved watermark itself (FR-25). Everything at or below it is
+    /// *claimed*, not necessarily written.
+    pub fn reserved(&self) -> Lsn {
+        Lsn(self.reserved.load(Ordering::Acquire))
+    }
+
     /// Highest fully written byte offset (a record boundary).
     pub fn filled(&self) -> Lsn {
         Lsn(self.filled.load(Ordering::Acquire))
@@ -154,10 +161,27 @@ impl WalWriter {
                     let target = self.filled().0;
                     if target > start {
                         let batch = self.take_batch(start, target)?;
-                        io.write_batch(start, batch).await?;
+                        // From here to `durable.store` the batch bytes live
+                        // only in `staged` — the leader future can be
+                        // abandoned (drop/unwind) at any await, and a batch
+                        // gone from `pending` but never written would wedge
+                        // the log forever (the next leader finds a staging
+                        // gap behind the filled watermark). The guard
+                        // re-stages the bytes unless durability was
+                        // published; a re-written batch is identical bytes
+                        // at identical offsets, so idempotent by
+                        // construction.
+                        let mut staged = StagedBatch {
+                            writer: self,
+                            start,
+                            bytes: batch,
+                            published: false,
+                        };
+                        io.write_batch(start, staged.bytes.clone()).await?;
                         io.sync_data().await?;
                         self.durable.store(target, Ordering::Release);
                         self.syncs.fetch_add(1, Ordering::AcqRel);
+                        staged.published = true;
                         true
                     } else {
                         false
@@ -261,6 +285,39 @@ impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
         self.0.leader.store(false, Ordering::Release);
         self.0.wake_all();
+    }
+}
+
+/// The batch a leader has taken out of [`WalWriter::pending`] but has not
+/// yet made durable. `take_batch` *removes* the bytes from staging, so an
+/// abandoned leader (future dropped mid-`write_batch`/mid-sync, or an I/O
+/// error) would otherwise lose them — a staging gap behind the filled
+/// watermark that wedges every future flush. Dropping an unpublished
+/// [`StagedBatch`] puts the bytes back (one entry at the batch's start
+/// offset — the watermark walk is indifferent to record boundaries inside
+/// a staged entry). Publication is marked before the guard drops on the
+/// success path; at that point the bytes are durable and staging them
+/// again would be wrong.
+struct StagedBatch<'a> {
+    writer: &'a WalWriter,
+    start: u64,
+    bytes: Vec<u8>,
+    published: bool,
+}
+
+impl Drop for StagedBatch<'_> {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        let mut pending = self.writer.pending.lock().expect("pending lock");
+        pending.insert(self.start, std::mem::take(&mut self.bytes));
+        drop(pending);
+        // Watermarks did not move (the batch was never published), but a
+        // waiter parked on this range re-checks after the leadership wake
+        // fired by [`LeaderGuard::drop`] — order the re-stage before that
+        // wake by dropping here, which this type's position inside the
+        // leader block guarantees.
     }
 }
 

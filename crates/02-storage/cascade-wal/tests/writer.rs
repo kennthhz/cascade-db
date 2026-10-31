@@ -401,3 +401,236 @@ fn frontier_window_lets_a_latecomer_join_the_barrier() {
     });
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- T3.1: group commit under concurrency -----------------------------------
+//
+// The plan's stress asks three things the unit shapes above don't cover:
+// N writers, one barrier (fsync count ≪ commit count), the watermark
+// invariants holding *while* writers run (probe), and the §8.2 per-inode
+// argument — records staged through one reactor's handle covered by the
+// leader's barrier through a *different* handle.
+
+/// N-writer stress, deterministic shape: 16 sessions fill their commit
+/// records first, then all flush concurrently. The first elected leader
+/// drains the whole filled prefix in ONE fdatasync; every other flusher
+/// resolves off the published durable LSN without writing. 16 commits,
+/// 1 barrier, every waiter released exactly once (each future resolves
+/// with durability covering it — no hangs, no partial acks).
+#[test]
+fn n_writer_stress_sixteen_commits_one_barrier() {
+    const N: u64 = 16;
+    let dir = temp_dir();
+    let w = Arc::new(WalWriter::new());
+    reactor().run(async {
+        let h = std::rc::Rc::new(WalHandle::open(&dir, DB).await.expect("handle opens"));
+
+        // All 16 records filled before anyone flushes: one contiguous
+        // prefix, so the first leader takes it whole.
+        let mut end = Lsn(0);
+        for i in 0..N {
+            end = fill(&insert(i, i as i32, "row"), &w);
+        }
+
+        let mut tasks = Vec::new();
+        for _ in 0..N {
+            let (w, h) = (Arc::clone(&w), std::rc::Rc::clone(&h));
+            tasks.push(glommio::spawn_local(async move {
+                w.flush_wal(&h, end).await.expect("flush resolves")
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await, end, "every waiter released with durability");
+        }
+        assert_eq!(w.durable(), end);
+        assert_eq!(w.syncs(), 1, "16 commits, one fdatasync");
+        let (ops, bytes) = h.write_stats();
+        assert_eq!(bytes, end.0, "every byte written exactly once");
+        assert_eq!(ops, 1, "one batch write for the whole group");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Filled-watermark invariant probe (the plan's "probe thread"): while
+/// rounds of commits drain, a concurrent task continuously samples the
+/// watermarks and asserts `durable <= filled <= reserved`, plus
+/// monotonicity of `durable`, `filled`, and the barrier count. One
+/// fdatasync per round of 4 commits — fsync count ≪ commit count — with
+/// the probe never observing a violation.
+#[test]
+fn watermark_invariants_hold_while_writers_drain() {
+    const ROUNDS: usize = 6;
+    const PER_ROUND: u64 = 4;
+    let dir = temp_dir();
+    let w = Arc::new(WalWriter::new());
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+
+        // The probe: samples until told to stop; any violated invariant
+        // fails the test through the shared slot.
+        static VIOLATION: AtomicU32 = AtomicU32::new(0);
+        let probe_stop = Arc::new(AtomicU32::new(0));
+        let probe = {
+            let (w, stop) = (Arc::clone(&w), Arc::clone(&probe_stop));
+            glommio::spawn_local(async move {
+                let (mut last_d, mut last_f, mut last_s) =
+                    (w.durable().0, w.filled().0, w.syncs());
+                loop {
+                    if stop.load(Ordering::Relaxed) == 1 {
+                        return;
+                    }
+                    let (d, f, r, s) =
+                        (w.durable().0, w.filled().0, w.reserved().0, w.syncs());
+                    if d > f || f > r {
+                        VIOLATION.fetch_or(1, Ordering::Relaxed);
+                    }
+                    if d < last_d || f < last_f || s < last_s {
+                        VIOLATION.fetch_or(2, Ordering::Relaxed);
+                    }
+                    (last_d, last_f, last_s) = (d, f, s);
+                    glommio::timer::sleep(Duration::from_micros(100)).await;
+                }
+            })
+        };
+
+        // Commit rounds: 4 records per round, one flush per round — the
+        // leader sweeps the round's whole prefix (filled > up_to, no
+        // window, no timing dependence).
+        for round in 0..ROUNDS {
+            let mut end = Lsn(0);
+            for i in 0..PER_ROUND {
+                end = fill(&insert((round as u64) * PER_ROUND + i, i as i32, "row"), &w);
+            }
+            let durable = w.flush_wal(&h, end).await.expect("flush resolves");
+            assert_eq!(durable, end, "round {round} drained fully");
+        }
+
+        probe_stop.store(1, Ordering::Relaxed);
+        probe.await;
+        assert_eq!(VIOLATION.load(Ordering::Relaxed), 0, "watermark invariant violation");
+        assert_eq!(
+            w.syncs(),
+            ROUNDS as u64,
+            "{} commits drained in {} barriers",
+            ROUNDS * PER_ROUND as usize,
+            ROUNDS
+        );
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// §8.2 per-inode argument, in its real shape for this design: session B
+/// stages its record through reactor B's handle *ownership* (B's handle is
+/// the only one B would ever touch), and reactor A's leader barrier makes
+/// it durable. B's handle never issues a single byte of I/O — its commit
+/// landed through A's write and A's `fdatasync`, which is per-inode and
+/// therefore covers everything staged by every reactor. Two handles here
+/// stand in for two reactors: the property under test is handle ownership
+/// (per-reactor handles), not reactor scheduling.
+#[test]
+fn another_reactors_commit_lands_through_this_reactors_barrier() {
+    let dir = temp_dir();
+    let w = Arc::new(WalWriter::new());
+    reactor().run(async {
+        let h_a = WalHandle::open(&dir, DB).await.expect("handle A opens");
+        let h_b = WalHandle::open(&dir, DB).await.expect("handle B opens");
+
+        // Both sessions fill their records (staged through the shared
+        // writer; no bytes on disk yet).
+        let ba = fill(&insert(1, 1, "a"), &w);
+        let bb = fill(&insert(2, 2, "b"), &w);
+
+        // B flushes through ITS handle; A flushes through its own. Whoever
+        // wins election drains the whole prefix — both commits — through
+        // ONE barrier; the loser resolves off the published LSN. Each task
+        // reports its handle's write stats after its flush (the handles
+        // are owned by their tasks, so the stats come back with them).
+        let (wa, wb) = (Arc::clone(&w), Arc::clone(&w));
+        let ta = glommio::spawn_local(async move {
+            let durable = wa.flush_wal(&h_a, ba).await;
+            (durable, h_a.write_stats())
+        });
+        let tb = glommio::spawn_local(async move {
+            let durable = wb.flush_wal(&h_b, bb).await;
+            (durable, h_b.write_stats())
+        });
+        let ((da, stats_a), (db, stats_b)) = futures_lite::future::zip(ta, tb).await;
+        assert_eq!(da.expect("A flush"), bb, "A's barrier swept B's commit");
+        assert_eq!(db.expect("B flush"), bb, "B resolved covered by A's barrier");
+
+        assert_eq!(w.syncs(), 1, "one fdatasync for both reactors' commits");
+        let (ops_a, bytes_a) = stats_a;
+        let (ops_b, bytes_b) = stats_b;
+        let total = bytes_a + bytes_b;
+        assert_eq!(total, bb.0, "every byte written exactly once");
+        assert_eq!(ops_a + ops_b, 1, "exactly one handle issued the batch write");
+        assert!(
+            (ops_a == 0) != (ops_b == 0),
+            "the loser's handle issued no I/O — its commit rode the leader's \
+             barrier: ops_a={ops_a} ops_b={ops_b}"
+        );
+
+        // And the on-disk log carries both records in order.
+        let reader = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        let e1 = reader
+            .read_record(Lsn(0))
+            .await
+            .expect("read 1 succeeds")
+            .expect("rec 1 exists");
+        assert_eq!(e1.record, insert(1, 1, "a"));
+        let e2 = reader
+            .read_record(ba)
+            .await
+            .expect("read 2 succeeds")
+            .expect("rec 2 exists");
+        assert_eq!(e2.record, insert(2, 2, "b"));
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A flush leader abandoned mid-window (its future dropped while it holds
+/// leadership in the group-commit sleep) must not wedge the log: the guard
+/// releases leadership on the drop path, the next flusher is elected, and
+/// the commit completes. The plan's "leader dying mid-sync — who
+/// re-leads?" for the drop/unwind flavor; the bytes are idempotent by
+/// offset, so a leader dropped *after* write is equally safe.
+#[test]
+fn abandoned_leader_releases_leadership_and_the_next_flush_completes() {
+    let dir = temp_dir();
+    let w = Arc::new(WalWriter::new());
+    reactor().run(async {
+        let h = std::rc::Rc::new(WalHandle::open(&dir, DB).await.expect("handle opens"));
+        let ba = fill(&insert(1, 1, "a"), &w);
+
+        // Leader enters the window (filled == up_to) and is dropped 50µs
+        // in — nominally mid-window-sleep, mid-leadership. Glommio timers
+        // on WSL2 have been observed to fire late, so the cut can land at
+        // any await: mid-window, mid-write, or mid-sync. The contract under
+        // test holds at every one of those points.
+        let first = bounded(
+            {
+                let w = Arc::clone(&w);
+                let h = std::rc::Rc::clone(&h);
+                async move { w.flush_wal(&h, ba).await }
+            },
+            Duration::from_micros(50),
+        )
+        .await;
+        match first {
+            Err(()) => {} // abandoned mid-flight, as intended
+            Ok(Ok(_)) => {} // completed before the cut — contract still holds
+            Ok(Err(e)) => panic!("the first flush failed outright: {e}"),
+        }
+
+        // The next flusher is elected and completes the commit — the batch
+        // the abandoned leader took out of staging came back, and the
+        // re-written bytes (if it got that far) are idempotent by offset.
+        let durable = w.flush_wal(&h, ba).await.expect("flush resolves — log not wedged");
+        assert_eq!(durable, ba);
+        assert_eq!(
+            w.syncs(),
+            1,
+            "exactly one barrier across both attempts (an abandoned leader never published)"
+        );
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
