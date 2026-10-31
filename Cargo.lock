@@ -314,6 +314,7 @@ name = "cascade-runtime"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "cascade-bpm",
  "cascade-error",
  "cascade-pg-parser",
  "cascade-telemetry",

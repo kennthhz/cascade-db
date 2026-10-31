@@ -46,9 +46,11 @@ The BPM does **not** decide affinity; it reads the policy from the catalog (Tier
 - Resource *enforcement* (lives in `cascade-governance`; this crate just provides the counters).
 - Affinity *decisions* (live in the catalog + runtime; BPM only enforces).
 
-## Existing Code (M1 debug slice, T1.9)
+## Existing Code (M1 debug slice, T1.9 + T3.2 gate)
 
-The single-pool, single-reactor case is real in `src/lib.rs`: fixed frame array (pre-allocated page RAM), `RefCell` page table, atomic pin count + dirty bit per frame, RAII `PageGuard` (panic-release tested), miss → `PageStore::read_page` on the calling reactor's ring → insert → pin, `PoolFull` until eviction lands. Write access requires the exclusive pin (pin == 1) — the debug stand-in for per-page latching. `PerDbAccounting` counts live pins per DB (invariant 3).
+The single-pool, single-reactor case is real in `src/lib.rs`: fixed frame array (pre-allocated page RAM), `RefCell` page table, atomic pin count + dirty bit per frame, RAII `PageGuard` (panic-release tested), miss → `PageStore::read_page` on the calling reactor's ring → insert → pin. Write access requires the exclusive pin (pin == 1) — the debug stand-in for per-page latching. `PerDbAccounting` counts live pins per DB (invariant 3).
+
+T3.2 landed the writeback gate (invariant 1, enforced): logged writes stamp the frame with the WAL boundary covering the modification (`PageGuard::write_logged`); `Bpm::flush_page` waits on an injected `WalDurability` gate until durability reaches that boundary — re-checking pin/stamp after every await (siblings run at the park points) — before the store write, and clears dirty only if the page was untouched meanwhile. A stamped page with no gate refuses writeback outright; unlogged dirty pages (plain `write`) are the caller's contract and write ungated. `Bpm::evict_page` routes through the same gate (no second writeback path) and reclaims frames onto a free list the miss path claims. Explicit-victim eviction; the §8.1 sharded victim selection lands with the concurrent BPM.
 
 ## Open Design Questions
 

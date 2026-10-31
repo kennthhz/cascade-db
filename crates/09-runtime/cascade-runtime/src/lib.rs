@@ -23,6 +23,7 @@ pub mod sql;
 pub mod tenant;
 pub mod tierc;
 pub mod topology;
+pub mod walgate;
 pub mod walhome;
 
 pub use accept::{AcceptLoop, AcceptStats, AcceptedConn};
