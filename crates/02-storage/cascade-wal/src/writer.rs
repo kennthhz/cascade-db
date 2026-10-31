@@ -66,10 +66,22 @@ impl Default for WalWriter {
 
 impl WalWriter {
     pub fn new() -> Self {
+        Self::new_at(Lsn(0))
+    }
+
+    /// A writer whose watermarks start at `start` instead of 0 — the
+    /// post-recovery resume constructor (T3.3). After replaying a log to
+    /// byte offset `start`, a fresh `WalWriter::new()` would hand out LSNs
+    /// from 0 and the first flush would overwrite replayed records;
+    /// `new_at(replay_end)` continues the same byte stream. Assumes the
+    /// log was already truncated to `start` (torn tail dropped) — the
+    /// resume point is a record boundary, and everything before it is
+    /// durable history this writer never re-mentions.
+    pub fn new_at(start: Lsn) -> Self {
         WalWriter {
-            reserved: AtomicU64::new(0),
-            filled: AtomicU64::new(0),
-            durable: AtomicU64::new(0),
+            reserved: AtomicU64::new(start.0),
+            filled: AtomicU64::new(start.0),
+            durable: AtomicU64::new(start.0),
             syncs: AtomicU64::new(0),
             pending: Mutex::new(BTreeMap::new()),
             leader: AtomicBool::new(false),

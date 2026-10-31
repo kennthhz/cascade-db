@@ -211,7 +211,7 @@ impl Runtime {
         cfg: &RuntimeConfig,
         topology: &dyn TopologyProvider,
     ) -> Result<Runtime, BootError> {
-        Runtime::boot_routed(cfg, topology, None, AuthConfig::default())
+        Runtime::boot_routed(cfg, topology, None, AuthConfig::default(), None)
     }
 
     /// Boot with the full connection path (spec §5.1): the first housekeeper
@@ -219,11 +219,20 @@ impl Runtime {
     /// connection to the least-loaded worker as a bare fd (FR-13); the worker
     /// adopts it onto its own ring. Per-worker channels and counters are
     /// created here in config order.
+    ///
+    /// `recovery` is the caller's [`crate::recovery::RecoveryPlan`] from
+    /// `recovery::prepare` (T3.3, FR-7) — recovery itself happens *before*
+    /// boot (and before any socket bind, which is the server's ordering to
+    /// keep); boot consumes the decision: the WAL writer resumes at the
+    /// replayed log end and every worker's table is seeded with the
+    /// replayed rows. `None` boots without WAL memory — every existing
+    /// non-server caller.
     pub fn boot_routed(
         cfg: &RuntimeConfig,
         topology: &dyn TopologyProvider,
         listener: Option<crate::accept::AcceptLoop>,
         auth: AuthConfig,
+        recovery: Option<&crate::recovery::RecoveryPlan>,
     ) -> Result<Runtime, BootError> {
         // FR-1: boot is the enforcement point, not the config parser. A
         // document that arrived through `from_toml_str` was already
@@ -367,8 +376,32 @@ impl Runtime {
                         None => derived,
                     },
                 };
+                // T3.3: the writer resumes at the replayed log end —
+                // seeding it at 0 after a recovery would overwrite durable
+                // history with this boot's first flush.
+                let resume = recovery
+                    .map(|p| cascade_types::Lsn(p.resume_offset))
+                    .unwrap_or(cascade_types::Lsn(0));
                 let (writer, constructed_on) =
-                    walhome::construct_writer_on(cfg, &online, topology, home);
+                    walhome::construct_writer_on(cfg, &online, topology, home, resume);
+                if let Some(plan) = recovery {
+                    cascade_telemetry::log(
+                        cascade_telemetry::Level::Info,
+                        "recovery_applied",
+                        &[
+                            ("resume_offset", plan.resume_offset.to_string().as_str()),
+                            ("rows", plan.seed_rows.len().to_string().as_str()),
+                            ("unclean", plan.unclean.to_string().as_str()),
+                            (
+                                "torn_tail",
+                                plan.torn_tail
+                                    .map(|l| l.0.to_string())
+                                    .unwrap_or_else(|| "none".into())
+                                    .as_str(),
+                            ),
+                        ],
+                    );
+                }
                 let mut table = WalHomeTable::new();
                 table.set(dev, WalHome { numa: home, constructed_on });
                 // Persist whatever this boot decided (A14), preserving any
@@ -390,6 +423,7 @@ impl Runtime {
             cfg.batch_rows,
             &pools,
             demo_heap.clone(),
+            recovery.map(|p| p.seed_rows.as_slice()).unwrap_or(&[]),
             &mut verified,
         )?;
 
@@ -577,6 +611,7 @@ fn spawn_workers(
     batch_rows: u32,
     pools: &PoolRegistry,
     demo_heap: Option<Arc<crate::demoheap::DemoHeap>>,
+    seed_rows: &[(i32, String)],
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Worker>, BootError> {
     let (tx, rx) = mpsc::channel();
@@ -605,6 +640,7 @@ fn spawn_workers(
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
+        let task_seed = seed_rows.to_vec();
         let deadline = Duration::from_micros(cfg.yield_deadline_us);
         let join = LocalExecutorBuilder::new(Placement::Fixed(core as usize))
             .name(&format!("cascade-w-{core}"))
@@ -637,6 +673,11 @@ fn spawn_workers(
                 };
                 let handoffs = rx.connect().await;
                 let table = Rc::new(crate::session::Table::new());
+                // T3.3: replayed committed rows land in every worker's
+                // table before the first session — the debug slice has no
+                // page store to read back from, so the seed *is* the
+                // recovered state.
+                table.seed(&task_seed);
                 while let Some(handoff) = handoffs.recv().await {
                     let counter = task_counter.clone();
                     let tenants = task_tenants.clone();

@@ -45,7 +45,7 @@ fn hot_path_records_the_exact_session_context() {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).unwrap();
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default()).unwrap();
+    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None).unwrap();
 
     // Identity, not just non-null: the session constructs `dev_context()`;
     // the hot path must record queries under exactly that (db, tenant) key —

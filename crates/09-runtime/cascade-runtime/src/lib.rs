@@ -15,6 +15,7 @@ pub mod handoff;
 mod mapping;
 pub mod pg;
 pub mod pin;
+pub mod recovery;
 pub mod pools;
 pub mod router;
 pub mod scram;

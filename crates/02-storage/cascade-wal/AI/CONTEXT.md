@@ -43,3 +43,20 @@ identical bytes at identical offsets is idempotent — the "leader dying
 mid-sync" case re-leads instead of wedging the log. Staging keeps encoded
 bytes until durable (a `BTreeMap`, the debug-slice ADR; the mutex-free ring
 is the perf ADR's business).
+
+## Boot Recovery Primitives (T3.3, answered)
+
+The read side of invariant 4 now distinguishes the two failure shapes:
+`WalError::TornTail` — a record whose declared length runs past EOF, or a
+truncated header — is the normal crash artifact (an unfinished write, never
+fsynced); recovery treats it as end-of-log and truncates (`truncate_log`).
+`WalError::Corruption` stays reserved for a complete-length record that
+fails its CRC — bit rot under durable history, which recovery must refuse
+over, never serve. `WalWriter::new_at(start)` is the resume constructor: a
+writer seeded at the replayed log end so a restarted boot's first flush
+appends instead of overwriting. The clean marker (`db_<db>.clean`, 8-byte
+LE LSN, file + best-effort directory fsync) is written only on graceful
+shutdown; `read_clean_marker`/`log_len` let boot classify the shutdown.
+All three fs helpers are synchronous `std::fs` and must run before any
+worker opens a handle. Recovery *orchestration* (the walk, the plan) stays
+out of this crate — it lives in cascade-runtime (`recovery::prepare`).

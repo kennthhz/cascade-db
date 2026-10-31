@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc            = { workspace = true }
+glommio         = { workspace = true }
 cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-runtime   = { workspace = true }
@@ -26,4 +27,5 @@ cascade-sql-planner = { workspace = true }
 cascade-sql-exec  = { workspace = true }
 
 [dev-dependencies]
-bench = { path = "../bench" }
+bench    = { path = "../bench" }
+postgres = "0.19"

@@ -50,7 +50,7 @@ fn boot_demo(batch_rows: u32, demo_rows: u32) -> Fixture {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default())
+    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
     Fixture {
         url: format!("postgres://alice:pw@127.0.0.1:{port}/dev"),

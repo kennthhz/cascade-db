@@ -13,9 +13,10 @@ use cascade_types::SegmentId;
 use crate::WalRecord;
 
 /// Every record starts with this header and ends with a CRC over
-/// `header ++ payload`.
-pub(crate) const HEADER_LEN: usize = 20;
-pub(crate) const CRC_LEN: usize = 4;
+/// `header ++ payload`. Public: the on-disk layout is a contract —
+/// recovery tooling and tests reason about byte offsets in it.
+pub const HEADER_LEN: usize = 20;
+pub const CRC_LEN: usize = 4;
 pub(crate) const FORMAT_VERSION: u32 = 1;
 
 pub(crate) const TYPE_BEGIN: u8 = 1;

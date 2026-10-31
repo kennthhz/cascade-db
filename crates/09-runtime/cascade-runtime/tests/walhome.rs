@@ -150,7 +150,7 @@ fn appends_route_to_the_home_writer_even_from_off_home_reactors() {
     let t = topo(hk, w0a, w0b, w1);
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let rt = Runtime::boot_routed(&cfg, &t, Some(listener), AuthConfig::default())
+    let rt = Runtime::boot_routed(&cfg, &t, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
 
     // Cross affinity: the designated home is the derivation, NUMA 0

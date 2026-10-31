@@ -8,7 +8,7 @@
 //! barrier count (FR-26/FR-27) — for the bench harness to collect.
 
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
     time::Duration,
 };
 
@@ -102,10 +102,43 @@ fn main() {
         ..RuntimeConfig::default()
     };
 
+    // FR-7: recovery runs *before* the socket binds. A boot that refused
+    // (corrupt log) never accepts a connection; a boot that replayed never
+    // serves a row its WAL cannot vouch for.
+    let db = cascade_runtime::tenant::dev_context().db;
+    let plan = match cfg.wal_dir.as_ref() {
+        Some(dir) => match cascade_runtime::recovery::prepare(dir, db) {
+            Ok(plan) => {
+                if plan.unclean {
+                    eprintln!(
+                        "cascade-server: crash recovery: replaying from byte {} ({} row(s){})",
+                        plan.resume_offset,
+                        plan.seed_rows.len(),
+                        plan.torn_tail
+                            .map(|l| format!(", torn tail truncated at {:#x}", l.0))
+                            .unwrap_or_default(),
+                    );
+                }
+                Some(plan)
+            }
+            Err(e) => {
+                eprintln!("cascade-server: boot refused: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     let listener = AcceptLoop::bind("127.0.0.1", port).expect("bind");
     let bound = listener.local_addr().expect("addr").port();
-    let rt =
-        Runtime::boot_routed(&cfg, &topo, Some(listener), Default::default()).expect("boot routed");
+    let rt = Runtime::boot_routed(
+        &cfg,
+        &topo,
+        Some(listener),
+        Default::default(),
+        plan.as_ref(),
+    )
+    .expect("boot routed");
     println!("cascade-server: ready on 127.0.0.1:{bound}");
     use std::io::Write;
     std::io::stdout().flush().ok();
@@ -114,12 +147,54 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    // Graceful shutdown (T3.3): drain → final flush → clean marker. The
+    // runtime drops first so no worker can append past the final sync; the
+    // brief drain sleep lets in-flight flushes land (the full drain is
+    // M4's — this slice's shutdown window has no concurrent clients to
+    // drain in the harness).
+    let (soft, hard) = rt.poll_stalls();
+    let wal = rt.debug_wal().cloned();
+    drop(rt);
+    std::thread::sleep(Duration::from_millis(200));
+    if let (Some(writer), Some(dir)) = (&wal, cfg.wal_dir.as_ref()) {
+        let writer = Arc::clone(writer);
+        let dir = dir.clone();
+        let outcome = std::thread::Builder::new()
+            .name("cascade-shutdown".into())
+            .spawn(move || -> Result<(), String> {
+                let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+                    .name("cascade-shutdown-io")
+                    .make()
+                    .map_err(|e| format!("executor: {e}"))?;
+                ex.run(async {
+                    let db = cascade_runtime::tenant::dev_context().db;
+                    let handle = cascade_wal::WalHandle::open(&dir, db)
+                        .await
+                        .map_err(|e| format!("wal handle: {e}"))?;
+                    let filled = writer.filled();
+                    writer
+                        .flush_wal(&handle, filled)
+                        .await
+                        .map_err(|e| format!("final flush: {e}"))?;
+                    cascade_wal::write_clean_marker(&dir, db, writer.durable())
+                        .map_err(|e| format!("clean marker: {e}"))?;
+                    Ok(())
+                })
+            })
+            .expect("shutdown thread spawns")
+            .join()
+            .expect("shutdown thread joins");
+        if let Err(e) = outcome {
+            eprintln!("cascade-server: clean marker not written: {e}");
+            std::process::exit(1);
+        }
+    }
+
     // One JSON observables line: the numbers the architecture claims live
     // or die on (stalls ≈ 0 under healthy load; bytes-per-fsync shows the
-    // group-commit batching).
-    let (soft, hard) = rt.poll_stalls();
-    let wal = rt.debug_wal();
-    let (syncs, durable, filled) = match wal {
+    // group-commit batching). Read off the writer Arc kept from before the
+    // runtime dropped — the numbers are final here.
+    let (syncs, durable, filled) = match wal.as_ref() {
         Some(w) => (w.syncs(), w.durable().0, w.filled().0),
         None => (0, 0, 0),
     };

@@ -35,7 +35,9 @@ pub mod format;
 mod io;
 mod writer;
 
-pub use io::{DebugWalReader, WalHandle};
+pub use io::{
+    log_len, read_clean_marker, truncate_log, write_clean_marker, DebugWalReader, WalHandle,
+};
 pub use writer::{Reservation, WalWriter};
 
 use cascade_types::{DatabaseId, Lsn};
@@ -67,7 +69,14 @@ pub enum WalRecord {
 #[derive(Debug)]
 pub enum WalError {
     Io(std::io::Error),
+    /// A complete-length record failed its CRC — bit rot or a mid-log
+    /// stomp. Recovery must refuse to serve over this.
     Corruption(Lsn),
+    /// The record's declared length runs past end-of-file (or the header
+    /// itself is truncated): a write that never finished — the normal
+    /// crash artifact, never fsynced (FR-25's filled-watermark twin on
+    /// the read side). Recovery treats this as end-of-log.
+    TornTail(Lsn),
     UnknownRecordVersion(u32),
 }
 
@@ -75,7 +84,12 @@ impl std::fmt::Display for WalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WalError::Io(e) => write!(f, "wal io error: {e}"),
-            WalError::Corruption(lsn) => write!(f, "wal record at {lsn:?} failed its CRC"),
+            WalError::Corruption(lsn) => {
+                write!(f, "wal record at {lsn:?} failed its CRC")
+            }
+            WalError::TornTail(lsn) => {
+                write!(f, "wal record at {lsn:?} is torn past end-of-file (incomplete write)")
+            }
             WalError::UnknownRecordVersion(v) => write!(f, "wal record version {v} is unknown"),
         }
     }

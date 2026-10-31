@@ -72,6 +72,31 @@ See runtime spec §5.2 for the full routing policy.
 - Multi-machine clustering / distributed query.
 - Dynamic core resize at runtime (requires restart).
 
+## Existing Code (M1 debug slice, T1.x–T3.3)
+
+The single-DB debug engine is real end-to-end: pgwire accept → auth (FR-9)
+→ least-loaded routing (FR-10) → fd handoff (FR-13) → per-reactor session
+loop (FR-16) over a per-worker `Rc<Table>`. Commits take the FR-27 order
+(WAL append → fdatasync → apply → ack) through the shared `WalWriter`;
+`boot_routed` wires the writer homed per affinity (A14) and opens one
+handle per reactor (I2).
+
+**Boot recovery (T3.3, FR-7).** `recovery::prepare(wal_dir, db)` runs on
+the boot thread *before* the socket binds — the server (`bin/cascade-server`)
+orders it prepare → bind → boot. Every boot walks the log and replays
+committed transactions (the WAL is the slice's only durable state home;
+even a clean stop replays), producing a `RecoveryPlan` that boot consumes:
+the writer resumes at `WalWriter::new_at(replay_end)`, and every worker's
+table is seeded with the replayed rows before its first session. Verdicts:
+torn tail (declared length past EOF) truncates and boots; uncommitted
+txns drop; a complete-length CRC failure refuses the boot outright. A
+clean marker (`db_<db>.clean`) stamped at SIGTERM makes the *next* boot
+clean — bytes past it still count as a crash. Test-only crash points
+(`recovery::crash_barrier`, armed via `CASCADE_TEST_BARRIER_DIR`) park a
+session at reserved/midfill/synced so the child-process harness
+(`bin/cascade-server/tests/crash.rs`) can `kill -9` at exact protocol
+points and assert the replay verdict on the first post-restart connection.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

@@ -19,7 +19,10 @@ use std::{
 };
 
 use cascade_types::{DatabaseId, Lsn, SegmentId};
-use cascade_wal::{DebugWalReader, WalError, WalHandle, WalReader, WalRecord, WalWriter};
+use cascade_wal::{
+    log_len, read_clean_marker, truncate_log, write_clean_marker, DebugWalReader, WalError,
+    WalHandle, WalReader, WalRecord, WalWriter,
+};
 
 const DB: DatabaseId = DatabaseId(5);
 
@@ -631,6 +634,174 @@ fn abandoned_leader_releases_leadership_and_the_next_flush_completes() {
             1,
             "exactly one barrier across both attempts (an abandoned leader never published)"
         );
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// T3.3: boot-recovery semantics — torn tail vs mid-log corruption on the
+// read side, writer resume past a replayed prefix, and the clean-marker /
+// length helpers boot recovery drives.
+// ---------------------------------------------------------------------------
+
+/// Sets the log file's length to `cut` — the deterministic stand-in for a
+/// crash mid-pwrite (the real thing leaves a short write at the tail; a
+/// truncation is byte-for-byte what the kernel ends up with).
+fn saw_off(dir: &PathBuf, cut: u64) {
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(format!("db_{}.log", DB.0)))
+        .expect("raw log opens");
+    f.set_len(cut).expect("truncate to the crash point");
+}
+
+/// Torn tail (wal invariant 4's read half): a record whose bytes run past
+/// EOF is the crash artifact — reported as [`WalError::TornTail`], both
+/// when EOF lands inside the header and when only the payload is short.
+/// Complete-length records before it still decode.
+#[test]
+fn short_tail_reads_as_torn_not_corrupt() {
+    let dir = temp_dir();
+    let w = WalWriter::new();
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let e1 = fill(&insert(1, 1, "a"), &w);
+        let e2 = fill(&insert(1, 2, "bb"), &w);
+        let e3 = fill(&insert(1, 3, "ccc"), &w);
+        w.flush_wal(&h, e3).await.expect("flush");
+
+        use cascade_wal::format::{CRC_LEN, HEADER_LEN};
+
+        // Cut 1 — EOF one byte into record 3's header.
+        saw_off(&dir, e2.0 + 1);
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        assert_eq!(r.len(), e2.0 + 1);
+        let first = r.read_record(Lsn(0)).await.expect("decodes").expect("present");
+        assert_eq!(first.next, e1);
+        let second = r.read_record(e1).await.expect("decodes").expect("present");
+        assert_eq!(second.next, e2);
+        match r.read_record(e2).await {
+            Err(WalError::TornTail(lsn)) => assert_eq!(lsn, e2),
+            other => panic!("EOF mid-header must read TornTail at {e2:?}, got {other:?}"),
+        }
+
+        // Cut 2 — header and CRC complete, declared payload runs past EOF.
+        saw_off(&dir, e2.0 + (HEADER_LEN + CRC_LEN) as u64);
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader reopens");
+        match r.read_record(e2).await {
+            Err(WalError::TornTail(lsn)) => assert_eq!(lsn, e2),
+            other => panic!("payload past EOF must read TornTail at {e2:?}, got {other:?}"),
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of the distinction: a record of *complete* length whose
+/// CRC fails is bit rot or a mid-log stomp — [`WalError::Corruption`],
+/// never forgiven as a tail. This is the error recovery refuses boot on.
+#[test]
+fn complete_length_bad_crc_is_corruption_not_torn() {
+    let dir = temp_dir();
+    let w = WalWriter::new();
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let e1 = fill(&insert(1, 1, "a"), &w);
+        let e2 = fill(&insert(1, 2, "bb"), &w);
+        w.flush_wal(&h, e2).await.expect("flush");
+
+        // Flip the last payload byte of record 1 — mid-log, full length,
+        // version and type untouched, so the only defense is the CRC.
+        let path = dir.join(format!("db_{}.log", DB.0));
+        let mut raw = std::fs::read(&path).expect("log reads");
+        let flip = e1.0 as usize - (cascade_wal::format::CRC_LEN + 1);
+        raw[flip] ^= 0xFF;
+        std::fs::write(&path, raw).expect("log writes back");
+
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        match r.read_record(Lsn(0)).await {
+            Err(WalError::Corruption(lsn)) => assert_eq!(lsn, Lsn(0)),
+            other => panic!("CRC failure must read Corruption, got {other:?}"),
+        }
+        // Record 2 is untouched but unreachable behind the refuse point —
+        // the walker stops at the first Corruption regardless.
+        match r.read_record(e1).await {
+            Ok(Some(_)) => {}
+            other => panic!("a later intact record still decodes: {other:?}"),
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Post-recovery resume: a writer constructed at the replayed log end
+/// continues the same byte stream instead of restarting at 0 and
+/// overwriting durable history. This is what makes a restarted server's
+/// first commit append-safe.
+#[test]
+fn resume_writer_appends_after_the_replayed_prefix() {
+    let dir = temp_dir();
+    let w = WalWriter::new();
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let e1 = fill(&insert(1, 1, "a"), &w);
+        let e2 = fill(&insert(1, 2, "bb"), &w);
+        w.flush_wal(&h, e2).await.expect("flush");
+        assert_eq!(e2, w.reserved(), "test sanity: the log ends at the fill point");
+
+        // A crash restart: fresh writer, seeded at the replayed end.
+        let w = WalWriter::new_at(e2);
+        assert_eq!(w.reserved(), e2);
+        assert_eq!(w.filled(), e2);
+        assert_eq!(w.durable(), e2);
+
+        let h = WalHandle::open(&dir, DB).await.expect("handle reopens");
+        let e3 = fill(&insert(2, 3, "cc"), &w);
+        assert_eq!(e3.0, e2.0 + cascade_wal::format::encode(&insert(2, 3, "cc")).len() as u64);
+        w.flush_wal(&h, e3).await.expect("flush");
+
+        // All three records decode, each at its own LSN — nothing clobbered.
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        let first = r.read_record(Lsn(0)).await.expect("decodes").expect("present");
+        assert_eq!(first.next, e1);
+        let second = r.read_record(e1).await.expect("decodes").expect("present");
+        assert_eq!(second.next, e2);
+        let third = r.read_record(e2).await.expect("decodes").expect("present");
+        assert_eq!(third.next, e3);
+        assert!(r.read_record(e3).await.expect("eof").is_none());
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The file-level recovery helpers: marker round-trip (absent = `None` —
+/// the unclean-shutdown signal), `log_len` on missing files, and
+/// `truncate_log` dropping exactly the torn suffix.
+#[test]
+fn clean_marker_and_length_helpers_round_trip() {
+    let dir = temp_dir();
+    let w = WalWriter::new();
+    reactor().run(async {
+        // Fresh directory: no log, no marker — boot reads "clean slate".
+        assert_eq!(log_len(&dir, DB).expect("len"), 0);
+        assert_eq!(read_clean_marker(&dir, DB).expect("marker"), None);
+
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let e1 = fill(&insert(1, 1, "a"), &w);
+        let e2 = fill(&insert(1, 2, "bb"), &w);
+        w.flush_wal(&h, e2).await.expect("flush");
+        assert_eq!(log_len(&dir, DB).expect("len"), e2.0);
+
+        // Graceful shutdown stamps the marker; boot reads it back.
+        write_clean_marker(&dir, DB, e2).expect("marker writes");
+        assert_eq!(read_clean_marker(&dir, DB).expect("marker"), Some(e2));
+
+        // A torn tail gets truncated back to the last record boundary:
+        // log length moves, the intact prefix still decodes, EOF ends it.
+        saw_off(&dir, e2.0 + 3);
+        truncate_log(&dir, DB, e2.0).expect("truncates");
+        assert_eq!(log_len(&dir, DB).expect("len"), e2.0);
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        assert!(r.read_record(Lsn(0)).await.expect("decodes").is_some());
+        assert!(r.read_record(e1).await.expect("decodes").is_some());
+        assert!(r.read_record(e2).await.expect("eof").is_none());
     });
     let _ = std::fs::remove_dir_all(&dir);
 }

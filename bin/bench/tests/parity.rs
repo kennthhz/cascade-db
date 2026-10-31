@@ -105,7 +105,7 @@ fn boot_cascade(wal_dir: &Path) -> (String, Runtime) {
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
     let rt =
-        Runtime::boot_routed(&cfg, &topo, Some(listener), Default::default()).expect("boot routed");
+        Runtime::boot_routed(&cfg, &topo, Some(listener), Default::default(), None).expect("boot routed");
     (format!("127.0.0.1:{port}"), rt)
 }
 

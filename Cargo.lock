@@ -349,7 +349,9 @@ dependencies = [
  "cascade-storage",
  "cascade-telemetry",
  "cascade-wal",
+ "glommio",
  "libc",
+ "postgres",
 ]
 
 [[package]]

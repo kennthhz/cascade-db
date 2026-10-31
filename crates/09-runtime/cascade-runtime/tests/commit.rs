@@ -60,7 +60,7 @@ fn boot() -> Fixture {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default())
+    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
     Fixture {
         url: format!("postgres://alice:pw@127.0.0.1:{port}/dev"),
@@ -256,7 +256,7 @@ fn without_wal_dir_the_engine_stays_in_memory() {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default())
+    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
     assert!(rt.debug_wal().is_none(), "no writer without wal_dir");
 

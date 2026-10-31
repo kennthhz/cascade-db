@@ -150,7 +150,7 @@ fn boot_warns_exactly_as_the_kernel_cmdline_demands_and_never_refuses() {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let boot = Runtime::boot_routed(&boot_cfg, &topo, Some(listener), AuthConfig::default());
+    let boot = Runtime::boot_routed(&boot_cfg, &topo, Some(listener), AuthConfig::default(), None);
     unlock();
 
     // FR-4: warn, never refuse — even a fully unisolated host boots.

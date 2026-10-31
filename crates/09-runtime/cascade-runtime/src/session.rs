@@ -78,6 +78,13 @@ impl Table {
         Self::default()
     }
 
+    /// Seeds replayed rows (T3.3 recovery): the table's initial contents,
+    /// applied before any session runs on this reactor. Rows arrive in
+    /// commit order — the order the previous boot acked them in.
+    pub fn seed(&self, rows: &[(i32, String)]) {
+        self.rows.borrow_mut().extend_from_slice(rows);
+    }
+
     fn insert(&self, row: Row) {
         self.rows.borrow_mut().push(row);
     }
@@ -149,7 +156,11 @@ impl From<WalError> for PgError {
     fn from(e: WalError) -> Self {
         match e {
             WalError::Io(_) => PgError::new("58000", format!("wal flush failed: {e}")),
-            WalError::Corruption(_) | WalError::UnknownRecordVersion(_) => {
+            // A torn tail at *flush* time means the watermarks let a flush
+            // cover a torn record — impossible by protocol, so it lands in
+            // the same integrity bucket as corruption (not a client's
+            // fault, never expected).
+            WalError::Corruption(_) | WalError::TornTail(_) | WalError::UnknownRecordVersion(_) => {
                 PgError::new("XX000", format!("wal integrity failure: {e}"))
             }
         }
@@ -573,13 +584,25 @@ async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
     let commit = writer.append_wal(&WalRecord::CommitTxn { xid });
     let end = commit.end();
 
+    // Crash-point barrier (T3.3 harness): every reservation exists, no
+    // byte is visible yet. A kill here replays as "nothing happened".
+    crate::recovery::crash_barrier("reserved").await;
     let _ = begin.fill();
     for r in inserts {
         let _ = r.fill();
     }
+    // Barrier: begin + inserts filled and visible, the commit record
+    // reserved but unfilled. A kill here replays as "transaction rolled
+    // back" — the filled watermark stops short of the commit record, so
+    // no flush ever covered it.
+    crate::recovery::crash_barrier("midfill").await;
     let _ = commit.fill();
 
     writer.flush_wal(&wal.handle, end).await?;
+    // Barrier: durable, not yet acked — the window FR-27's ordering
+    // exists for. A kill here replays a commit the client never saw
+    // (in-doubt); the replay applies it either way.
+    crate::recovery::crash_barrier("synced").await;
     Ok(end)
 }
 

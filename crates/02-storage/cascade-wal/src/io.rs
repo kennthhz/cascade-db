@@ -6,6 +6,7 @@
 //! [`WalHandle`] owned by exactly one reactor.
 
 use std::{
+    io::Write as _,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -55,11 +56,12 @@ pub struct WalHandle {
 impl WalHandle {
     /// Opens (creating if needed) `<wal_dir>/db_<db>.log`.
     ///
-    /// M1 mounts fresh data/wal directories per run, and a writer's LSNs
-    /// start at 0 — opening a log that already holds records would let the
-    /// writer overwrite them. Resuming an existing log (starting the
-    /// writer's reserved watermark at the file's length) arrives with
-    /// recovery checkpointing.
+    /// The handle is length-agnostic — it writes wherever the writer's
+    /// watermarks say — but a `WalWriter::new()` starts its LSNs at 0, so
+    /// pairing one with a log that already holds records would overwrite
+    /// them. Boot recovery resumes with [`crate::WalWriter::new_at`]
+    /// seeded at the replayed log end (T3.3); only that constructor may
+    /// pair with a non-empty log.
     pub async fn open(wal_dir: &Path, db: DatabaseId) -> Result<Self, WalError> {
         std::fs::create_dir_all(wal_dir).map_err(WalError::Io)?;
         let path: PathBuf = wal_dir.join(format!("db_{}.log", db.0));
@@ -186,8 +188,11 @@ impl DebugWalReader {
 
 impl WalReader for DebugWalReader {
     /// Decodes the single record starting at `start` (its LSN). `None` at
-    /// end-of-log; [`WalError::Corruption`] on a torn or bit-rotted record
-    /// (wal invariant 4 — this is the check recovery relies on).
+    /// end-of-log; [`WalError::TornTail`] when the record's declared length
+    /// runs past EOF (a write that never finished — the normal crash
+    /// artifact, never fsynced); [`WalError::Corruption`] on a
+    /// complete-length record that fails its CRC (bit rot — recovery must
+    /// refuse over this, wal invariant 4).
     async fn read_record(&self, start: Lsn) -> Result<Option<crate::WalEntry>, WalError> {
         if start.0 >= self.len {
             return Ok(None);
@@ -195,7 +200,8 @@ impl WalReader for DebugWalReader {
         // Header first to learn the length, then the whole record.
         let hdr = Self::read(&self.file, start.0, format::HEADER_LEN + format::CRC_LEN).await?;
         if hdr.len() < format::HEADER_LEN + format::CRC_LEN {
-            return Err(WalError::Corruption(start));
+            // EOF mid-header: the write never finished.
+            return Err(WalError::TornTail(start));
         }
         let payload_len = u32::from_le_bytes(hdr[..4].try_into().expect("4 bytes")) as usize;
         let total = format::HEADER_LEN + payload_len + format::CRC_LEN;
@@ -206,7 +212,7 @@ impl WalReader for DebugWalReader {
         };
         if bytes.len() < total {
             // Declared length runs past EOF: torn by definition.
-            return Err(WalError::Corruption(start));
+            return Err(WalError::TornTail(start));
         }
         match format::decode(&bytes) {
             Ok((rec, consumed)) => {
@@ -223,4 +229,69 @@ impl WalReader for DebugWalReader {
             }
         }
     }
+}
+
+/// File-level helpers for boot recovery (T3.3): the clean marker and the
+/// torn-tail truncation. All synchronous `std::fs` — they run on the boot
+/// thread *before* any worker opens a handle on the same file, so no
+/// reactor ever sees a moved file length underneath it.
+
+/// Byte length of the DB's log file (`0` when there is none yet).
+pub fn log_len(wal_dir: &Path, db: DatabaseId) -> std::io::Result<u64> {
+    let path: PathBuf = wal_dir.join(format!("db_{}.log", db.0));
+    match std::fs::metadata(&path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
+/// Truncates the log to `len` and fsyncs it — the torn-tail recovery
+/// action: everything at or past `len` was an unfinished write that no
+/// flush ever covered, so dropping it cannot lose a durable byte. Must
+/// run before any handle opens the file (see above).
+pub fn truncate_log(wal_dir: &Path, db: DatabaseId, len: u64) -> std::io::Result<()> {
+    let path: PathBuf = wal_dir.join(format!("db_{}.log", db.0));
+    let f = std::fs::OpenOptions::new().write(true).open(&path)?;
+    f.set_len(len)?;
+    f.sync_all()
+}
+
+/// Writes the clean marker: `db_<db>.clean` holding the durable LSN at
+/// graceful shutdown. File fsync, then a best-effort directory fsync so
+/// the marker's *existence* is durable too. Only a graceful shutdown
+/// writes it (M4 owns the full drain; the server's SIGTERM path is the
+/// caller today).
+pub fn write_clean_marker(wal_dir: &Path, db: DatabaseId, lsn: Lsn) -> std::io::Result<()> {
+    std::fs::create_dir_all(wal_dir)?;
+    let path: PathBuf = wal_dir.join(format!("db_{}.clean", db.0));
+    {
+        let mut f = std::fs::File::create(&path)?;
+        f.write_all(&lsn.0.to_le_bytes())?;
+        f.sync_all()?;
+    }
+    // The marker must exist after a crash, not just its content: fsync the
+    // directory. Missing support degrades to content-only durability.
+    if let Ok(dir) = std::fs::File::open(wal_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// The clean marker's LSN (`None` = no marker: the last shutdown was not
+/// graceful, or this log never had one).
+pub fn read_clean_marker(wal_dir: &Path, db: DatabaseId) -> std::io::Result<Option<Lsn>> {
+    let path: PathBuf = wal_dir.join(format!("db_{}.clean", db.0));
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if bytes.len() != 8 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("clean marker is {} bytes, expected 8", bytes.len()),
+        ));
+    }
+    Ok(Some(Lsn(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))))
 }

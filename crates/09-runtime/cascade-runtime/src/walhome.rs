@@ -97,14 +97,17 @@ pub fn derive_wal_home(db: DatabaseId, pools: &PoolRegistry) -> Option<u32> {
 /// Constructs the home writer on its home NUMA: a pinned constructor
 /// thread first-touches the writer's state on a core of that node (a
 /// worker core of the NUMA in config order, else any online core the
-/// topology places there). Returns the writer and the core it was
-/// constructed on (`None` = every fallback fired and the writer was built
-/// on the boot thread — reported, not hidden).
+/// topology places there). `start` seeds the writer's watermarks — the
+/// replayed log end on a recovery boot (T3.3), 0 otherwise. Returns the
+/// writer and the core it was constructed on (`None` = every fallback
+/// fired and the writer was built on the boot thread — reported, not
+/// hidden).
 pub fn construct_writer_on(
     cfg: &crate::config::RuntimeConfig,
     online: &[u32],
     topology: &dyn crate::topology::TopologyProvider,
     numa: u32,
+    start: cascade_types::Lsn,
 ) -> (std::sync::Arc<cascade_wal::WalWriter>, Option<u32>) {
     let core = cfg
         .worker_cores
@@ -126,7 +129,7 @@ pub fn construct_writer_on(
                 ("reason", "no pinnable core on the home NUMA"),
             ],
         );
-        return (std::sync::Arc::new(cascade_wal::WalWriter::new()), None);
+        return (std::sync::Arc::new(cascade_wal::WalWriter::new_at(start)), None);
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -137,7 +140,7 @@ pub fn construct_writer_on(
                 .and_then(|seen| seen.first().copied());
             // The writer is built *inside* the pinned thread: its (small)
             // state first-touches on the home NUMA by construction.
-            let writer = std::sync::Arc::new(cascade_wal::WalWriter::new());
+            let writer = std::sync::Arc::new(cascade_wal::WalWriter::new_at(start));
             let _ = tx.send((pinned, writer));
         });
     match spawned {
@@ -165,7 +168,7 @@ pub fn construct_writer_on(
                         ("reason", "constructor thread died; boot-thread placement"),
                     ],
                 );
-                (std::sync::Arc::new(cascade_wal::WalWriter::new()), None)
+                (std::sync::Arc::new(cascade_wal::WalWriter::new_at(start)), None)
             }
         },
         Err(e) => {
@@ -177,7 +180,7 @@ pub fn construct_writer_on(
                     ("reason", e.to_string().as_str()),
                 ],
             );
-            (std::sync::Arc::new(cascade_wal::WalWriter::new()), None)
+            (std::sync::Arc::new(cascade_wal::WalWriter::new_at(start)), None)
         }
     }
 }
