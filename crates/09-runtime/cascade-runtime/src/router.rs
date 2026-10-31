@@ -144,13 +144,16 @@ impl Router {
         }
     }
 
-    /// The housekeeper serving loop: accept (blocking — sleeps between
-    /// events, FR-5), authenticate (FR-9: before routing), hand off, and
-    /// never touch the fd again (FR-13).
+    /// The housekeeper serving loop: accept (blocking, but bounded by the
+    /// orchestrator's next tick deadline — sleeps between events, FR-5),
+    /// authenticate (FR-9: before routing), hand off, and never touch the fd
+    /// again (FR-13). Between accept returns, due background ticks fire
+    /// (T4.1, D9: the serving housekeeper *is* the background-work home).
     ///
     /// Runs an unpinned glommio executor on the calling thread purely for the
     /// sender-side channel connect; after that connect, the loop is plain
     /// blocking I/O and the ring idles.
+    #[allow(clippy::too_many_arguments)]
     pub fn serve(
         listener: AcceptLoop,
         auth: AuthConfig,
@@ -159,6 +162,8 @@ impl Router {
         counters: Vec<Arc<AtomicU64>>,
         tierc: Arc<TierCSnapshot>,
         max_conns_per_worker: u32,
+        mut orchestrator: crate::orchestrator::Orchestrator,
+        wakeups: Arc<AtomicU64>,
     ) {
         let ex = LocalExecutorBuilder::new(ExecutorPlacement::Unbound)
             .name("cascade-hk-ring")
@@ -182,9 +187,23 @@ impl Router {
             };
 
             let (stats, listener) = listener.into_parts();
-            for stream in listener.incoming() {
-                let mut stream = match stream {
-                    Ok(s) => s,
+            loop {
+                // One wakeup = one accept(2) return, timed out or not. The
+                // idle-rate observable for FR-5/T4.1: an idle server wakes
+                // ~once per tick — a `loop {}` would show millions.
+                wakeups.fetch_add(1, Ordering::Relaxed);
+                crate::accept::set_recv_timeout(&listener, orchestrator.until_next())
+                    .expect("SO_RCVTIMEO set");
+                let mut stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    // Timed out or raced the timeout: the tick window is up.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        orchestrator.poll_due();
+                        continue;
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return, // listener dead
                 };
@@ -199,7 +218,8 @@ impl Router {
                     router.route(stream, &session);
                 }
                 // else: a rejection was already sent (or the peer vanished);
-                // dropping the stream closes it.
+                // dropping the stream closes it. Ticks wait for the next
+                // loop pass — at most one handshake of lateness.
             }
         });
     }

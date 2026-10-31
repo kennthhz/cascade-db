@@ -97,6 +97,23 @@ session at reserved/midfill/synced so the child-process harness
 (`bin/cascade-server/tests/crash.rs`) can `kill -9` at exact protocol
 points and assert the replay verdict on the first post-restart connection.
 
+**Orchestrator tick loop (T4.1, D9, FR-5, FR-31's frame).** Background
+work is centralized on the *serving* housekeeper: `Orchestrator`
+(`src/orchestrator.rs`) owns a fixed-grid tick schedule
+(`deadline + n·interval`), and the router loop interleaves it with accept
+via `SO_RCVTIMEO` — `accept` sleeps up to the next tick deadline
+(`until_next`), and every timeout return fires `poll_due` (at most ONE
+tick per call; a buried grid re-arms one interval from *now*, skip-late —
+no burst catch-up, no compounding drift, and no re-entrancy: jobs run
+sequentially on the one thread). Jobs implement `TickJob` and are
+registered at boot; `StallWatch` wraps the §7.2 `coop::poll_stall` pass
+(what `Runtime::poll_stalls` does on demand). Observables on `Runtime`:
+`orchestrator()` → ticks fired, worst lateness, housekeeper wakeups
+(each accept return = 1; idle wakeups ≈ ticks — a busy-wait shows ~10⁶).
+`tick_ms` config knob (default 1000). A listenerless boot never ticks
+(`orchestrator() == None`); the plan's T4.4 shutdown drain builds on this
+loop.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

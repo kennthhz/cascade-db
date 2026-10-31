@@ -156,6 +156,12 @@ pub struct RuntimeConfig {
     pub wal_dir: Option<std::path::PathBuf>,
     /// Tier C fan-out bounded wait (spec §8.4, plan R11; default 1 000 ms).
     pub tierc_fanout_wait_ms: u64,
+    /// Orchestrator tick interval (T4.1; default 1 000 ms): how often the
+    /// serving housekeeper wakes to run background jobs (§9 — checkpoint
+    /// decisions, reaping, statistics hang on this frame). The housekeeper
+    /// sleeps in `accept(2)` between ticks — the interval bounds background
+    /// latency, never a busy poll (FR-5).
+    pub tick_ms: u64,
     pub stall: StallConfig,
     pub auth: AuthConfig,
 }
@@ -176,6 +182,7 @@ impl Default for RuntimeConfig {
             wal_dir: None,
             demo_rows: 0,
             tierc_fanout_wait_ms: 1000,
+            tick_ms: 1000,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),
         }
@@ -234,6 +241,8 @@ pub enum ConfigError {
     ZeroMaxConns,
     #[error("runtime.tierc_fanout_wait_ms must be > 0")]
     ZeroFanoutWait,
+    #[error("runtime.tick_ms must be > 0")]
+    ZeroTickInterval,
     #[error("runtime.stall.soft_us ({soft_us}) must be <= stall.hard_us ({hard_us}) and both > 0")]
     StallThresholds { soft_us: u64, hard_us: u64 },
     #[error("runtime.stall.kill = true is not supported until kill wiring lands; leave it off (plan R12: default off)")]
@@ -302,6 +311,9 @@ impl RuntimeConfig {
         }
         if self.tierc_fanout_wait_ms == 0 {
             return Err(ConfigError::ZeroFanoutWait);
+        }
+        if self.tick_ms == 0 {
+            return Err(ConfigError::ZeroTickInterval);
         }
         if self.stall.soft_us == 0
             || self.stall.hard_us == 0
@@ -395,6 +407,7 @@ size_mb = 1024
         assert_eq!(cfg.drain_deadline_s, 30);
         assert_eq!(cfg.max_conns_per_worker, 200);
         assert_eq!(cfg.tierc_fanout_wait_ms, 1000);
+        assert_eq!(cfg.tick_ms, 1000);
         assert_eq!(cfg.stall.soft_us, 1_000);
         assert_eq!(cfg.stall.hard_us, 10_000);
         assert!(!cfg.stall.kill);
@@ -577,6 +590,7 @@ size_mb = 1
             ("drain_deadline_s", &ConfigError::ZeroDrainDeadline),
             ("max_conns_per_worker", &ConfigError::ZeroMaxConns),
             ("tierc_fanout_wait_ms", &ConfigError::ZeroFanoutWait),
+            ("tick_ms", &ConfigError::ZeroTickInterval),
         ] {
             let cfg = with_workers(&format!(
                 "{key} = 0\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n"

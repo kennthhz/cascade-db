@@ -30,6 +30,31 @@ pub struct AcceptedConn {
     pub peer: SocketAddr,
 }
 
+/// Caps how long a blocking `accept(2)` on `listener` may sleep before it
+/// returns `WouldBlock`/`TimedOut` — the mechanism that lets the serving
+/// housekeeper interleave accept with orchestrator ticks while still
+/// sleeping between events (FR-5, T4.1). Socket options live in this module
+/// by discipline (bind owns `SO_REUSEADDR`, this owns `SO_RCVTIMEO`).
+pub(crate) fn set_recv_timeout(listener: &TcpListener, d: std::time::Duration) -> io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: d.as_secs() as libc::time_t,
+        tv_usec: d.subsec_micros() as libc::suseconds_t,
+    };
+    unsafe {
+        let got = libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        if got != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Wakeup statistics: one increment per `accept(2)` return. With no clients
 /// this stays flat — the observable form of "sleeps between events" (FR-5).
 #[derive(Debug, Default)]

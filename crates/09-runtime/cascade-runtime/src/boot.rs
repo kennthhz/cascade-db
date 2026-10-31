@@ -75,6 +75,10 @@ pub struct Runtime {
     /// The static Tier C placement snapshot routing reads (FR-10, T2.4).
     /// Live catalog updates arrive with T5.5.
     tierc: Arc<TierCSnapshot>,
+    /// The orchestrator tick-loop observables (T4.1), present only when a
+    /// listener was given — D9 centralizes background work on the
+    /// *serving* housekeeper, so a compute-only boot never ticks.
+    orchestrator: Option<crate::orchestrator::OrchestratorStats>,
 }
 
 pub struct Housekeeper {
@@ -303,6 +307,25 @@ impl Runtime {
             cfg.default_db_numa_affinity,
             &worker_numas,
         ));
+        // T4.1 (D9, FR-5, FR-31's frame): when serving, the first
+        // housekeeper owns the orchestrator tick loop — §M4 background jobs
+        // (stall sampling now; checkpointer, recycler, reaper, statistics
+        // later) run on its thread between accepts. Without a listener
+        // nothing serves and nothing ticks: the compute-only `boot` shape.
+        let (orchestrator, wakeups, orchestrator_stats) = if listener.is_some() {
+            let mut orch =
+                crate::orchestrator::Orchestrator::new(Duration::from_millis(cfg.tick_ms));
+            orch.register(Box::new(crate::orchestrator::StallWatch::new(
+                stalls.clone(),
+                Duration::from_micros(cfg.stall.soft_us),
+                Duration::from_micros(cfg.stall.hard_us),
+            )));
+            let wakeups = Arc::new(AtomicU64::new(0));
+            let stats = orch.stats(Arc::clone(&wakeups));
+            (Some(orch), Some(wakeups), Some(stats))
+        } else {
+            (None, None, None)
+        };
         let housekeepers = spawn_housekeepers(
             cfg,
             listener,
@@ -311,6 +334,8 @@ impl Runtime {
             worker_numas.clone(),
             counters.clone(),
             Arc::clone(&tierc),
+            orchestrator,
+            wakeups,
             &mut verified,
         )?;
         // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
@@ -437,6 +462,7 @@ impl Runtime {
             pools,
             tierc,
             demo_heap,
+            orchestrator: orchestrator_stats,
         })
     }
 
@@ -448,10 +474,18 @@ impl Runtime {
         &self.workers
     }
 
+    /// The orchestrator tick-loop observables (T4.1): ticks fired, worst
+    /// tick lateness, housekeeper wakeups. `None` when booted without a
+    /// listener — nothing serves, nothing ticks (D9).
+    pub fn orchestrator(&self) -> Option<&crate::orchestrator::OrchestratorStats> {
+        self.orchestrator.as_ref()
+    }
+
     /// One housekeeper-style stall sample over every worker reactor (A15),
-    /// returning `(soft, hard)` totals across all reactors. The tick loop
-    /// that calls this periodically lands with the housekeeper (M4+); this
-    /// method is the poll surface today.
+    /// returning `(soft, hard)` totals across all reactors. The orchestrator
+    /// runs the same poll every tick via its `StallWatch` job (T4.1); this
+    /// method remains the synchronous surface for tests and the shutdown
+    /// path.
     pub fn poll_stalls(&self) -> (u64, u64) {
         let mut soft = 0;
         let mut hard = 0;
@@ -531,8 +565,9 @@ pub fn check_smt_mode(
 /// Spawn one `std::thread` per housekeeper core (R5); each pins itself and
 /// reports its *verified* affinity. Boot fails unless every report arrives
 /// within the deadline and matches its core. When a listener is given, the
-/// *first* housekeeper core runs the router loop (accept → auth → handoff);
-/// the rest park.
+/// *first* housekeeper core runs the router loop (accept → auth → handoff)
+/// with the orchestrator tick loop on the same thread (T4.1, D9); the rest
+/// park.
 #[allow(clippy::too_many_arguments)]
 fn spawn_housekeepers(
     cfg: &RuntimeConfig,
@@ -542,26 +577,41 @@ fn spawn_housekeepers(
     worker_numas: Vec<u32>,
     counters: Vec<Arc<AtomicU64>>,
     tierc: Arc<TierCSnapshot>,
+    orchestrator: Option<crate::orchestrator::Orchestrator>,
+    wakeups: Option<Arc<AtomicU64>>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
-    let mut serving = listener.map(|l| (l, auth, senders, worker_numas, counters, tierc));
+    let mut serving = match (listener, orchestrator, wakeups) {
+        (Some(loop_), Some(orch), Some(wake)) => {
+            Some((loop_, auth, senders, worker_numas, counters, tierc, orch, wake))
+        }
+        _ => None,
+    };
     for &core in &cfg.housekeeper_cores {
         let tx = tx.clone();
         let body: Box<dyn FnOnce() + Send> = match serving.take() {
-            Some((loop_, auth, senders, numas, counters, tierc)) => Box::new(move || {
-                // Pin first; then accept (blocking — sleeps between
-                // events, FR-5) → authenticate → route by affinity →
-                // hand off. Housekeepers reserve no arena (the trailing
-                // 0 below).
-                let _ = tx.send((core, pin::pin_current(core), 0));
-                Router::serve(loop_, auth, senders, numas, counters, tierc, max_conns);
-            }),
+            Some((loop_, auth, senders, numas, counters, tierc, orchestrator, wakeups)) => {
+                Box::new(move || {
+                    // Pin first; then accept (blocking, bounded by the next
+                    // tick deadline — sleeps between events, FR-5) →
+                    // authenticate → route by affinity → hand off; due
+                    // ticks fire between accepts (T4.1, D9). Housekeepers
+                    // reserve no arena (the trailing 0 below).
+                    let _ = tx.send((core, pin::pin_current(core), 0));
+                    Router::serve(
+                        loop_, auth, senders, numas, counters, tierc, max_conns, orchestrator,
+                        wakeups,
+                    );
+                })
+            }
             None => Box::new(move || {
                 let _ = tx.send((core, pin::pin_current(core), 0));
-                // Background ticks land later; park — no busy-wait (FR-5).
+                // The orchestrator ticks on the *serving* housekeeper (D9,
+                // T4.1); this one has no work yet — park, no busy-wait
+                // (FR-5).
                 loop {
                     std::thread::park();
                 }
