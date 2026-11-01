@@ -84,7 +84,10 @@ fn single_routes_within_bound_numa_and_refuses_when_drained() {
 
     // FR-10: routing reads the snapshot, and the snapshot's A13 pick is
     // NUMA 1 (one worker there vs two on NUMA 0).
-    assert_eq!(fx._rt.tierc().resolve(Some("dev")).bound_numa, Some(1));
+    assert_eq!(
+        fx._rt.tierc().load().resolve(Some("dev")).bound_numa,
+        Some(1)
+    );
 
     // Held for its side effect: the live connection occupying the bound
     // NUMA's only worker.
@@ -166,7 +169,7 @@ fn cross_routes_machine_wide() {
 fn cluster_default_is_inherited_by_dbs_without_explicit_affinity() {
     let fx = boot(NumaAffinity::Cross);
     assert_eq!(
-        fx._rt.tierc().default_affinity(),
+        fx._rt.tierc().load().default_affinity(),
         NumaAffinity::Cross,
         "snapshot carries the cluster default"
     );

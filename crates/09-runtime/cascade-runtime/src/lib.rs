@@ -53,6 +53,6 @@ pub use stats::{StatsSnapshot, WorkerCounters};
 pub use submit::{submit_loop, SubmitError, SubmitHandle, SubmitInit, SubmitJob, SubmitStats};
 pub use orchestrator::{Orchestrator, OrchestratorStats, StallWatch, Tick, TickJob};
 pub use pools::{NumaPoolHandle, PoolRegistry};
-pub use tierc::{Placement, TierCSnapshot};
+pub use tierc::{Catalog, ClusterSnapshot, Placement};
 pub use walhome::{WalHome, WalHomeTable};
 pub use topology::{AllowedCpuTopology, SyntheticTopology, TopologyError, TopologyProvider};

@@ -3,7 +3,7 @@
 //! semantics live in cascade-bpm's tests; watermark semantics in
 //! cascade-wal's; this file proves the adapter composes both.
 
-use std::{cell::Cell, path::PathBuf, rc::Rc, sync::atomic::{AtomicU32, Ordering}, sync::Arc, time::Duration};
+use std::{cell::Cell, rc::Rc, sync::atomic::{AtomicU32, Ordering}, sync::Arc, time::Duration};
 
 use cascade_types::{DatabaseId, Lsn};
 use cascade_wal::{WalHandle, WalRecord, WalWriter};
@@ -38,7 +38,8 @@ fn gate_resolves_only_when_the_writer_publishes_durability() {
         assert_eq!(gate.durable_lsn(), Lsn(0));
         let parked = Rc::new(Cell::new(false));
         let flag = Rc::clone(&parked);
-        let waiter = {
+        // Detached on purpose: the flag below is polled, not awaited.
+        let _waiter = {
             let gate = Rc::clone(&gate);
             glommio::spawn_local(async move {
                 gate.wait_durable(end).await.expect("gate resolves");

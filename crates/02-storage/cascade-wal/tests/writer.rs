@@ -10,7 +10,7 @@
 
 use std::{
     io::{Seek, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -647,7 +647,7 @@ fn abandoned_leader_releases_leadership_and_the_next_flush_completes() {
 /// Sets the log file's length to `cut` — the deterministic stand-in for a
 /// crash mid-pwrite (the real thing leaves a short write at the tail; a
 /// truncation is byte-for-byte what the kernel ends up with).
-fn saw_off(dir: &PathBuf, cut: u64) {
+fn saw_off(dir: &Path, cut: u64) {
     let f = std::fs::OpenOptions::new()
         .write(true)
         .open(dir.join(format!("db_{}.log", DB.0)))

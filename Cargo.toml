@@ -59,6 +59,10 @@ tokio       = { version = "1", features = ["rt", "macros"] }
 # checksums / hashing
 crc32fast = "1.4"
 
+# pointer-swap publication (§8.4 — the Tier C snapshot's chosen primitive:
+# wait-free reads, writers never block readers, Arc-refcount reclamation)
+arc-swap = "1.9"
+
 # system
 libc = "0.2"
 

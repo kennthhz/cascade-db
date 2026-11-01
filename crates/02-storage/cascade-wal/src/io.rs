@@ -231,10 +231,10 @@ impl WalReader for DebugWalReader {
     }
 }
 
-/// File-level helpers for boot recovery (T3.3): the clean marker and the
-/// torn-tail truncation. All synchronous `std::fs` — they run on the boot
-/// thread *before* any worker opens a handle on the same file, so no
-/// reactor ever sees a moved file length underneath it.
+// File-level helpers for boot recovery (T3.3): the clean marker and the
+// torn-tail truncation. All synchronous `std::fs` — they run on the boot
+// thread *before* any worker opens a handle on the same file, so no
+// reactor ever sees a moved file length underneath it.
 
 /// Byte length of the DB's log file (`0` when there is none yet).
 pub fn log_len(wal_dir: &Path, db: DatabaseId) -> std::io::Result<u64> {

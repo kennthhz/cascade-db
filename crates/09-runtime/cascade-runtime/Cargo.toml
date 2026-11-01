@@ -20,6 +20,7 @@ cascade-pg-parser = { workspace = true }
 
 libc        = { workspace = true }
 glommio      = { workspace = true }
+arc-swap    = { workspace = true }
 serde        = { workspace = true }
 toml         = { workspace = true }
 futures-lite = { workspace = true }

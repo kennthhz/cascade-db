@@ -364,6 +364,51 @@ an `Rc` is rejected at compile time with E0277 on the `F: Send` bound
 deliberately absent until T5.3 (the first real consumer) — the same
 staging discipline as the checkpointer's channel.
 
+**Tier C snapshot + pointer-load reads (T5.2, FR-28, §6.3/§8.4) —
+the pointer is the lock-free read.** `src/tierc.rs`: the T2.4 static
+snapshot grew the ArcSwap read path and took FR-28's literal payload
+name (`TierCSnapshot` → `ClusterSnapshot`); arc-swap 1.9.3 entered the
+workspace for this (§8.4 names it the chosen primitive). The `Catalog`
+holder wraps `ArcSwap<ClusterSnapshot>`: reads are `load()` — a Guard,
+one pointer copy, no refcount bump, no lock, no compare-exchange — or
+`load_full()` (one refcount increment) for the rare reader that must
+hold its snapshot across an await; a Guard never spans an `.await`
+because a live guard occupies one of the THREAD's debt slots (per-thread,
+shared across every ArcSwap instance), which pushes that thread's other
+loads onto the slower refcount path. The ONLY write is
+`pub(crate) store(Arc<ClusterSnapshot>)`: no swap/rcu/compare_exchange
+is re-exposed, so "no second writer path" (I9) is grep-auditable and no
+external crate can write at all. Until T5.3's housekeeper writer lands,
+boot's `Catalog::new` is the only publication — the snapshot stays
+immutable after boot, the T2.4 posture. Consumers: router `route()`
+pointer-loads per connection; boot's WAL-home resolve reads once
+pre-serving. Per-reactor instances are T5.3's fan-out shape (R11's
+laggard adoption needs one ArcSwap per reactor); today ONE instance,
+held by the router plus boot's one resolve. The three §8.4 guarantees
+are pinned by tests the review verified against arc-swap 1.9.3's actual
+swap/pay_all/debt mechanics: the race test (barrier-synchronized 3
+readers + writer over 5 000 whole snapshots riding the revision in
+`bound_numa`; asserts coherent pairing, per-reader MONOTONE revisions —
+a real invariant since the storage is one SeqCst-swapped pointer and
+every snapshot is a distinct allocation, so no ABA — final-revision
+visibility via the done flag's Acquire/Release, and that some reader
+actually saw the pointer MOVE: the anti-"run and hope" assert), the
+reclamation test (strong_count 2→1 at the store — pay_all drops the old
+Arc synchronously — and Weak::upgrade fails once the last reader
+finishes), and the guard-pinning test (a Guard's snapshot survives two
+concurrent replacements whole and frees on guard drop, on both debt
+outcomes). Compile-time pins: `assert_impl_all!(ClusterSnapshot:
+Send, Sync)` — what makes T5.3's fan-out job legal — and Catalog
+Send+Sync. Surprise: arc-swap's Guard IS `Send` in 1.9.x (it holds
+`ManuallyDrop<Arc<T>>` plus a shared debt reference, not the raw
+pointer of older versions) — the docs state the honest debt-pressure
+reason, not a fake `!Send`. Also in this commit: pre-existing clippy
+debt the old exit-code-only gate had let through — an
+`async_yields_async` ERROR in tests/submit.rs (denied by clippy 1.95;
+the unresolved `first` future now drops inside the block),
+walgate's unused import and detached-task naming, and cascade-wal's
+doc-divider comment plus a `&PathBuf`→`&Path` in its writer test.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

@@ -207,7 +207,7 @@ fn full_queue_refuses_without_blocking() {
         .expect("parked executor spawns");
 
     let ex = caller_executor("submit-caller", caller_core);
-    let unresolved_first = ex.run(async move {
+    ex.run(async move {
         let handle = init.connect().await;
         let gate = Arc::new(AtomicBool::new(false));
         let first = handle.submit_to(move || {
@@ -227,9 +227,11 @@ fn full_queue_refuses_without_blocking() {
         );
         assert_eq!(stats.refused.load(Ordering::Relaxed), 1);
         assert_eq!(stats.submitted.load(Ordering::Relaxed), 2);
-        first // never drained here; dropped with the queue below
+        // `first` was never drained — its future drops here, unresolved
+        // (dropping it cancels the oneshot; the parked receiver below
+        // drops with the queue at test end, so nothing hangs).
+        drop(first);
     });
-    drop(unresolved_first);
     drop(parked);
 }
 

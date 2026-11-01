@@ -44,7 +44,7 @@ use crate::{
     pools::PoolRegistry,
     router::Router,
     tenant::TenantCounters,
-    tierc::TierCSnapshot,
+    tierc::{Catalog, ClusterSnapshot},
     topology::{TopologyError, TopologyProvider},
     walhome::{self, WalHome, WalHomeTable},
 };
@@ -74,9 +74,10 @@ pub struct Runtime {
     pools: PoolRegistry,
     /// The perf-demo relation, when `runtime.demo_rows` > 0.
     demo_heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
-    /// The static Tier C placement snapshot routing reads (FR-10, T2.4).
-    /// Live catalog updates arrive with T5.5.
-    tierc: Arc<TierCSnapshot>,
+    /// The Tier C catalog holder routing reads pointer-load (FR-28,
+    /// T2.4, T5.2). The single writer + `submit_to` fan-out arrive with
+    /// T5.3; live catalog updates with T5.5.
+    tierc: Arc<Catalog>,
     /// The orchestrator tick-loop observables (T4.1), present only when a
     /// listener was given — D9 centralizes background work on the
     /// *serving* housekeeper, so a compute-only boot never ticks.
@@ -352,10 +353,10 @@ impl Runtime {
             .iter()
             .flat_map(|w| std::iter::repeat(w.numa).take(w.cores.len()))
             .collect();
-        let tierc = Arc::new(TierCSnapshot::build(
+        let tierc = Arc::new(Catalog::new(ClusterSnapshot::build(
             cfg.default_db_numa_affinity,
             &worker_numas,
-        ));
+        )));
         // T4.1 (D9, FR-5, FR-31's frame): when serving, the first
         // housekeeper owns the orchestrator tick loop — §M4 background jobs
         // (stall sampling, checkpointer fanout now; recycler, reaper,
@@ -429,7 +430,7 @@ impl Runtime {
                 let pool_numas: Vec<u32> = cfg.numa_pools.iter().map(|p| p.numa).collect();
                 let home = walhome::resolve_wal_home(
                     dev,
-                    &tierc.resolve(Some("dev")),
+                    &tierc.load().resolve(Some("dev")),
                     &persisted,
                     &pool_numas,
                 );
@@ -848,9 +849,12 @@ impl Runtime {
         &self.pools
     }
 
-    /// The Tier C placement snapshot routing reads (FR-10, T2.4) — the
-    /// same `Arc` the router holds. Static until T5.5's live feed.
-    pub fn tierc(&self) -> &Arc<TierCSnapshot> {
+    /// The Tier C catalog routing reads pointer-load (FR-10, T2.4,
+    /// FR-28, T5.2) — the same `Arc<Catalog>` the router holds. Reads:
+    /// `tierc().load()` is the FR-28 pointer copy; `load_full()` if the
+    /// snapshot must be held across an await. The single writer path
+    /// arrives with T5.3; live catalog updates with T5.5.
+    pub fn tierc(&self) -> &Arc<Catalog> {
         &self.tierc
     }
 
@@ -969,7 +973,7 @@ fn spawn_housekeepers(
     senders: Vec<SharedSender<Handoff>>,
     worker_numas: Vec<u32>,
     counters: Vec<Arc<crate::stats::WorkerCounters>>,
-    tierc: Arc<TierCSnapshot>,
+    tierc: Arc<Catalog>,
     tick_init: Option<crate::orchestrator::OrchestratorInit>,
     designated: Vec<(u32, SharedSender<ControlMsg>)>,
     checkpoint: Option<CheckpointStats>,

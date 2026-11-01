@@ -34,7 +34,7 @@ use crate::{
     config::{AuthConfig, NumaAffinity},
     handoff::Handoff,
     pg::{handshake, send_fatal, AuthPolicy, Session},
-    tierc::{Placement, TierCSnapshot},
+    tierc::{Catalog, Placement},
 };
 
 /// PG too_many_connections — the FR-12/R10 refusal code.
@@ -52,7 +52,7 @@ pub struct Router {
     policy: AuthPolicy,
     routes: Vec<Route>,
     max_conns_per_worker: u32,
-    tierc: Arc<TierCSnapshot>,
+    tierc: Arc<Catalog>,
 }
 
 impl Router {
@@ -90,7 +90,8 @@ impl Router {
         let peer = stream
             .peer_addr()
             .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        let placement = self.tierc.resolve(session.startup.database());
+        // FR-28's read on the routing path: one pointer copy, no lock.
+        let placement = self.tierc.load().resolve(session.startup.database());
         let Some(idx) = self.choose(&placement) else {
             // FR-12 (R10): a single-affinity DB with no available worker on
             // its bound NUMA is refused, naming the NUMA — never silently
@@ -167,7 +168,7 @@ impl Router {
         senders: Vec<SharedSender<Handoff>>,
         numas: Vec<u32>,
         counters: Vec<Arc<crate::stats::WorkerCounters>>,
-        tierc: Arc<TierCSnapshot>,
+        tierc: Arc<Catalog>,
         max_conns_per_worker: u32,
         tick_init: crate::orchestrator::OrchestratorInit,
         designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
