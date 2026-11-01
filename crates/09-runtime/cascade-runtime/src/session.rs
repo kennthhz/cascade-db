@@ -271,6 +271,39 @@ async fn read_message<W: AsyncRead + Unpin>(sink: &mut W) -> io::Result<Option<(
     Ok(Some((hdr[0], payload)))
 }
 
+/// One framed message, interruptible by the idle reaper (T4.5). While
+/// parked here the session marks itself `waiting` in its registry entry
+/// — the ONLY state from which the reaper may condemn it (a session
+/// mid-statement is not idle, whatever the clock says). If the reaper
+/// condemned the connection during this wait, returns `Ok(None)` —
+/// indistinguishable from EOF at this layer — so the session exits
+/// through the ordinary FR-15 cleanup path. The waker is re-stored on
+/// every poll: the reaper's wake must land on the waker of the poll
+/// that is actually parked. `reap == None` (reaping disabled) is the
+/// plain read, zero overhead.
+async fn reap_message<W: AsyncRead + Unpin>(
+    reap: Option<&Rc<crate::reaper::ReapRegistry>>,
+    id: Option<crate::reaper::ConnId>,
+    sink: &mut W,
+) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let (reg, id) = match (reap, id) {
+        (Some(r), Some(i)) => (r, i),
+        _ => return read_message(sink).await,
+    };
+    reg.set_waiting(id, true);
+    let mut inner = std::pin::pin!(read_message(sink));
+    let res = std::future::poll_fn(|cx| {
+        if reg.is_dropped(id) {
+            return std::task::Poll::Ready(Ok(None));
+        }
+        reg.store_waker(id, cx.waker());
+        std::future::Future::poll(inner.as_mut(), cx)
+    })
+    .await;
+    reg.set_waiting(id, false);
+    res
+}
+
 /// Per-connection environment handed to every session by its worker: the
 /// pieces of the shutdown protocol (T4.4) the session honors between
 /// statements. `draining` is §10.2 step 2b — once set, the *next*
@@ -298,6 +331,19 @@ impl Drop for GaugeGuard<'_> {
     }
 }
 
+/// Unregisters the connection's reaper entry on every exit, unwinding
+/// included. A zombie entry would sit in the registry forever — not
+/// re-reapable (it's already dropped or removed from eligibility), but
+/// never removed either, a slow leak per panicked session and a growing
+/// walk for every reap pass on this ring.
+struct ReapGuard<'a>(&'a Rc<crate::reaper::ReapRegistry>, crate::reaper::ConnId);
+
+impl Drop for ReapGuard<'_> {
+    fn drop(&mut self) {
+        self.0.unregister(self.1);
+    }
+}
+
 /// The session task a worker spawns per handed-off connection: simple-query
 /// loop until Terminate or disconnect. The tenant context and span are
 /// constructed once here and *borrowed* through every executed statement
@@ -312,8 +358,20 @@ pub async fn run(
     heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
     batch_rows: u32,
     env: SessionEnv,
+    reap: Option<Rc<crate::reaper::ReapRegistry>>,
 ) {
     counter.fetch_add(1, Ordering::Relaxed);
+    // The idle reaper (T4.5, FR-34): one registry entry per connection,
+    // armed before the first read and unregistered by an RAII guard on
+    // every exit — a panic must not leave a zombie entry for every later
+    // reap pass to reconsider (the GaugeGuard discipline). Idle runs
+    // from each statement's completion (`touch` below), never from
+    // connection age.
+    let reap_id = reap.as_ref().map(|r| r.register());
+    let _reap_guard = reap
+        .as_ref()
+        .zip(reap_id)
+        .map(|(r, id)| ReapGuard(r, id));
     // SAFETY: the fd crossed exactly once via the shared channel and this
     // task is its sole owner — adopted onto *this* reactor's ring (I2).
     let stream = unsafe { glommio::net::TcpStream::from_raw_fd(handoff.fd) };
@@ -325,7 +383,7 @@ pub async fn run(
     let mut sess = Session::new(table);
 
     loop {
-        let msg = match read_message(&mut out.sink).await {
+        let msg = match reap_message(reap.as_ref(), reap_id, &mut out.sink).await {
             Ok(Some(m)) => m,
             Ok(None) => break,
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
@@ -444,6 +502,13 @@ pub async fn run(
                     }
                     if out.send(b'Z', &[sess.rfb_byte()]).await.is_err() {
                         closed = true;
+                    }
+                    // The statement just COMPLETED — the RFB is out. This
+                    // is where the reaper's idle clock resets: idle is
+                    // measured from last completion, never from connection
+                    // age (T4.5).
+                    if let (Some(r), Some(id)) = (reap.as_ref(), reap_id) {
+                        r.touch(id);
                     }
                 }
                 // `_inflight` (the gauge guard) drops here — or on the

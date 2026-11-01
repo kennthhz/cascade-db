@@ -162,6 +162,15 @@ pub struct RuntimeConfig {
     /// sleeps in `accept(2)` between ticks — the interval bounds background
     /// latency, never a busy poll (FR-5).
     pub tick_ms: u64,
+    /// Idle-connection reap timeout (spec §9, FR-34; default `0` =
+    /// disabled): a connection parked in its message read whose last
+    /// *completed* statement is older than this is reaped by the reaper
+    /// via its owning reactor, through the ordinary disconnect-cleanup
+    /// path. Idle is measured from last statement completion — never
+    /// from connection age — and a session mid-statement is never
+    /// reaped. `0` disables reaping entirely: a default that kills
+    /// client connections must be opted into.
+    pub idle_reap_ms: u64,
     pub stall: StallConfig,
     pub auth: AuthConfig,
 }
@@ -183,6 +192,7 @@ impl Default for RuntimeConfig {
             demo_rows: 0,
             tierc_fanout_wait_ms: 1000,
             tick_ms: 1000,
+            idle_reap_ms: 0,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),
         }

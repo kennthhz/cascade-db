@@ -348,6 +348,7 @@ fn draining_session_refuses_the_next_statement_with_57p01() {
                     None,
                     64,
                     env,
+                    None, // no reaper: the drain drives this session, not idle
                 )
                 .await;
             });

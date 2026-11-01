@@ -233,6 +233,53 @@ client can hold the serving thread inside `handshake` per-read bounded
 but unbounded in total — a total handshake deadline belongs to the
 pgwire slice.
 
+**Idle-connection reaper (T4.5, FR-34) — the idle definition is the
+design.** `src/reaper.rs`: the fourth dedicated channel family (SPSC —
+control stays T4.2-flush, recycle T4.3-recycle, drain T4.4-final-flush).
+The serving housekeeper's `IdleReaper` (a `TickJob`) `try_send`s an
+empty `ReapTick` to **every** worker — idle connections live on all
+rings, not just designated ones; the signal carries no timeout
+deliberately, because the decision is made worker-side, on the ring
+that owns the entries (the housekeeper only rings the bell). Each
+worker's `reap_loop` (sibling task, sharing the sessions'
+`Rc<ReapRegistry>` — Tier A, same ring) walks the reactor-local
+registry and condemns entries that are **parked in their message read
+AND whose last completed statement is older than `idle_reap_ms`**. Both
+halves are load-bearing: idle runs from *last statement completion*
+(`touch` fires exactly when each statement's RFB goes out — never from
+connection age, and never across a statement's own runtime), and
+`waiting` is set only inside the session's read wrapper (`reap_message`
+in `session.rs`: a `poll_fn` that checks `is_dropped` first — returning
+EOF, so the reap exits through the ordinary FR-15 cleanup, mid-txn
+abort included — stores the poll's waker, then delegates to the pinned
+underlying read). A session blocked in a write or a WAL sync is
+`waiting == false` and structurally un-reapable; the reap snapshot is
+exact (same-ring serialization), the waker is re-stored every poll, and
+the entry survives condemnation for the session to observe (the
+unregister guard removes it — a zombie entry would otherwise sit in the
+registry forever). Condemned connections close without a wire message
+(the client sees EOF); the reap-vs-arriving-query race is deliberate
+and documented — a query already in the kernel buffer when the pass
+snapshot condemned the connection loses, exactly like PG's
+`idle_session_timeout` at tick granularity. `idle_reap_ms` defaults to
+`0` = disabled: no channels, no job, no loops, and sessions take the
+plain read (`reap == None`); a default that kills client connections
+must be opted into. **Connect-order rule (found as a live three-way
+boot deadlock: all executors spinning at 100%)**: a `connect()` blocks
+until the peer endpoint connects on its own executor, so the serving
+side must connect the signal families in the same order the workers do
+(handoff → control → recycle → drain → reap) — connecting the reaper
+before the drain deadlocked: the serving thread waited inside a
+reap-sender connect for a worker still waiting inside its drain connect
+for this thread's drain senders, sequenced after the reapers. The rule
+now lives at the connect site in `router.rs`. Observables:
+`Runtime::reap_stats()` (signals attempted / refused-full / connections
+condemned across workers; `None` when disabled or listenerless).
+Review follow-ups acknowledged, not T4.5: the session's connection
+counter decrement (`session.rs`) is a manual line rather than an RAII
+guard — the same unwind discipline ReapGuard/GaugeGuard follow would
+apply to it.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

@@ -89,6 +89,11 @@ pub struct Runtime {
     /// when something serves AND a WAL exists — no listener means nothing
     /// orchestrates; no `wal_dir` means there is nothing to recycle.
     recycle: Option<crate::recycler::RecycleStats>,
+    /// The reaper's orchestration counters (T4.5, FR-34). Present only
+    /// when something serves AND reaping is enabled (`idle_reap_ms > 0`,
+    /// not the default — a default that kills client connections must be
+    /// opted into).
+    reap: Option<crate::reaper::ReapStats>,
     /// The per-DB WAL-truncatable frontier (T4.3's recycler reads it),
     /// present whenever a WAL was configured. Stays at 0 until passes
     /// actually flush stamped pages — which, with no live worker BPM yet,
@@ -565,6 +570,52 @@ impl Runtime {
         } else {
             (Vec::new(), Vec::new())
         };
+        // The reap channels (T4.5, FR-34): the FOURTH signal family
+        // (control: T4.2, recycle: T4.3, drain: T4.4) — SPSC forbids
+        // sharing, and targeting = scope again, but the scope differs:
+        // idle connections live on EVERY worker, not just designated
+        // ones, so this family fans out one channel per worker core
+        // rather than per pool. Disabled (`idle_reap_ms == 0`, the
+        // default) or listenerless: no channels, no job, no loops.
+        let worker_core_count: usize = cfg
+            .worker_cores
+            .iter()
+            .map(|w| w.cores.len())
+            .sum();
+        let reap_enabled = listener.is_some() && cfg.idle_reap_ms > 0;
+        let reap_signals = Arc::new(AtomicU64::new(0));
+        let reap_refused = Arc::new(AtomicU64::new(0));
+        let reap_reaped = Arc::new(AtomicU64::new(0));
+        let reap_stats = reap_enabled.then(|| {
+            crate::reaper::ReapStats::new(
+                Arc::clone(&reap_signals),
+                Arc::clone(&reap_refused),
+                Arc::clone(&reap_reaped),
+            )
+        });
+        // One `new_bounded` per channel binds BOTH halves — the senders
+        // go into `ReapInit` (serving side), the receivers stay here for
+        // the workers, in the same per-core order `spawn_workers` zips.
+        let (reap_init, reap_receivers): (
+            Option<crate::reaper::ReapInit>,
+            Vec<Option<glommio::channels::shared_channel::SharedReceiver<crate::reaper::ReapTick>>>,
+        ) = match reap_stats.clone() {
+            Some(stats) => {
+                let mut senders = Vec::with_capacity(worker_core_count);
+                let mut rxs = Vec::with_capacity(worker_core_count);
+                for _ in 0..worker_core_count {
+                    let (tx, rx) = new_bounded::<crate::reaper::ReapTick>(8);
+                    senders.push(tx);
+                    rxs.push(rx);
+                }
+                let init = crate::reaper::ReapInit { senders, stats };
+                (Some(init), rxs.into_iter().map(Some).collect())
+            }
+            None => (
+                None,
+                (0..worker_core_count).map(|_| None).collect::<Vec<_>>(),
+            ),
+        };
         let housekeepers = spawn_housekeepers(
             cfg,
             listener,
@@ -579,6 +630,7 @@ impl Runtime {
             recycle_init,
             serving_shutdown,
             drain_tx,
+            reap_init,
             Arc::clone(&shutdown_flag),
             &mut verified,
         )?;
@@ -653,6 +705,8 @@ impl Runtime {
             control_rx,
             recycle_receivers,
             drain_receivers,
+            reap_receivers,
+            &reap_reaped,
             draining,
             inflight,
             dev_home,
@@ -683,6 +737,7 @@ impl Runtime {
             orchestrator: orchestrator_stats,
             checkpoint: checkpoint_stats,
             recycle: recycle_stats,
+            reap: reap_stats,
             truncatable,
             shutdown_flag,
             shutdown_trace,
@@ -717,6 +772,14 @@ impl Runtime {
     /// bytes computed reclaimable. `None` without a listener or a WAL.
     pub fn recycle_stats(&self) -> Option<&crate::recycler::RecycleStats> {
         self.recycle.as_ref()
+    }
+
+    /// The reaper's orchestration counters (T4.5, FR-34): reap signals
+    /// fanned out / dropped-full / connections condemned across all
+    /// workers. `None` without a listener or with reaping disabled
+    /// (`idle_reap_ms == 0`, the default).
+    pub fn reap_stats(&self) -> Option<&crate::reaper::ReapStats> {
+        self.reap.as_ref()
     }
 
     /// The WAL-truncatable frontier (T4.2/FR-31, consumed by the T4.3
@@ -896,15 +959,16 @@ fn spawn_housekeepers(
     recycle: Option<crate::recycler::RecycleInit>,
     shutdown: Option<crate::shutdown::ServingShutdown>,
     drain: Vec<(u32, bool, SharedSender<crate::shutdown::DrainMsg>)>,
+    reap: Option<crate::reaper::ReapInit>,
     shutdown_flag: Arc<AtomicBool>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
-    let mut serving = match (listener, tick_init, checkpoint, recycle, shutdown, drain) {
-        (Some(loop_), Some(init), Some(stats), recycle, shutdown, drain) => {
-            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats, recycle, shutdown, drain))
+    let mut serving = match (listener, tick_init, checkpoint, recycle, shutdown, drain, reap) {
+        (Some(loop_), Some(init), Some(stats), recycle, shutdown, drain, reap) => {
+            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats, recycle, shutdown, drain, reap))
         }
         _ => None,
     };
@@ -924,6 +988,7 @@ fn spawn_housekeepers(
                 recycle,
                 shutdown,
                 drain,
+                reap,
             )) => Box::new(move || {
                 // Pin first; then accept (blocking, bounded by the next
                 // tick deadline — sleeps between events, FR-5) →
@@ -936,7 +1001,7 @@ fn spawn_housekeepers(
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
                     loop_, auth, senders, numas, counters, tierc, max_conns, tick_init,
-                    designated, stats, recycle, shutdown, drain,
+                    designated, stats, recycle, shutdown, drain, reap,
                 );
             }),
             None => {
@@ -998,6 +1063,8 @@ fn spawn_workers(
     control_receivers: Vec<SharedReceiver<ControlMsg>>,
     recycle_receivers: Vec<Option<SharedReceiver<crate::recycler::RecycleSignal>>>,
     drain_receivers: Vec<Option<SharedReceiver<crate::shutdown::DrainMsg>>>,
+    reap_receivers: Vec<Option<SharedReceiver<crate::reaper::ReapTick>>>,
+    reap_reaped: &Arc<AtomicU64>,
     draining: Arc<AtomicBool>,
     inflight: Vec<Arc<AtomicU64>>,
     dev_home: Option<u32>,
@@ -1021,13 +1088,14 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for ((((((((numa, core), rx), ctrl_rx), recycle_rx), drain_rx), counter), inflight), (tenant_counters, stall)) in
+    for (((((((( (numa, core), rx), ctrl_rx), recycle_rx), drain_rx), reap_rx), counter), inflight), (tenant_counters, stall)) in
         per_core
             .into_iter()
             .zip(receivers)
             .zip(control_receivers)
             .zip(recycle_receivers)
             .zip(drain_receivers)
+            .zip(reap_receivers)
             .zip(counters.iter())
             .zip(inflight)
             .zip(tenant_counters.iter().zip(stalls.iter()))
@@ -1058,6 +1126,8 @@ fn spawn_workers(
             inflight: Arc::clone(&inflight),
         };
         let task_is_home = Some(numa) == dev_home;
+        let reap_reaped_counter = Arc::clone(reap_reaped);
+        let reap_timeout_ms = cfg.idle_reap_ms;
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
@@ -1125,6 +1195,29 @@ fn spawn_workers(
                     ))
                     .detach();
                 }
+                // The reap plane (T4.5, FR-34): its own channel, its own
+                // loop — on EVERY worker, not just designated ones, because
+                // idle connections live everywhere. The registry is the
+                // sessions' Tier A bookkeeping, created on this ring and
+                // shared (Rc) with the reap loop and every session task
+                // below; the loop is spawned only when reaping is enabled,
+                // but the registry's absence is exactly what tells a
+                // session to skip the bookkeeping (`reap == None`).
+                let task_reap_registry =
+                    reap_rx.as_ref().map(|_| Rc::new(crate::reaper::ReapRegistry::new()));
+                if let Some(rx) = reap_rx {
+                    let reaps = rx.connect().await;
+                    let registry = task_reap_registry
+                        .as_ref()
+                        .expect("registry built alongside its receiver");
+                    glommio::spawn_local(crate::reaper::reap_loop(
+                        reaps,
+                        Rc::clone(registry),
+                        Duration::from_millis(reap_timeout_ms),
+                        Arc::clone(&reap_reaped_counter),
+                    ))
+                    .detach();
+                }
                 let table = Rc::new(crate::session::Table::new());
                 // T3.3: replayed committed rows land in every worker's
                 // table before the first session — the debug slice has no
@@ -1143,6 +1236,7 @@ fn spawn_workers(
                     glommio::spawn_local(crate::session::run(
                         handoff, table, counter, tenants, wal, heap, batch_rows,
                         task_env.clone(),
+                        task_reap_registry.as_ref().map(Rc::clone),
                     ))
                     .detach();
                 }

@@ -13,7 +13,7 @@ The binary. Composition only — no business logic. Everything reusable lives in
 
 ## Current shape (M1)
 
-Args: `--port`, `--hk-cores`, `--worker-cores`, `--wal-dir`, `--batch-rows`. Placement is explicit operator cores; the /sys topology provider and TOML config land in later phases.
+Args: `--port`, `--hk-cores`, `--worker-cores`, `--wal-dir`, `--batch-rows`, `--demo-rows`, `--idle-reap-ms` (T4.5: idle-connection reap timeout; `0`, the default, disables reaping). Placement is explicit operator cores; the /sys topology provider and TOML config land in later phases.
 
 ## Open Design Questions
 

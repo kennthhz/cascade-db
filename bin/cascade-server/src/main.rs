@@ -35,6 +35,7 @@ fn main() {
     let mut wal_dir: Option<std::path::PathBuf> = None;
     let mut batch_rows: u32 = 1024;
     let mut demo_rows: u32 = 0;
+    let mut idle_reap_ms: u64 = 0;
 
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -63,6 +64,13 @@ fn main() {
                     .parse()
                     .expect("demo rows")
             }
+            "--idle-reap-ms" => {
+                idle_reap_ms = it
+                    .next()
+                    .expect("--idle-reap-ms value")
+                    .parse()
+                    .expect("idle reap ms")
+            }
             other => {
                 eprintln!("unknown arg {other}");
                 std::process::exit(2);
@@ -70,7 +78,7 @@ fn main() {
         }
     }
     if hk_cores.is_empty() || worker_cores.is_empty() {
-        eprintln!("usage: cascade-server --port N --hk-cores a --worker-cores b,c [--wal-dir DIR] [--batch-rows N] [--demo-rows N]");
+        eprintln!("usage: cascade-server --port N --hk-cores a --worker-cores b,c [--wal-dir DIR] [--batch-rows N] [--demo-rows N] [--idle-reap-ms N]");
         std::process::exit(2);
     }
 
@@ -101,6 +109,7 @@ fn main() {
         batch_rows,
         wal_dir,
         demo_rows,
+        idle_reap_ms,
         ..RuntimeConfig::default()
     };
 

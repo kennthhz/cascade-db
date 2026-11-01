@@ -175,6 +175,7 @@ impl Router {
         recycle: Option<crate::recycler::RecycleInit>,
         shutdown: Option<crate::shutdown::ServingShutdown>,
         drain: Vec<(u32, bool, SharedSender<crate::shutdown::DrainMsg>)>,
+        reap: Option<crate::reaper::ReapInit>,
     ) {
         let ex = LocalExecutorBuilder::new(ExecutorPlacement::Unbound)
             .name("cascade-hk-ring")
@@ -243,9 +244,34 @@ impl Router {
             // drain is one-shot). The middle flag marks the WAL-home
             // reactor — the drain keys step 3's ack on it, never on slot
             // position.
+            //
+            // Family order here is load-bearing (T4.5): a `connect` blocks
+            // until the peer endpoint connects on its own executor, so the
+            // serving side must connect the families in the SAME order the
+            // workers do (handoff → control → recycle → drain → reap).
+            // Connecting the reaper BEFORE the drain deadlocked the boot:
+            // the serving thread waited inside reap-sender #0 for a worker
+            // that was itself still waiting inside its drain connect — for
+            // this thread's drain senders, which came after the reapers.
             let mut drain_senders = Vec::with_capacity(drain.len());
             for (numa, is_home, tx) in drain {
                 drain_senders.push((numa, is_home, tx.connect().await));
+            }
+            // The reaper (T4.5, FR-34) registers last: unlike the
+            // recycler it has no producer/consumer dependency on the
+            // others (it reads no frontier, writes no LSN), so the tick
+            // order carries no correctness here — the CONNECT order above
+            // is what must mirror the workers. Its fanout targets EVERY
+            // worker: idle connections live on all rings, not just
+            // designated ones.
+            if let Some(init) = reap {
+                let mut senders = Vec::with_capacity(init.senders.len());
+                for tx in init.senders {
+                    senders.push(tx.connect().await);
+                }
+                orchestrator.register(Box::new(crate::reaper::IdleReaper::new(
+                    senders, init.stats,
+                )));
             }
             // The shutdown flag read every loop pass. `None` on a
             // listenerless boot (nothing accepts, nothing drains — D9).

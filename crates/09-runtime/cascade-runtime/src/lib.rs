@@ -19,6 +19,7 @@ pub mod pg;
 pub mod pin;
 pub mod recovery;
 pub mod pools;
+pub mod reaper;
 pub mod recycler;
 pub mod router;
 pub mod scram;
@@ -41,6 +42,7 @@ pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
 pub use recycler::{
     recycle_loop, RecycleInit, RecycleSignal, RecycleSite, RecycleStats, WalRecycler,
 };
+pub use reaper::{reap_loop, ConnId, IdleReaper, ReapInit, ReapRegistry, ReapStats, ReapTick};
 pub use shutdown::{
     drain_loop, run_drain, send_final_flush, DrainMsg, FinalFlushCtx, ServingShutdown,
     ShutdownTrace,
