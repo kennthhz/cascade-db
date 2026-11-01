@@ -150,6 +150,7 @@ fn boot_warns_exactly_as_the_kernel_cmdline_demands_and_never_refuses() {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let boot = Runtime::boot_routed(&boot_cfg, &topo, Some(listener), AuthConfig::default(), None);
     unlock();
 
@@ -197,6 +198,7 @@ fn provisioned_host_boots_without_warnings() {
     let (records, unlock) = capture();
     let boot_cfg = cfg(hk, &workers);
     let topo = SyntheticTopology::new(workers.iter().copied().chain([hk]));
+    cascade_runtime::testutil::arm_suite_watchdog();
     let boot = Runtime::boot(&boot_cfg, &topo);
     unlock();
 

@@ -61,6 +61,7 @@ fn pools_map_to_numas_with_per_numa_sizes() {
             .try_into()
             .expect("four allowed cores"),
     );
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("boot succeeds on online cores");
 
     // Mapping: one pool per configured NUMA, in config order (FR-22).
@@ -125,6 +126,7 @@ fn worker_less_pool_is_legal() {
         ..RuntimeConfig::default()
     };
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("a worker-less pool is legal (A18)");
     assert_eq!(rt.pools().num_numas(), 3);
     let pool2 = rt.pools().pool_for_numa(2).expect("worker-less pool exists");
@@ -160,6 +162,7 @@ fn pool_numa_absent_from_host_degrades_not_crashes() {
         ..RuntimeConfig::default()
     };
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("unplaceable pool warns, does not crash");
     let ghost = rt.pools().pool_for_numa(999).expect("pool still exists");
     assert_eq!(ghost.frames(), 128);
@@ -214,6 +217,7 @@ fn pools_are_node_local_on_bare_metal() {
         ..RuntimeConfig::default()
     };
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("bare-metal boot");
     for pool in rt.pools().iter() {
         // Without a bound node the locality claim is best-effort by

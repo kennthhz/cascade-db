@@ -35,6 +35,7 @@ fn boots_synthetic_topology_and_verifies_pins() {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let cfg = test_config(allowed[0], &[allowed[1], allowed[2]]);
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("boot succeeds on online cores");
 
     assert_eq!(
@@ -53,6 +54,7 @@ fn boots_synthetic_topology_and_verifies_pins() {
     // FR-1 refusal: a core the topology does not report online must fail
     // boot, not half-start.
     let bad_cfg = test_config(allowed[0], &[99]);
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&bad_cfg, &topo).expect_err("offline worker core must refuse boot") {
         BootError::CoreOffline { core } => assert_eq!(core, 99),
         other => panic!("expected CoreOffline(99), got {other:?}"),
@@ -63,6 +65,7 @@ fn boots_synthetic_topology_and_verifies_pins() {
 fn refuses_housekeeper_core_offline() {
     let topo = SyntheticTopology::new([0, 1]);
     let cfg = test_config(42, &[1]);
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &topo).expect_err("offline housekeeper core must refuse boot") {
         BootError::CoreOffline { core } => assert_eq!(core, 42),
         other => panic!("expected CoreOffline(42), got {other:?}"),
@@ -80,6 +83,7 @@ fn refuses_core_provider_claims_but_kernel_rejects() {
 
     let lying = SyntheticTopology::new(allowed.iter().copied().chain([9999]));
     let cfg = test_config(allowed[0], &[9999]);
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &lying).expect_err("kernel-refused core must refuse boot") {
         err @ (BootError::WorkerSpawn { .. } | BootError::CoreOffline { .. }) => {
             // Exact variant depends on the host: either the provider check
@@ -106,6 +110,7 @@ fn boots_bare_metal() {
 
     let topo = AllowedCpuTopology;
     let cfg = test_config(allowed[0], &[allowed[1], allowed[2]]);
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("boot on the real topology");
 
     // FR-2's whole point: boot returning Ok means every pin was verified
@@ -124,6 +129,7 @@ fn refuses_duplicate_worker_core_at_boot() {
     assert!(allowed.len() >= 2, "needs at least 2 CPUs");
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let cfg = test_config(allowed[0], &[allowed[1], allowed[1]]);
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &topo).expect_err("duplicate worker core must refuse boot") {
         BootError::Config(e) => {
             assert_eq!(e, cascade_runtime::config::ConfigError::DuplicateCore { core: allowed[1] });
@@ -140,6 +146,7 @@ fn refuses_core_in_both_roles_at_boot() {
     let topo = SyntheticTopology::new(allowed.iter().copied());
     let mut cfg = test_config(allowed[0], &[allowed[1]]);
     cfg.housekeeper_cores = vec![allowed[1]];
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &topo).expect_err("cross-role core must refuse boot") {
         BootError::Config(e) => {
             assert_eq!(
@@ -187,6 +194,7 @@ fn boots_workers_across_numa_groups() {
         ..RuntimeConfig::default()
     };
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("multi-NUMA boot succeeds");
     let by_numa: Vec<(u32, u32)> = rt.workers().iter().map(|w| (w.numa, w.core)).collect();
     assert_eq!(

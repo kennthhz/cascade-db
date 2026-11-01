@@ -59,6 +59,7 @@ fn boot(workers: usize) -> (String, Runtime) {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
     (format!("127.0.0.1:{port}"), rt)

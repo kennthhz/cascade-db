@@ -117,6 +117,7 @@ fn single_writer_homes_to_the_bound_numa() {
     let dir = temp_wal_dir("single-bound");
     let (cfg, hk, w0a, w0b, w1) = cfg_for(NumaAffinity::Single, &dir, false, false);
     let t = topo(hk, w0a, w0b, w1);
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &t).expect("boot");
 
     let dev = DatabaseId(0);
@@ -150,6 +151,7 @@ fn appends_route_to_the_home_writer_even_from_off_home_reactors() {
     let t = topo(hk, w0a, w0b, w1);
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &t, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
 
@@ -207,6 +209,7 @@ fn cross_home_is_derived_then_the_persisted_choice_survives_restarts() {
 
     // Boot #1 (creation): the derivation picks NUMA 0 — *not* NUMA 1 (the
     // bound pick a copy-the-bound home would make).
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt1 = Runtime::boot(&cfg, &t).expect("first boot");
     let dev = DatabaseId(0);
     assert_eq!(
@@ -225,6 +228,7 @@ fn cross_home_is_derived_then_the_persisted_choice_survives_restarts() {
 
     // Boot #2 (restart, same layout): the persisted choice wins — the
     // derivation would say NUMA 0 again, and A14 forbids re-picking.
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt2 = Runtime::boot(&cfg, &t).expect("restart boot");
     assert_eq!(
         rt2.wal_homes().home(dev).map(|h| h.numa),
@@ -235,6 +239,7 @@ fn cross_home_is_derived_then_the_persisted_choice_survives_restarts() {
     // Boot #3 (restart, *changed* layout): a third pool shifts the
     // derivation to NUMA 2 — the persisted home still holds.
     let (cfg3, _, _, _, _) = cfg_for(NumaAffinity::Cross, &dir, true, false);
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt3 = Runtime::boot(&cfg3, &t).expect("changed-layout boot");
     assert_eq!(
         rt3.wal_homes().home(dev).map(|h| h.numa),
@@ -259,6 +264,7 @@ fn persisted_home_absent_from_pools_degrades_to_derivation() {
     let t = topo(hk, w0a, w0b, w1);
     walhome::write_homes(&dir, &std::collections::HashMap::from([(0u32, 7u32)]));
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &t).expect("stale home degrades, does not crash");
     let dev = DatabaseId(0);
     assert_eq!(

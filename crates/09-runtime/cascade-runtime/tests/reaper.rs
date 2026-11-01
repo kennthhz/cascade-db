@@ -80,8 +80,24 @@ fn boot(wal: bool, tick_ms: u64, reap_ms: u64, stall_ms: u64) -> Fixture {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
+    // Hang diagnostics, read at fire time (Arc-backed clones): ticks frozen
+    // ⇒ dead housekeeper ring; ticks advancing + reaped == 0 while a client
+    // hangs ⇒ dead worker ring.
+    let orch = rt.orchestrator().cloned();
+    let reap = rt.reap_stats().cloned();
+    cascade_runtime::testutil::on_hang(
+        format!("reaper-fixture runtime on 127.0.0.1:{port}"),
+        move || {
+            format!(
+                "ticks={:?} reap={:?}",
+                orch.as_ref().map(|o| (o.ticks(), o.wakeups())),
+                reap.as_ref().map(|r| r.reaped())
+            )
+        },
+    );
     Fixture {
         addr: format!("127.0.0.1:{port}"),
         wal_dir,

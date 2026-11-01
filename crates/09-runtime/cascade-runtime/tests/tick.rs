@@ -84,8 +84,24 @@ fn boot_ticking(tick_ms: u64, wal_dir: &Path) -> Fixture {
     let (topo, cfg) = config(Some(wal_dir), tick_ms);
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
+    // Hang diagnostics, read at fire time (Arc-backed clones): ticks frozen
+    // ⇒ dead housekeeper ring; ticks advancing + reaped == 0 while a client
+    // hangs ⇒ dead worker ring.
+    let orch = rt.orchestrator().cloned();
+    let reap = rt.reap_stats().cloned();
+    cascade_runtime::testutil::on_hang(
+        format!("tick-fixture runtime on 127.0.0.1:{port}"),
+        move || {
+            format!(
+                "ticks={:?} reap={:?}",
+                orch.as_ref().map(|o| (o.ticks(), o.wakeups())),
+                reap.as_ref().map(|r| r.reaped())
+            )
+        },
+    );
     Fixture {
         url: format!("postgres://alice:pw@127.0.0.1:{port}/dev"),
         rt,
@@ -291,6 +307,7 @@ fn ticks_continue_under_client_load() {
 fn compute_only_boot_has_no_tick_stats() {
     let _serial = serial();
     let (topo, cfg) = config(None, 50);
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("compute boot");
     assert!(
         rt.orchestrator().is_none(),

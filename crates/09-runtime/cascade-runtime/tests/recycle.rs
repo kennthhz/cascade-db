@@ -89,6 +89,7 @@ fn live_recycler_runs_but_never_touches_the_log() {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
 
@@ -330,6 +331,7 @@ fn boots_without_serving_or_wal_expose_no_recycle_stats() {
         wal_dir: Some(dir),
         ..RuntimeConfig::default()
     };
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("compute boot");
     assert!(rt.recycle_stats().is_none());
     assert_eq!(rt.truncatable_lsn(), Some(Lsn(0)));

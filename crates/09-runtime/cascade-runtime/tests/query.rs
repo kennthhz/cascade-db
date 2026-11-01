@@ -50,8 +50,26 @@ fn boot_demo(batch_rows: u32, demo_rows: u32) -> Fixture {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
+    // Hang diagnostics (the watchdog prints these if this binary wedges):
+    // both are Arc-backed clones, so the closure reads them at FIRE time —
+    // ticks frozen ⇒ the housekeeper ring is the dead one; ticks advancing
+    // with reaped == 0 while a client hangs ⇒ a worker ring is dead (its
+    // reap loop froze with it).
+    let orch = rt.orchestrator().cloned();
+    let reap = rt.reap_stats().cloned();
+    cascade_runtime::testutil::on_hang(
+        format!("query-fixture runtime on 127.0.0.1:{port}"),
+        move || {
+            format!(
+                "ticks={:?} reap={:?}",
+                orch.as_ref().map(|o| (o.ticks(), o.wakeups())),
+                reap.as_ref().map(|r| r.reaped())
+            )
+        },
+    );
     Fixture {
         url: format!("postgres://alice:pw@127.0.0.1:{port}/dev"),
         addr: format!("127.0.0.1:{port}"),

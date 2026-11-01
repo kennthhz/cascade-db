@@ -387,6 +387,7 @@ fn live_ticks_run_passes_and_the_frontier_stays_put() {
         ..RuntimeConfig::default()
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
 
@@ -456,6 +457,7 @@ fn listenerless_boot_has_no_checkpoint_stats_but_a_frontier() {
         wal_dir: Some(dir),
         ..RuntimeConfig::default()
     };
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("compute boot");
     assert!(rt.checkpoint_stats().is_none());
     assert!(rt.orchestrator().is_none());

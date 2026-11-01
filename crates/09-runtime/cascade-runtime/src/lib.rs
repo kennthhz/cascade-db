@@ -27,6 +27,7 @@ pub mod session;
 pub mod shutdown;
 pub mod stats;
 pub mod submit;
+pub mod testutil;
 pub mod sql;
 pub mod tenant;
 pub mod tierc;

@@ -138,6 +138,7 @@ fn physical_mode_refuses_sibling_assignment() {
         ..RuntimeConfig::default() // mode = physical
     };
 
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &topo).expect_err("siblings must refuse in physical mode") {
         BootError::SmtSiblingsAssigned { a, b } => {
             assert!(a == wa && b == wb, "names the sibling pair: {a},{b}");
@@ -148,6 +149,7 @@ fn physical_mode_refuses_sibling_assignment() {
     // Same topology, logical mode: boots fine.
     let mut logical = cfg.clone();
     logical.topology.mode = SmtMode::Logical;
+    cascade_runtime::testutil::arm_suite_watchdog();
     Runtime::boot(&logical, &topo).expect("logical mode allows siblings");
 }
 
@@ -171,6 +173,7 @@ fn physical_mode_refuses_housekeeper_worker_sibling_pair() {
         }],
         ..RuntimeConfig::default() // mode = physical
     };
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &topo).expect_err("hk/worker sibling pair must refuse") {
         BootError::SmtSiblingsAssigned { a, b } => {
             assert!((a == 0 && b == 2) || (a == 2 && b == 0), "names the pair: {a},{b}");
@@ -201,6 +204,7 @@ fn non_contiguous_worker_set_boots() {
         }],
         ..RuntimeConfig::default()
     };
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot(&cfg, &topo).expect("non-contiguous set boots");
     assert_eq!(
         rt.workers().iter().map(|w| w.core).collect::<Vec<_>>(),
@@ -249,6 +253,7 @@ fn asymmetric_sibling_map_still_refuses() {
         }],
         ..RuntimeConfig::default()
     };
+    cascade_runtime::testutil::arm_suite_watchdog();
     match Runtime::boot(&cfg, &topo).expect_err("asymmetric map must still refuse") {
         BootError::SmtSiblingsAssigned { .. } => {}
         other => panic!("expected SmtSiblingsAssigned, got {other:?}"),
