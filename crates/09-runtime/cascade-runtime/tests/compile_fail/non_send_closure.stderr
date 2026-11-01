@@ -1,0 +1,24 @@
+error[E0277]: `Rc<usize>` cannot be sent between threads safely
+ --> tests/compile_fail/non_send_closure.rs:9:36
+  |
+9 |     let _submit = handle.submit_to(move || async move { *captured + 1 });
+  |                          --------- -------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |                          |         |
+  |                          |         `Rc<usize>` cannot be sent between threads safely
+  |                          |         within this `{closure@$DIR/tests/compile_fail/non_send_closure.rs:9:36: 9:43}`
+  |                          required by a bound introduced by this call
+  |
+  = help: within `{closure@$DIR/tests/compile_fail/non_send_closure.rs:9:36: 9:43}`, the trait `Send` is not implemented for `Rc<usize>`
+note: required because it's used within this closure
+ --> tests/compile_fail/non_send_closure.rs:9:36
+  |
+9 |     let _submit = handle.submit_to(move || async move { *captured + 1 });
+  |                                    ^^^^^^^
+note: required by a bound in `SubmitHandle::submit_to`
+ --> src/submit.rs
+  |
+  |     pub fn submit_to<T, F, Fut>(&self, f: F) -> Submit<T>
+  |            --------- required by a bound in this associated function
+  |     where
+  |         F: FnOnce() -> Fut + Send + 'static,
+  |                              ^^^^ required by this bound in `SubmitHandle::submit_to`

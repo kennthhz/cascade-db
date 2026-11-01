@@ -322,6 +322,48 @@ router sharing, summing one set twice) breaks an equality; plus a
 150-statement benchmark-sized workload with exact totals and the
 abandoned-mid-txn rollback through the FR-15 tail.
 
+**`submit_to` primitive (T5.1, FR-35, §6.1) — the closure crosses, the
+future never does.** `src/submit.rs`: the signature is R14's verbatim
+shape — `f: FnOnce() -> Fut + Send + 'static` with **no `Send` bound
+on `Fut`** and `T: Send + 'static`. The asymmetry is the whole design:
+the queued job carries only the boxed closure (a `Send` type, as
+glommio's `new_bounded<T: Send>` requires), `submit_loop` invokes the
+closure ON the target ring and spawns the returned future with
+`spawn_local` right there — so `Rc`s and other ring-local state are
+free inside the future, and no `unsafe` `Send` claim exists anywhere
+in the module. The result crosses back over a hand-rolled oneshot
+(std Mutex, state-then-waker lock order; cancel-on-sender-drop) whose
+contract is "the caller always resolves, never hangs":
+`SubmitError::Lost` when the job's task died or the queue tore down,
+`Saturated` when the bounded queue is full — the codebase's
+counted-refusal discipline, never a blocking caller ring.
+`SubmitStats{submitted, executed, refused}` is the FR-36 debug
+counter — T5.4's zero-probe reads `submitted` over an OLTP workload.
+**Two properties consumers must know**: (1) a panicking job resolves
+its caller `Lost` (glommio drops the dying task's future, the oneshot
+cancels) but the panic then propagates through glommio's executor loop
+— the WHOLE target ring dies, every in-flight caller gets `Lost`; for
+T5.4 a panicking housekeeper job is a housekeeper-ring outage, and
+recovery belongs there, not in the primitive (pinned by
+`panicking_job_resolves_lost_and_the_ring_dies`). (2) The channel is
+1:1 and ring-bound — glommio's `ConnectedSender` holds `Rc`, so a
+`SubmitHandle` is `!Send`: clones submit concurrently but only from
+the owning ring; fan-out = one handle per target, fan-IN from N rings
+= N channels + N sibling `submit_loop`s on the target (the T5.4
+housekeeper shape). **Bring-up lessons**: (a) the oneshot's poll must
+restore `State::Empty` on the pending path — persisting the transient
+`Taken` marker made a later `send()` see the channel as resolved and
+silently DROP the value (caller hang; found by probe, covered by
+`pending_then_send_wakes_the_stored_waker`); (b) the T4.5 connect rule
+again — sequencing both halves' connects on one thread spins forever;
+the halves must rendezvous concurrently on their own executors. The
+compile-fail test is the plan's trybuild pattern: a closure capturing
+an `Rc` is rejected at compile time with E0277 on the `F: Send` bound
+(the `.stderr` is rustc-version-sensitive — regenerate with
+`TRYBUILD=overwrite` on toolchain upgrades). Boot wiring is
+deliberately absent until T5.3 (the first real consumer) — the same
+staging discipline as the checkpointer's channel.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

@@ -32,3 +32,4 @@ static_assertions = { workspace = true }
 
 [dev-dependencies]
 postgres     = "0.19"
+trybuild     = "1"
