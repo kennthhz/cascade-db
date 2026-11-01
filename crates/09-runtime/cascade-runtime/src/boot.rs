@@ -18,9 +18,10 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    os::unix::io::RawFd,
     rc::Rc,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
     time::Duration,
@@ -94,10 +95,27 @@ pub struct Runtime {
     /// means the whole log stays reclaimable-by-nothing (the module doc's
     /// safety argument).
     truncatable: Option<Arc<TruncatableLsn>>,
+    /// The flag [`Runtime::shutdown`] sets to start §10.2 on the serving
+    /// thread (T4.4) — and to release the parked housekeepers (their park
+    /// loop checks it on every wake, so a listenerless boot's shutdown is
+    /// still a clean join, D9).
+    shutdown_flag: Arc<AtomicBool>,
+    /// The same trace the serving thread's drain appends to — `shutdown`
+    /// reads it after the joins and reports the sequence.
+    shutdown_trace: crate::shutdown::ShutdownTrace,
+    /// A dup of the listening fd, taken before the listener moved into the
+    /// serving thread. `shutdown(2)` on the dup wakes a blocked `accept(2)`
+    /// immediately (Linux fails the accept with EINVAL; the dup shares the
+    /// open file description) instead of waiting out the accept timeout.
+    listen_dup: Option<RawFd>,
 }
 
 pub struct Housekeeper {
     pub core: u32,
+    /// For the shutdown unpark: the parked (non-serving) housekeepers
+    /// sleep in `park()`, and [`Runtime::shutdown`] must wake them to
+    /// check the shutdown flag or their join would hang forever.
+    thread: std::thread::Thread,
     join: std::thread::JoinHandle<()>,
 }
 
@@ -434,53 +452,6 @@ impl Runtime {
             }
             _ => None,
         };
-        let housekeepers = spawn_housekeepers(
-            cfg,
-            listener,
-            auth,
-            senders,
-            worker_numas.clone(),
-            counters.clone(),
-            Arc::clone(&tierc),
-            tick_init,
-            designated,
-            checkpoint_stats.clone(),
-            recycle_init,
-            &mut verified,
-        )?;
-        // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
-        // config, its memory bound to its node — after topology is resolved
-        // and placement validated, before any worker exists to fault it.
-        let mut pools = PoolRegistry::build(cfg)?;
-        // T2.6 (A14, §8.2): the per-DB writer, homed per affinity —
-        // `single` follows the Tier C bound NUMA (the writers sit with the
-        // only workers allowed to serve the DB, I13); `cross` gets a
-        // designated NUMA, derived on first creation and persisted under
-        // the WAL directory from then on (A14: a reboot re-reads the
-        // choice, it never re-derives — a changed pool layout must not
-        // migrate a database's WAL stream). One shared writer (T1.11):
-        // every reactor's sessions append through it, so it is constructed
-        // once, on its home NUMA — never per-reactor (the multi-home bug).
-        // The per-reactor handle *open* (§10.1 step 8) stays in-task on
-        // each worker's own ring.
-        // Perf-demo relation: populated once, on the boot thread, before
-        // any reactor exists to read it (module-doc discipline).
-        let demo_heap = match cfg.demo_rows {
-            0 => None,
-            rows => {
-                let db = crate::tenant::dev_context().db;
-                match crate::demoheap::DemoHeap::populate(rows, db, &mut pools) {
-                    Ok(heap) => Some(std::sync::Arc::new(heap)),
-                    Err(frame_budget) => {
-                        return Err(BootError::DemoTooLarge {
-                            rows,
-                            frame_budget,
-                        })
-                    }
-                }
-            }
-        };
-
         let (wal, wal_homes) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
@@ -525,6 +496,125 @@ impl Runtime {
             }
             None => (None, WalHomeTable::new()),
         };
+        // T4.4 (FR-8, §10.2): the serving thread's shutdown state. The
+        // draining flag and the per-worker in-flight gauges exist for every
+        // boot (sessions carry them as their [`crate::session::SessionEnv`]
+        // whether or not anything orchestrates); the [`ServingShutdown`]
+        // bundle goes to the serving housekeeper only when a listener
+        // exists. The writer is constructed ABOVE (before the housekeepers
+        // spawn) precisely so this bundle can carry it — the clean marker's
+        // durable LSN reads it after the final flush.
+        let draining = Arc::new(AtomicBool::new(false));
+        let inflight: Vec<Arc<AtomicU64>> =
+            (0..n_workers).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let shutdown_trace = crate::shutdown::ShutdownTrace::new();
+        // The flag exists for EVERY boot — the parked (non-serving)
+        // housekeepers' park loop checks it on each wake, so
+        // `Runtime::shutdown` can release them on a listenerless boot too
+        // (D9 degrades to joins, not to a hang).
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let serving_shutdown = listener.is_some().then(|| crate::shutdown::ServingShutdown {
+            flag: Arc::clone(&shutdown_flag),
+            draining: Arc::clone(&draining),
+            inflight: inflight.clone(),
+            deadline: Duration::from_secs(cfg.drain_deadline_s),
+            trace: shutdown_trace.clone(),
+            wal: wal
+                .as_ref()
+                .zip(cfg.wal_dir.clone())
+                .map(|(w, dir)| (Arc::clone(w), dir)),
+        });
+        // A dup of the listening fd, taken before the listener moves into
+        // the serving thread (T4.4): `shutdown(2)` on the dup wakes a
+        // blocked `accept(2)` at once — Linux fails the accepter with
+        // EINVAL on a shut-down listener — instead of waiting out the
+        // accept timeout. A failed dup degrades gracefully (the accept
+        // timeout arm still notices the flag within one tick); `None`
+        // skips the wake rather than `shutdown(2)` a bad fd.
+        let listen_dup = listener.as_ref().and_then(|l| {
+            let fd = unsafe { libc::dup(l.as_raw_fd()) };
+            if fd < 0 {
+                let err = std::io::Error::last_os_error();
+                cascade_telemetry::log(
+                    cascade_telemetry::Level::Warn,
+                    "shutdown_listen_dup_failed",
+                    &[("reason", err.to_string().as_str())],
+                );
+                None
+            } else {
+                Some(fd)
+            }
+        });
+        // The drain channels (T4.4): one SPSC channel per designated
+        // reactor — the third signal family (control: T4.2, recycle:
+        // T4.3), so §10.2's one-shot final flushes never queue behind tick
+        // traffic and vice versa. The HOME IDENTITY rides the tuple — if
+        // the resolved WAL home names a pooled NUMA with no workers, no
+        // sender is flagged, and the drain (not ack slot position) knows
+        // no one can flush the tail: the marker is refused, honestly.
+        // Empty on a listenerless boot.
+        let (drain_tx, drain_rx_by_numa) = if listener.is_some() {
+            let mut txs = Vec::new();
+            let mut rxs = Vec::new();
+            for (numa, _) in &designated {
+                let (tx, rx) = new_bounded::<crate::shutdown::DrainMsg>(8);
+                txs.push((*numa, Some(*numa) == dev_home, tx));
+                rxs.push((*numa, rx));
+            }
+            (txs, rxs)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let housekeepers = spawn_housekeepers(
+            cfg,
+            listener,
+            auth,
+            senders,
+            worker_numas.clone(),
+            counters.clone(),
+            Arc::clone(&tierc),
+            tick_init,
+            designated,
+            checkpoint_stats.clone(),
+            recycle_init,
+            serving_shutdown,
+            drain_tx,
+            Arc::clone(&shutdown_flag),
+            &mut verified,
+        )?;
+        // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
+        // config, its memory bound to its node — after topology is resolved
+        // and placement validated, before any worker exists to fault it.
+        let mut pools = PoolRegistry::build(cfg)?;
+        // T2.6 (A14, §8.2): the per-DB writer, homed per affinity —
+        // `single` follows the Tier C bound NUMA (the writers sit with the
+        // only workers allowed to serve the DB, I13); `cross` gets a
+        // designated NUMA, derived on first creation and persisted under
+        // the WAL directory from then on (A14: a reboot re-reads the
+        // choice, it never re-derives — a changed pool layout must not
+        // migrate a database's WAL stream). One shared writer (T1.11):
+        // every reactor's sessions append through it, so it is constructed
+        // once, on its home NUMA — never per-reactor (the multi-home bug).
+        // The per-reactor handle *open* (§10.1 step 8) stays in-task on
+        // each worker's own ring.
+        // Perf-demo relation: populated once, on the boot thread, before
+        // any reactor exists to read it (module-doc discipline).
+        let demo_heap = match cfg.demo_rows {
+            0 => None,
+            rows => {
+                let db = crate::tenant::dev_context().db;
+                match crate::demoheap::DemoHeap::populate(rows, db, &mut pools) {
+                    Ok(heap) => Some(std::sync::Arc::new(heap)),
+                    Err(frame_budget) => {
+                        return Err(BootError::DemoTooLarge {
+                            rows,
+                            frame_budget,
+                        })
+                    }
+                }
+            }
+        };
+
         // The recycle channel's receiving end lands on the FIRST worker of
         // the WAL-home NUMA — the same per-NUMA designated-reactor rule the
         // checkpoint fanout's senders follow. A boot with no recycler (no
@@ -541,11 +631,31 @@ impl Runtime {
                 }
             })
             .collect();
+        // The drain channels' receiving ends follow the same rule (T4.4):
+        // the first worker of each NUMA pool is that pool's designated
+        // reactor, and `drain_rx_by_numa` was created in designated order,
+        // so the k-th distinct NUMA takes the k-th receiver.
+        let mut drain_rx_left = drain_rx_by_numa.into_iter();
+        let mut drain_seen = HashSet::new();
+        let drain_receivers: Vec<Option<_>> = worker_numas
+            .iter()
+            .map(|numa| {
+                if drain_seen.insert(*numa) {
+                    drain_rx_left.next().map(|(_, rx)| rx)
+                } else {
+                    None
+                }
+            })
+            .collect();
         let workers = spawn_workers(
             cfg,
             receivers,
             control_rx,
             recycle_receivers,
+            drain_receivers,
+            draining,
+            inflight,
+            dev_home,
             &checkpoint_passes,
             &recycle_passes,
             &recycle_reclaimed,
@@ -574,6 +684,9 @@ impl Runtime {
             checkpoint: checkpoint_stats,
             recycle: recycle_stats,
             truncatable,
+            shutdown_flag,
+            shutdown_trace,
+            listen_dup,
         })
     }
 
@@ -660,6 +773,73 @@ impl Runtime {
     pub fn tierc(&self) -> &Arc<TierCSnapshot> {
         &self.tierc
     }
+
+    /// §10.2 graceful shutdown (T4.4, FR-8) — the caller's half, consuming
+    /// the runtime:
+    ///
+    /// 1–4 run on the *serving* housekeeper (see
+    /// [`crate::shutdown`]): this method sets the flag the accept loop
+    /// polls and wakes a blocked `accept(2)` via the dup'd fd, then joins
+    /// the housekeepers — a completed housekeeper join means the whole
+    /// drain finished (final flushes acked, clean marker written, trace
+    /// recorded).
+    /// 5 is here: joining a worker drops its executor, and a dropped
+    /// executor kills the detached session tasks and closes their fds,
+    /// rings, and WAL handles — §10.2's force-abort-by-drop for whatever
+    /// the deadline could not drain.
+    ///
+    /// Returns the phase trace in completion order — the same sequence the
+    /// integration suite asserts.
+    pub fn shutdown(self) -> ShutdownReport {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+        // Release the parked housekeepers now — their join would otherwise
+        // hang forever (they sleep in `park()`, which the flag store does
+        // not wake).
+        for h in &self.housekeepers {
+            h.thread.unpark();
+        }
+        if let Some(dup) = self.listen_dup {
+            // Wake a blocked accept(2) immediately. The dup shares the
+            // listening socket's open file description, so this lands on
+            // the real listener; the dup has served its purpose and is
+            // closed here (the serving thread's accept reads the failure
+            // and its flag check recognizes shutdown).
+            unsafe {
+                libc::shutdown(dup, libc::SHUT_RDWR);
+                libc::close(dup);
+            }
+        }
+        // Housekeepers first: a worker must stay alive to ack the final
+        // flushes, so the reactors drop only after the drain is done.
+        let mut housekeepers_stopped = 0;
+        for h in self.housekeepers {
+            if h.join.join().is_ok() {
+                housekeepers_stopped += 1;
+            }
+        }
+        let mut workers_stopped = 0;
+        for w in self.workers {
+            if w.join.join().is_ok() {
+                workers_stopped += 1;
+            }
+        }
+        self.shutdown_trace.record("reactors-dropped");
+        ShutdownReport {
+            phases: self.shutdown_trace.phases(),
+            housekeepers_stopped,
+            workers_stopped,
+        }
+    }
+}
+
+/// What [`Runtime::shutdown`] reports: the §10.2 phase trace in completion
+/// order and the join tallies (a tally below the booted count means a
+/// thread panicked — every other failure mode refuses boot, T2.1).
+#[derive(Debug, Clone)]
+pub struct ShutdownReport {
+    pub phases: Vec<&'static str>,
+    pub housekeepers_stopped: usize,
+    pub workers_stopped: usize,
 }
 
 /// FR-3: in `physical` SMT mode (the default) one worker per *physical* core
@@ -714,14 +894,17 @@ fn spawn_housekeepers(
     designated: Vec<(u32, SharedSender<ControlMsg>)>,
     checkpoint: Option<CheckpointStats>,
     recycle: Option<crate::recycler::RecycleInit>,
+    shutdown: Option<crate::shutdown::ServingShutdown>,
+    drain: Vec<(u32, bool, SharedSender<crate::shutdown::DrainMsg>)>,
+    shutdown_flag: Arc<AtomicBool>,
     verified_all: &mut HashSet<u32>,
 ) -> Result<Vec<Housekeeper>, BootError> {
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
-    let mut serving = match (listener, tick_init, checkpoint, recycle) {
-        (Some(loop_), Some(init), Some(stats), recycle) => {
-            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats, recycle))
+    let mut serving = match (listener, tick_init, checkpoint, recycle, shutdown, drain) {
+        (Some(loop_), Some(init), Some(stats), recycle, shutdown, drain) => {
+            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats, recycle, shutdown, drain))
         }
         _ => None,
     };
@@ -739,27 +922,40 @@ fn spawn_housekeepers(
                 designated,
                 stats,
                 recycle,
+                shutdown,
+                drain,
             )) => Box::new(move || {
                 // Pin first; then accept (blocking, bounded by the next
                 // tick deadline — sleeps between events, FR-5) →
                 // authenticate → route by affinity → hand off; due
                 // ticks fire between accepts (T4.1, D9). Housekeepers
-                // reserve no arena (the trailing 0 below).
+                // reserve no arena (the trailing 0 below). After the
+                // accept loop breaks on the shutdown flag (T4.4), serve
+                // runs the whole §10.2 drain on this same thread before
+                // returning.
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
                     loop_, auth, senders, numas, counters, tierc, max_conns, tick_init,
-                    designated, stats, recycle,
+                    designated, stats, recycle, shutdown, drain,
                 );
             }),
-            None => Box::new(move || {
-                let _ = tx.send((core, pin::pin_current(core), 0));
+            None => {
                 // The orchestrator ticks on the *serving* housekeeper (D9,
                 // T4.1); this one has no work yet — park, no busy-wait
-                // (FR-5).
-                loop {
-                    std::thread::park();
-                }
-            }),
+                // (FR-5). The park loop exits when shutdown releases it:
+                // without this check the join in `Runtime::shutdown`
+                // would hang forever (T4.4 review fix).
+                let flag = Arc::clone(&shutdown_flag);
+                Box::new(move || {
+                    let _ = tx.send((core, pin::pin_current(core), 0));
+                    loop {
+                        std::thread::park();
+                        if flag.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                })
+            }
         };
         let join = std::thread::Builder::new()
             .name(format!("cascade-hk-{core}"))
@@ -768,7 +964,8 @@ fn spawn_housekeepers(
                 core,
                 message: e.to_string(),
             })?;
-        out.push(Housekeeper { core, join });
+        let thread = join.thread().clone();
+        out.push(Housekeeper { core, thread, join });
     }
     drop(tx); // so a dead thread's disconnect is observable
     let (verified, _arenas) =
@@ -800,6 +997,10 @@ fn spawn_workers(
     receivers: Vec<SharedReceiver<Handoff>>,
     control_receivers: Vec<SharedReceiver<ControlMsg>>,
     recycle_receivers: Vec<Option<SharedReceiver<crate::recycler::RecycleSignal>>>,
+    drain_receivers: Vec<Option<SharedReceiver<crate::shutdown::DrainMsg>>>,
+    draining: Arc<AtomicBool>,
+    inflight: Vec<Arc<AtomicU64>>,
+    dev_home: Option<u32>,
     checkpoint_passes: &Arc<AtomicU64>,
     recycle_passes: &Arc<AtomicU64>,
     recycle_reclaimed: &Arc<AtomicU64>,
@@ -820,13 +1021,15 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for ((((((numa, core), rx), ctrl_rx), recycle_rx), counter), (tenant_counters, stall)) in
+    for ((((((((numa, core), rx), ctrl_rx), recycle_rx), drain_rx), counter), inflight), (tenant_counters, stall)) in
         per_core
             .into_iter()
             .zip(receivers)
             .zip(control_receivers)
             .zip(recycle_receivers)
+            .zip(drain_receivers)
             .zip(counters.iter())
+            .zip(inflight)
             .zip(tenant_counters.iter().zip(stalls.iter()))
     {
         // §10.1 step 6c: bind this reactor to its own NUMA's pool. A
@@ -844,6 +1047,17 @@ fn spawn_workers(
             Arc::clone(recycle_passes),
             Arc::clone(recycle_reclaimed),
         );
+        // The drain plane (T4.4): the designated reactors get their own
+        // loop over the drain channel, with a site over the same pass
+        // counter and — on the WAL-home reactor — a cloned WAL pair for
+        // the final tail flush. `is_home` is the same dev-home decision
+        // the boot thread made (one decision, two consumers again).
+        let task_drain_site = CheckpointSite::new(Arc::clone(checkpoint_passes));
+        let task_env = crate::session::SessionEnv {
+            draining: Arc::clone(&draining),
+            inflight: Arc::clone(&inflight),
+        };
+        let task_is_home = Some(numa) == dev_home;
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
@@ -892,6 +1106,25 @@ fn spawn_workers(
                     glommio::spawn_local(crate::recycler::recycle_loop(recycles, task_recycle))
                         .detach();
                 }
+                // The drain plane (T4.4, §10.2 steps 3+4): §10.2's final
+                // flushes arrive on their own channel — designated
+                // reactors only. The loop dies when the serving side drops
+                // its sender (the drain is one-shot) or with this ring.
+                if let Some(drain_rx) = drain_rx {
+                    let drains = drain_rx.connect().await;
+                    let final_flush = crate::shutdown::FinalFlushCtx {
+                        wal: wal
+                            .as_ref()
+                            .map(|(w, h)| (Arc::clone(w), Rc::clone(h))),
+                        is_home: task_is_home,
+                    };
+                    glommio::spawn_local(crate::shutdown::drain_loop(
+                        drains,
+                        task_drain_site,
+                        Some(final_flush),
+                    ))
+                    .detach();
+                }
                 let table = Rc::new(crate::session::Table::new());
                 // T3.3: replayed committed rows land in every worker's
                 // table before the first session — the debug slice has no
@@ -909,6 +1142,7 @@ fn spawn_workers(
                     });
                     glommio::spawn_local(crate::session::run(
                         handoff, table, counter, tenants, wal, heap, batch_rows,
+                        task_env.clone(),
                     ))
                     .detach();
                 }

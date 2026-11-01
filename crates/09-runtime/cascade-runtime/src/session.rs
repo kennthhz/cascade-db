@@ -15,7 +15,7 @@ use std::{
     os::unix::io::FromRawFd,
     rc::Rc,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -271,10 +271,38 @@ async fn read_message<W: AsyncRead + Unpin>(sink: &mut W) -> io::Result<Option<(
     Ok(Some((hdr[0], payload)))
 }
 
+/// Per-connection environment handed to every session by its worker: the
+/// pieces of the shutdown protocol (T4.4) the session honors between
+/// statements. `draining` is §10.2 step 2b — once set, the *next*
+/// statement is refused with 57P01 and the connection closes (the current
+/// one always finishes). `inflight` is the per-worker in-flight-statement
+/// gauge the drain waits on: an idle connection holds it at zero, so
+/// idle clients never block a drain — only a statement actually being
+/// processed does.
+#[derive(Clone)]
+pub struct SessionEnv {
+    pub draining: Arc<AtomicBool>,
+    pub inflight: Arc<AtomicU64>,
+}
+
+/// Balances one in-flight increment on every exit, unwinding included.
+/// A dropped decrement would stick the worker's gauge above zero forever,
+/// silently converting every later shutdown of that worker into the
+/// deadline path (§10.2 step 2c) — so the decrement is the guard's Drop,
+/// not a line at the bottom of the statement arm.
+struct GaugeGuard<'a>(&'a AtomicU64);
+
+impl Drop for GaugeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The session task a worker spawns per handed-off connection: simple-query
 /// loop until Terminate or disconnect. The tenant context and span are
 /// constructed once here and *borrowed* through every executed statement
 /// (FR-20/FR-21 shape, from birth).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     handoff: Handoff,
     table: Rc<Table>,
@@ -283,6 +311,7 @@ pub async fn run(
     wal: Option<Wal>,
     heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
     batch_rows: u32,
+    env: SessionEnv,
 ) {
     counter.fetch_add(1, Ordering::Relaxed);
     // SAFETY: the fd crossed exactly once via the shared channel and this
@@ -310,72 +339,116 @@ pub async fn run(
         };
         match msg.0 {
             b'Q' => {
+                // §10.2 step 2b: draining refuses the *next* statement —
+                // anything already read before the flag was set still
+                // ran. Fatal severity, so the connection closes (PG
+                // semantics for 57P01), and FR-15's cleanup below runs.
+                if env.draining.load(Ordering::Relaxed) {
+                    let err = PgError::new(
+                        crate::shutdown::ADMIN_SHUTDOWN,
+                        "terminating connection: the server is shutting down",
+                    );
+                    let _ = out.send_error(&err).await;
+                    break;
+                }
+                // The drain's wait counts this statement as in-flight
+                // until its ReadyForQuery went out (§10.2 step 2c). The
+                // guard below balances the increment on EVERY exit —
+                // including a panic unwinding this task, which a manual
+                // decrement at the bottom would miss and which would stick
+                // the gauge above zero forever, silently turning every
+                // later shutdown into the deadline path (T4.4 review).
+                env.inflight.fetch_add(1, Ordering::Relaxed);
+                let _inflight = GaugeGuard(&env.inflight);
+                let mut closed = false;
+                // §10.2 step 2b's race window: the flag may have flipped
+                // between the check above and our increment. Re-check with
+                // the statement counted — the drain wait can then never
+                // declare victory over a statement it never saw.
+                if env.draining.load(Ordering::Relaxed) {
+                    let err = PgError::new(
+                        crate::shutdown::ADMIN_SHUTDOWN,
+                        "terminating connection: the server is shutting down",
+                    );
+                    let _ = out.send_error(&err).await;
+                    closed = true;
+                }
                 // Payload is one cstring — except the empty query, which has
-                // no payload at all and answers EmptyQueryResponse.
-                let sql = if msg.1.is_empty() {
+                // no payload at all and answers EmptyQueryResponse. The two
+                // framing failures answer and mark `closed`; `sql` is then
+                // unused.
+                let sql: &str = if closed || msg.1.is_empty() {
                     ""
-                } else {
-                    let Some(nul) = msg.1.iter().position(|&b| b == 0) else {
-                        let e = PgError::new("08P01", "unterminated query string");
-                        let _ = out.send_error(&e).await;
-                        break;
-                    };
+                } else if let Some(nul) = msg.1.iter().position(|&b| b == 0) {
                     match std::str::from_utf8(&msg.1[..nul]) {
                         Ok(s) => s,
                         Err(_) => {
                             let e = PgError::new("08P01", "query string is not UTF-8");
                             let _ = out.send_error(&e).await;
+                            closed = true;
+                            ""
+                        }
+                    }
+                } else {
+                    let e = PgError::new("08P01", "unterminated query string");
+                    let _ = out.send_error(&e).await;
+                    closed = true;
+                    ""
+                };
+                if !closed {
+                    // Real PG: a multi-statement query string stops at the first
+                    // error; remaining statements are skipped, then RFB closes
+                    // the batch. An entirely empty query answers
+                    // EmptyQueryResponse.
+                    let stmts = crate::sql::split_statements(sql);
+                    let mut failed = false;
+                    if stmts.is_empty() {
+                        let _ = out.send(b'I', &[]).await;
+                    }
+                    for stmt_sql in stmts {
+                        if failed {
                             break;
                         }
-                    }
-                };
-                // Real PG: a multi-statement query string stops at the first
-                // error; remaining statements are skipped, then RFB closes
-                // the batch. An entirely empty query answers
-                // EmptyQueryResponse.
-                let stmts = crate::sql::split_statements(sql);
-                let mut failed = false;
-                if stmts.is_empty() {
-                    let _ = out.send(b'I', &[]).await;
-                }
-                for stmt_sql in stmts {
-                    if failed {
-                        break;
-                    }
-                    match crate::sql::parse(stmt_sql.trim()) {
-                        Ok(stmt) => {
-                            match execute(
-                                &mut sess,
-                                stmt,
-                                &mut out,
-                                &ctx,
-                                &span,
-                                &tenants,
-                                wal.as_ref(),
-                                heap.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(()) => {}
-                                Err(e) => {
-                                    let _ = out.send_error(&e).await;
-                                    if sess.txn == TxnStatus::InTxn {
-                                        sess.txn = TxnStatus::Failed;
+                        match crate::sql::parse(stmt_sql.trim()) {
+                            Ok(stmt) => {
+                                match execute(
+                                    &mut sess,
+                                    stmt,
+                                    &mut out,
+                                    &ctx,
+                                    &span,
+                                    &tenants,
+                                    wal.as_ref(),
+                                    heap.as_ref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        let _ = out.send_error(&e).await;
+                                        if sess.txn == TxnStatus::InTxn {
+                                            sess.txn = TxnStatus::Failed;
+                                        }
+                                        failed = true;
                                     }
-                                    failed = true;
                                 }
                             }
-                        }
-                        Err(e) => {
-                            let _ = out.send_error(&PgError::from(e)).await;
-                            if sess.txn == TxnStatus::InTxn {
-                                sess.txn = TxnStatus::Failed;
+                            Err(e) => {
+                                let _ = out.send_error(&PgError::from(e)).await;
+                                if sess.txn == TxnStatus::InTxn {
+                                    sess.txn = TxnStatus::Failed;
+                                }
+                                failed = true;
                             }
-                            failed = true;
                         }
                     }
+                    if out.send(b'Z', &[sess.rfb_byte()]).await.is_err() {
+                        closed = true;
+                    }
                 }
-                if out.send(b'Z', &[sess.rfb_byte()]).await.is_err() {
+                // `_inflight` (the gauge guard) drops here — or on the
+                // break above, or on unwind — balancing the increment.
+                if closed {
                     break;
                 }
             }

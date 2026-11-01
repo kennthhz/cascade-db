@@ -23,6 +23,7 @@ pub mod recycler;
 pub mod router;
 pub mod scram;
 pub mod session;
+pub mod shutdown;
 pub mod sql;
 pub mod tenant;
 pub mod tierc;
@@ -39,6 +40,10 @@ pub use checkpointer::{
 pub use config::{ConfigError, NumaAffinity, RuntimeConfig, SmtMode};
 pub use recycler::{
     recycle_loop, RecycleInit, RecycleSignal, RecycleSite, RecycleStats, WalRecycler,
+};
+pub use shutdown::{
+    drain_loop, run_drain, send_final_flush, DrainMsg, FinalFlushCtx, ServingShutdown,
+    ShutdownTrace,
 };
 pub use orchestrator::{Orchestrator, OrchestratorStats, StallWatch, Tick, TickJob};
 pub use pools::{NumaPoolHandle, PoolRegistry};

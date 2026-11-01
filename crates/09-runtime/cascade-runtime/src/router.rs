@@ -150,6 +150,13 @@ impl Router {
     /// again (FR-13). Between accept returns, due background ticks fire
     /// (T4.1, D9: the serving housekeeper *is* the background-work home).
     ///
+    /// Shutdown (T4.4): every loop exit re-checks the shutdown flag; a set
+    /// flag breaks the loop (a blocked `accept(2)` is woken by `shutdown(2)`
+    /// on a dup of the listener fd — the EINVAL lands in the dead-listener
+    /// arm), a connection that raced the flag is refused with PG `57P01`
+    /// rather than routed, and after the loop the serving thread runs the
+    /// whole §10.2 drain ([`crate::shutdown::run_drain`]).
+    ///
     /// Runs an unpinned glommio executor on the calling thread purely for the
     /// sender-side channel connect; after that connect, the loop is plain
     /// blocking I/O and the ring idles.
@@ -166,6 +173,8 @@ impl Router {
         designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
         checkpoint: crate::checkpointer::CheckpointStats,
         recycle: Option<crate::recycler::RecycleInit>,
+        shutdown: Option<crate::shutdown::ServingShutdown>,
+        drain: Vec<(u32, bool, SharedSender<crate::shutdown::DrainMsg>)>,
     ) {
         let ex = LocalExecutorBuilder::new(ExecutorPlacement::Unbound)
             .name("cascade-hk-ring")
@@ -228,6 +237,21 @@ impl Router {
                     init.stats,
                 )));
             }
+            // The drain channels (T4.4) are the third signal family —
+            // connected here on the serving executor, held as plain locals
+            // (they are NOT tick jobs; only the drain uses them, and the
+            // drain is one-shot). The middle flag marks the WAL-home
+            // reactor — the drain keys step 3's ack on it, never on slot
+            // position.
+            let mut drain_senders = Vec::with_capacity(drain.len());
+            for (numa, is_home, tx) in drain {
+                drain_senders.push((numa, is_home, tx.connect().await));
+            }
+            // The shutdown flag read every loop pass. `None` on a
+            // listenerless boot (nothing accepts, nothing drains — D9).
+            let shutdown_flagged = |flag: Option<&Arc<std::sync::atomic::AtomicBool>>| {
+                flag.map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
+            };
 
             let (stats, listener) = listener.into_parts();
             loop {
@@ -245,11 +269,50 @@ impl Router {
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
                         orchestrator.poll_due();
+                        if shutdown_flagged(shutdown.as_ref().map(|s| &s.flag)) {
+                            break;
+                        }
                         continue;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => return, // listener dead
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        if shutdown_flagged(shutdown.as_ref().map(|s| &s.flag)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Transient accept failure (the peer aborted its
+                    // connect): real PostgreSQL continues, and so do we —
+                    // treating it as listener death would skip the drain
+                    // and the clean marker entirely (T4.4 review).
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionAborted => {
+                        if shutdown_flagged(shutdown.as_ref().map(|s| &s.flag)) {
+                            break;
+                        }
+                        continue;
+                    }
+                    // Listener dead — genuinely, or woken by the shutdown
+                    // `shutdown(2)` (a dup'd fd closed on the accept side
+                    // reads as EINVAL here). The flag tells the two apart:
+                    // shutdown proceeds, a real listener death ends serve.
+                    Err(_) => {
+                        if shutdown_flagged(shutdown.as_ref().map(|s| &s.flag)) {
+                            break;
+                        }
+                        return;
+                    }
                 };
+                // §10.2 step 1: stop accepting. A connection that raced the
+                // flag between its connect and this check never gets routed
+                // into a draining fleet — refused with PG 57P01, then closed.
+                if shutdown_flagged(shutdown.as_ref().map(|s| &s.flag)) {
+                    let mut refused = stream;
+                    let _ = crate::pg::send_fatal(
+                        &mut refused,
+                        crate::shutdown::ADMIN_SHUTDOWN,
+                        "terminating connection: the server is shutting down",
+                    );
+                    break;
+                }
                 // Transactional request/response traffic is dominated by
                 // small segments: with Nagle on, each response's later
                 // segments wait out the peer's delayed ACK (tens of ms on
@@ -263,6 +326,16 @@ impl Router {
                 // else: a rejection was already sent (or the peer vanished);
                 // dropping the stream closes it. Ticks wait for the next
                 // loop pass — at most one handshake of lateness.
+            }
+
+            // The accept loop broke on the flag: §10.2 steps 2–4 run right
+            // here, on the serving thread, before the executor drops (step
+            // 5 is Runtime::shutdown's joins). The drain senders drop with
+            // this async block — that is what ends each worker's
+            // `drain_loop`.
+            if let Some(ctx) = &shutdown {
+                ctx.trace.record("accept-stopped");
+                crate::shutdown::run_drain(ctx, &drain_senders);
             }
         });
     }

@@ -3,12 +3,14 @@
 //! Minimal M1-era server: explicit core/port arguments (the TOML config
 //! surface and catalog wiring land in later phases), boots the routed
 //! runtime from `docs/runtime-implementation-plan.md` §10.1, serves until
-//! SIGTERM/SIGINT, then prints one JSON line of runtime observables —
-//! the stall totals (§7.2) and the WAL writer's watermarks and fdatasync
-//! barrier count (FR-26/FR-27) — for the bench harness to collect.
+//! SIGTERM/SIGINT, runs the §10.2 graceful shutdown (T4.4 — drain, final
+//! flushes, clean marker, reactor drops), then prints one JSON line of
+//! runtime observables — the stall totals (§7.2) and the WAL writer's
+//! watermarks and fdatasync barrier count (FR-26/FR-27) — for the bench
+//! harness to collect.
 
 use std::{
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -147,47 +149,23 @@ fn main() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    // Graceful shutdown (T3.3): drain → final flush → clean marker. The
-    // runtime drops first so no worker can append past the final sync; the
-    // brief drain sleep lets in-flight flushes land (the full drain is
-    // M4's — this slice's shutdown window has no concurrent clients to
-    // drain in the harness).
+    // Graceful shutdown (T4.4, FR-8, §10.2 — verbatim, in order): the flag
+    // and the accept wake start the drain on the serving housekeeper
+    // (refuse new → drain in-flight statements, deadline-bounded → final
+    // per-DB WAL flush, home reactor first → final flush pass on every
+    // designated reactor → clean marker); the joins here are §10.2 step 5 —
+    // dropping each reactor kills its session tasks and closes their fds,
+    // rings, and WAL handles. The trace in the report is the sequence,
+    // completion-ordered.
     let (soft, hard) = rt.poll_stalls();
     let wal = rt.debug_wal().cloned();
-    drop(rt);
-    std::thread::sleep(Duration::from_millis(200));
-    if let (Some(writer), Some(dir)) = (&wal, cfg.wal_dir.as_ref()) {
-        let writer = Arc::clone(writer);
-        let dir = dir.clone();
-        let outcome = std::thread::Builder::new()
-            .name("cascade-shutdown".into())
-            .spawn(move || -> Result<(), String> {
-                let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
-                    .name("cascade-shutdown-io")
-                    .make()
-                    .map_err(|e| format!("executor: {e}"))?;
-                ex.run(async {
-                    let db = cascade_runtime::tenant::dev_context().db;
-                    let handle = cascade_wal::WalHandle::open(&dir, db)
-                        .await
-                        .map_err(|e| format!("wal handle: {e}"))?;
-                    let filled = writer.filled();
-                    writer
-                        .flush_wal(&handle, filled)
-                        .await
-                        .map_err(|e| format!("final flush: {e}"))?;
-                    cascade_wal::write_clean_marker(&dir, db, writer.durable())
-                        .map_err(|e| format!("clean marker: {e}"))?;
-                    Ok(())
-                })
-            })
-            .expect("shutdown thread spawns")
-            .join()
-            .expect("shutdown thread joins");
-        if let Err(e) = outcome {
-            eprintln!("cascade-server: clean marker not written: {e}");
-            std::process::exit(1);
-        }
+    let report = rt.shutdown();
+    eprintln!("cascade-server: shutdown phases: {:?}", report.phases);
+    // The clean marker is the crash-recovery contract (T3.3): a shutdown
+    // that could not vouch for the WAL tail must say so loudly.
+    if cfg.wal_dir.is_some() && !report.phases.contains(&"clean-marker") {
+        eprintln!("cascade-server: clean marker not written — WAL tail unconfirmed");
+        std::process::exit(1);
     }
 
     // One JSON observables line: the numbers the architecture claims live

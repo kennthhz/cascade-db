@@ -96,6 +96,15 @@ impl AcceptLoop {
         self.listener.local_addr()
     }
 
+    /// The listening fd, for the shutdown path's `dup` (T4.4): boot dups it
+    /// before the listener moves into the serving thread, and
+    /// `Runtime::shutdown` wakes a blocked `accept(2)` with `shutdown(2)`
+    /// on the dup — the dup shares the open file description, so the wake
+    /// lands on the real listener.
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.listener.as_raw_fd()
+    }
+
     pub fn stats(&self) -> &Arc<AcceptStats> {
         &self.stats
     }

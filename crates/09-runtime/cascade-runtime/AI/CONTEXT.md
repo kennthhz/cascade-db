@@ -177,6 +177,62 @@ segmented WAL (§8.2). Observable: `Runtime::recycle_stats()`
 (signals/refused/passes/reclaimed_bytes; `None` without a listener or
 a WAL).
 
+**Graceful shutdown (T4.4, FR-8) — §10.2 verbatim, in order, on the
+serving housekeeper.** `src/shutdown.rs`: the whole sequence runs where
+the background work lived (D9) — the accept loop breaks on a shutdown
+flag (`Runtime::shutdown` sets it and wakes a blocked `accept(2)`
+instantly via `shutdown(2)` on a **dup of the listening fd**; Linux
+fails the accepter with EINVAL, and the flag check in the dead-listener
+arm distinguishes that from a real listener death; ECONNABORTED is
+transient and continues, never mistaken for death — that would skip
+the drain). A connection that raced the flag is refused `57P01` (never
+routed); sessions carry a `SessionEnv { draining, inflight }` — once
+draining is set, the NEXT statement is fatal `57P01` and the connection
+closes (FR-15 cleanup retested through this path), and the refusal is
+re-checked **after** the in-flight increment, closing the race where a
+statement slips in while the drain wait is concluding. The drain wait
+counts **in-flight statements, not connections** — an idle client
+blocks nothing, exactly like PG's txn-free idle backend — bounded by
+`drain_deadline_s` (default 30): `wait_inflight` returns at zero or at
+the deadline (the force-abort half is finished by step 5's reactor
+drop), and the gauge is balanced by an RAII `GaugeGuard` — a manual
+decrement would miss an unwinding panic and stick the gauge forever,
+silently converting every later shutdown into the deadline path.
+Final flushes ride the **third dedicated channel family**
+(`DrainMsg::FinalFlush` to each designated reactor; SPSC — the control
+channel stays pure T4.2-flush, the recycle channel pure T4.3-recycle):
+the WAL-home reactor flushes the per-DB WAL tail first (step 3), then
+every designated reactor runs one final pass (step 4) — passes run
+**unconditionally**, so the trace proves flushes RAN rather than were
+skipped as "nothing dirty" (the live frontier pins at 0 and the pass
+still acks). The home site is identified by a **flag carried in the
+sender tuple, never by ack slot position**: a persisted WAL home on a
+pooled NUMA with no workers yields no flagged sender, and the drain
+then refuses the marker (`shutdown_no_wal_home_reactor`) instead of
+mistaking a non-home Ok for the tail flush. Acks are message-carried
+(`mpsc::Sender<Result<..>>` inside the message — the staged form of
+T5.1's `submit_to` return path) and share ONE deadline budget (a
+wedged set delays shutdown once, not once per site); the clean marker
+(T3.3) is stamped **only on the home ack** — a wedged other site
+delays shutdown once but cannot unsync the marker. Every phase
+boundary appends to a `ShutdownTrace`; `tests/shutdown.rs` asserts the
+whole **sequence** (accept-stopped → refuse-new → sessions-drained →
+final-wal-flush → final-bpm-flush → clean-marker → reactors-dropped),
+plus idle-client non-blocking, listenerless quiet
+(`["reactors-dropped"]`), the identity-keyed home ordering (unit), and
+the deterministic 57P01 refusal driven at the session layer. Step 5 is
+`Runtime::shutdown`'s joins: housekeepers first (a worker must live to
+ack), then workers — a joined worker drops its ring, killing detached
+session tasks and closing fds/WAL handles. Parked (non-serving)
+housekeepers poll the flag on each `park()` wake and are explicitly
+unparked — without that their join would hang forever (the flag exists
+on every boot for exactly this). Report:
+`ShutdownReport { phases, housekeepers_stopped, workers_stopped }`.
+Known follow-ups (review-acknowledged, not T4.4): a byte-trickling
+client can hold the serving thread inside `handshake` per-read bounded
+but unbounded in total — a total handshake deadline belongs to the
+pgwire slice.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:
