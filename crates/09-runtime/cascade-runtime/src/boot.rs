@@ -44,7 +44,7 @@ use crate::{
     pools::PoolRegistry,
     router::Router,
     tenant::TenantCounters,
-    tierc::{Catalog, ClusterSnapshot},
+    tierc::{Catalog, ClusterSnapshot, TierCPlane, TIERC_PUBLISH_CAP, TIERC_WRITE_CAP},
     topology::{TopologyError, TopologyProvider},
     walhome::{self, WalHome, WalHomeTable},
 };
@@ -91,9 +91,11 @@ pub struct Runtime {
     /// orchestrates; no `wal_dir` means there is nothing to recycle.
     recycle: Option<crate::recycler::RecycleStats>,
     /// The reaper's orchestration counters (T4.5, FR-34). Present only
-    /// when something serves AND reaping is enabled (`idle_reap_ms > 0`,
-    /// not the default — a default that kills client connections must be
-    /// opted into).
+    /// when something serves AND a reap rule is enabled: a nonzero
+    /// `idle_reap_ms` (opt-in — a default that kills idle client
+    /// connections must be asked for) or a nonzero `stall_reap_ms`
+    /// (the default — the wedged-backend containment bounds a stuck
+    /// statement at 30 s).
     reap: Option<crate::reaper::ReapStats>,
     /// The per-DB WAL-truncatable frontier (T4.3's recycler reads it),
     /// present whenever a WAL was configured. Stays at 0 until passes
@@ -353,10 +355,61 @@ impl Runtime {
             .iter()
             .flat_map(|w| std::iter::repeat(w.numa).take(w.cores.len()))
             .collect();
-        let tierc = Arc::new(Catalog::new(ClusterSnapshot::build(
-            cfg.default_db_numa_affinity,
-            &worker_numas,
-        )));
+        // T5.3 (FR-6, FR-29, §10.1 step 7): the initial snapshot builds
+        // HERE — the WAL-home resolve below reads it — but nothing
+        // publishes from boot. The serving housekeeper's catalog and every
+        // worker's start EMPTY; §10.1 step 7's publish half is the Tier C
+        // writer's first act inside `Router::serve` (before the accept
+        // loop), and workers gate traffic until their own store lands
+        // (the gate in the handoff loop).
+        let initial = ClusterSnapshot::build(cfg.default_db_numa_affinity, &worker_numas);
+        // Per-worker Tier C wiring (T5.3), same per-core order as every
+        // other vec: one empty catalog, one write channel (the fan-in —
+        // the worker's `submit_change` handle), one publication channel
+        // (the fan-out — the writer's store jobs, drained onto this
+        // worker's catalog on its own ring). The publication init's
+        // stats Arc crosses to the worker BEFORE the init moves into the
+        // plane: init and handle share it, and the worker's
+        // `submit_loop` must count into the same Arc.
+        let mut tierc_worker_catalogs = Vec::with_capacity(n_workers);
+        let mut tierc_write_inits = Vec::with_capacity(n_workers);
+        let mut tierc_write_receivers = Vec::with_capacity(n_workers);
+        let mut tierc_write_stats = Vec::with_capacity(n_workers);
+        let mut tierc_publish_inits = Vec::with_capacity(n_workers);
+        let mut tierc_publish_receivers = Vec::with_capacity(n_workers);
+        let mut tierc_publish_stats = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            tierc_worker_catalogs.push(Arc::new(Catalog::empty()));
+            let (winit, wrx) = crate::submit::channel(TIERC_WRITE_CAP);
+            tierc_write_stats.push(winit.stats());
+            tierc_write_receivers.push(wrx);
+            tierc_write_inits.push(winit);
+            let (pinit, prx) = crate::submit::channel(TIERC_PUBLISH_CAP);
+            tierc_publish_stats.push(pinit.stats());
+            tierc_publish_inits.push(pinit);
+            tierc_publish_receivers.push(prx);
+        }
+        let tierc_plane = TierCPlane {
+            catalog: Arc::new(Catalog::empty()),
+            worker_catalogs: tierc_worker_catalogs.clone(),
+            worker_cores: cfg
+                .worker_cores
+                .iter()
+                .flat_map(|w| w.cores.iter().copied())
+                .collect(),
+            write_receivers: tierc_write_receivers,
+            write_stats: tierc_write_stats,
+            publish_inits: tierc_publish_inits,
+            fanout_wait: Duration::from_millis(cfg.tierc_fanout_wait_ms),
+            worker_numas: worker_numas.clone(),
+        };
+        // The workers' own catalog handles (Arc clones of the plane's
+        // vec, same order) cross into their reactor tasks below.
+        let tierc_catalogs = tierc_worker_catalogs;
+        // The Runtime-exposed catalog is the SERVING housekeeper's own —
+        // published by the writer at §10.1 step 7, read via FR-28's
+        // pointer copy afterwards.
+        let tierc = Arc::clone(&tierc_plane.catalog);
         // T4.1 (D9, FR-5, FR-31's frame): when serving, the first
         // housekeeper owns the orchestrator tick loop — §M4 background jobs
         // (stall sampling, checkpointer fanout now; recycler, reaper,
@@ -430,7 +483,7 @@ impl Runtime {
                 let pool_numas: Vec<u32> = cfg.numa_pools.iter().map(|p| p.numa).collect();
                 let home = walhome::resolve_wal_home(
                     dev,
-                    &tierc.load().resolve(Some("dev")),
+                    &initial.resolve(Some("dev")),
                     &persisted,
                     &pool_numas,
                 );
@@ -582,14 +635,17 @@ impl Runtime {
         // sharing, and targeting = scope again, but the scope differs:
         // idle connections live on EVERY worker, not just designated
         // ones, so this family fans out one channel per worker core
-        // rather than per pool. Disabled (`idle_reap_ms == 0`, the
-        // default) or listenerless: no channels, no job, no loops.
+        // rather than per pool. Armed by EITHER reap rule — the opt-in
+        // idle timeout or the (default-on) stall bound; the pass itself
+        // is one snapshot walking both rules. Listenerless: no channels,
+        // no job, no loops.
         let worker_core_count: usize = cfg
             .worker_cores
             .iter()
             .map(|w| w.cores.len())
             .sum();
-        let reap_enabled = listener.is_some() && cfg.idle_reap_ms > 0;
+        let reap_enabled =
+            listener.is_some() && (cfg.idle_reap_ms > 0 || cfg.stall_reap_ms > 0);
         let reap_signals = Arc::new(AtomicU64::new(0));
         let reap_refused = Arc::new(AtomicU64::new(0));
         let reap_reaped = Arc::new(AtomicU64::new(0));
@@ -630,7 +686,8 @@ impl Runtime {
             senders,
             worker_numas.clone(),
             counters.clone(),
-            Arc::clone(&tierc),
+            tierc_plane,
+            initial,
             tick_init,
             designated,
             checkpoint_stats.clone(),
@@ -713,6 +770,10 @@ impl Runtime {
             recycle_receivers,
             drain_receivers,
             reap_receivers,
+            tierc_write_inits,
+            tierc_publish_receivers,
+            tierc_publish_stats,
+            tierc_catalogs,
             &reap_reaped,
             draining,
             inflight,
@@ -783,8 +844,8 @@ impl Runtime {
 
     /// The reaper's orchestration counters (T4.5, FR-34): reap signals
     /// fanned out / dropped-full / connections condemned across all
-    /// workers. `None` without a listener or with reaping disabled
-    /// (`idle_reap_ms == 0`, the default).
+    /// workers. `None` without a listener or with both reap rules
+    /// disabled (`idle_reap_ms == 0` AND `stall_reap_ms == 0`).
     pub fn reap_stats(&self) -> Option<&crate::reaper::ReapStats> {
         self.reap.as_ref()
     }
@@ -973,7 +1034,8 @@ fn spawn_housekeepers(
     senders: Vec<SharedSender<Handoff>>,
     worker_numas: Vec<u32>,
     counters: Vec<Arc<crate::stats::WorkerCounters>>,
-    tierc: Arc<Catalog>,
+    tierc_plane: TierCPlane,
+    initial: ClusterSnapshot,
     tick_init: Option<crate::orchestrator::OrchestratorInit>,
     designated: Vec<(u32, SharedSender<ControlMsg>)>,
     checkpoint: Option<CheckpointStats>,
@@ -989,7 +1051,7 @@ fn spawn_housekeepers(
     let max_conns = cfg.max_conns_per_worker;
     let mut serving = match (listener, tick_init, checkpoint, recycle, shutdown, drain, reap) {
         (Some(loop_), Some(init), Some(stats), recycle, shutdown, drain, reap) => {
-            Some((loop_, auth, senders, worker_numas, counters, tierc, init, designated, stats, recycle, shutdown, drain, reap))
+            Some((loop_, auth, senders, worker_numas, counters, tierc_plane, initial, init, designated, stats, recycle, shutdown, drain, reap))
         }
         _ => None,
     };
@@ -1002,7 +1064,8 @@ fn spawn_housekeepers(
                 senders,
                 numas,
                 counters,
-                tierc,
+                tierc_plane,
+                initial,
                 tick_init,
                 designated,
                 stats,
@@ -1021,8 +1084,8 @@ fn spawn_housekeepers(
                 // returning.
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
-                    loop_, auth, senders, numas, counters, tierc, max_conns, tick_init,
-                    designated, stats, recycle, shutdown, drain, reap,
+                    loop_, auth, senders, numas, counters, tierc_plane, initial, max_conns,
+                    tick_init, designated, stats, recycle, shutdown, drain, reap,
                 );
             }),
             None => {
@@ -1085,6 +1148,10 @@ fn spawn_workers(
     recycle_receivers: Vec<Option<SharedReceiver<crate::recycler::RecycleSignal>>>,
     drain_receivers: Vec<Option<SharedReceiver<crate::shutdown::DrainMsg>>>,
     reap_receivers: Vec<Option<SharedReceiver<crate::reaper::ReapTick>>>,
+    tierc_write_inits: Vec<crate::submit::SubmitInit>,
+    tierc_publish_receivers: Vec<SharedReceiver<crate::submit::SubmitJob>>,
+    tierc_publish_stats: Vec<Arc<crate::submit::SubmitStats>>,
+    tierc_catalogs: Vec<Arc<Catalog>>,
     reap_reaped: &Arc<AtomicU64>,
     draining: Arc<AtomicBool>,
     inflight: Vec<Arc<AtomicU64>>,
@@ -1109,7 +1176,7 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for (((((((( (numa, core), rx), ctrl_rx), recycle_rx), drain_rx), reap_rx), counter), inflight), (tenant_counters, stall)) in
+    for (((((((((((( (numa, core), rx), ctrl_rx), recycle_rx), drain_rx), reap_rx), tierc_write_init), tierc_publish_rx), tierc_publish_stat), tierc_catalog), counter), inflight), (tenant_counters, stall)) in
         per_core
             .into_iter()
             .zip(receivers)
@@ -1117,6 +1184,10 @@ fn spawn_workers(
             .zip(recycle_receivers)
             .zip(drain_receivers)
             .zip(reap_receivers)
+            .zip(tierc_write_inits)
+            .zip(tierc_publish_receivers)
+            .zip(tierc_publish_stats)
+            .zip(tierc_catalogs)
             .zip(counters.iter())
             .zip(inflight)
             .zip(tenant_counters.iter().zip(stalls.iter()))
@@ -1149,6 +1220,7 @@ fn spawn_workers(
         let task_is_home = Some(numa) == dev_home;
         let reap_reaped_counter = Arc::clone(reap_reaped);
         let reap_timeout_ms = cfg.idle_reap_ms;
+        let reap_stall_ms = cfg.stall_reap_ms;
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
@@ -1221,9 +1293,12 @@ fn spawn_workers(
                 // idle connections live everywhere. The registry is the
                 // sessions' Tier A bookkeeping, created on this ring and
                 // shared (Rc) with the reap loop and every session task
-                // below; the loop is spawned only when reaping is enabled,
-                // but the registry's absence is exactly what tells a
-                // session to skip the bookkeeping (`reap == None`).
+                // below; the loop is spawned only when a reap rule is
+                // enabled, but the registry's absence is exactly what tells
+                // a session to skip the bookkeeping (`reap == None`). The
+                // stall bound rides the same pass: `None` when
+                // `stall_reap_ms == 0` (disabled), the rule itself is
+                // worker-side (`reap_overdue`).
                 let task_reap_registry =
                     reap_rx.as_ref().map(|_| Rc::new(crate::reaper::ReapRegistry::new()));
                 if let Some(rx) = reap_rx {
@@ -1235,10 +1310,29 @@ fn spawn_workers(
                         reaps,
                         Rc::clone(registry),
                         Duration::from_millis(reap_timeout_ms),
+                        (reap_stall_ms > 0).then(|| Duration::from_millis(reap_stall_ms)),
                         Arc::clone(&reap_reaped_counter),
                     ))
                     .detach();
                 }
+                // The Tier C planes (T5.3, FR-6/FR-29), connected LAST on
+                // this ring — the mirror of the serving side's order (the
+                // writer's forwarders and publication inits connect after
+                // its reap senders). The write handle is this worker's
+                // `submit_change` funnel route (T5.4's sessions take it);
+                // the publication channel drains store jobs onto THIS
+                // catalog on THIS ring. The catalog starts EMPTY: until
+                // the boot publication's store lands here, the gate in
+                // the handoff loop below refuses every connection (FR-6)
+                // instead of serving from an absent snapshot.
+                let task_catalog = tierc_catalog;
+                let _tierc_write = tierc_write_init.connect().await;
+                let tierc_publish = tierc_publish_rx.connect().await;
+                glommio::spawn_local(crate::submit::submit_loop(
+                    tierc_publish,
+                    tierc_publish_stat,
+                ))
+                .detach();
                 let table = Rc::new(crate::session::Table::new());
                 // T3.3: replayed committed rows land in every worker's
                 // table before the first session — the debug slice has no
@@ -1246,6 +1340,15 @@ fn spawn_workers(
                 // recovered state.
                 table.seed(&task_seed);
                 while let Some(handoff) = handoffs.recv().await {
+                    // FR-6's gate (§10.1 step 7 → 9): no session starts
+                    // from an absent catalog. Before this reactor's
+                    // boot publication lands, the refusal answers PG
+                    // 57P03 on the wire and closes the fd — the
+                    // handoff's ownership ends right here.
+                    let handoff = match crate::tierc::gate_handoff(handoff, &task_catalog) {
+                        Ok(handoff) => handoff,
+                        Err(()) => continue,
+                    };
                     let counter = task_counter.clone();
                     let tenants = task_tenants.clone();
                     let table = Rc::clone(&table);

@@ -171,6 +171,18 @@ pub struct RuntimeConfig {
     /// reaped. `0` disables reaping entirely: a default that kills
     /// client connections must be opted into.
     pub idle_reap_ms: u64,
+    /// Statement-stall reap bound (default 30 000; `0` = disabled): a
+    /// statement in flight longer than this condemns its session via the
+    /// reaper, through the ordinary disconnect-cleanup path. The
+    /// containment for a backend wedged on an io_uring completion that
+    /// never arrives (the socket-op sibling of cascade-wal's
+    /// `OP_WATCHDOG`: WAL ops are idempotent and re-issue, socket ops
+    /// cannot, so the backend is killed instead — PG's own termination
+    /// of a stuck backend). Deliberately ON by default: a wedged backend
+    /// is bounded, not immortal. Distinct from `stall.kill` (§7.2's
+    /// reactor-stall kill switch, still unsupported) — this is §9's
+    /// backend-level bound.
+    pub stall_reap_ms: u64,
     pub stall: StallConfig,
     pub auth: AuthConfig,
 }
@@ -193,6 +205,7 @@ impl Default for RuntimeConfig {
             tierc_fanout_wait_ms: 1000,
             tick_ms: 1000,
             idle_reap_ms: 0,
+            stall_reap_ms: 30_000,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),
         }
@@ -418,6 +431,7 @@ size_mb = 1024
         assert_eq!(cfg.max_conns_per_worker, 200);
         assert_eq!(cfg.tierc_fanout_wait_ms, 1000);
         assert_eq!(cfg.tick_ms, 1000);
+        assert_eq!(cfg.stall_reap_ms, 30_000);
         assert_eq!(cfg.stall.soft_us, 1_000);
         assert_eq!(cfg.stall.hard_us, 10_000);
         assert!(!cfg.stall.kill);

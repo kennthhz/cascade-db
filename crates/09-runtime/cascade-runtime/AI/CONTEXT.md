@@ -262,9 +262,34 @@ registry forever). Condemned connections close without a wire message
 and documented — a query already in the kernel buffer when the pass
 snapshot condemned the connection loses, exactly like PG's
 `idle_session_timeout` at tick granularity. `idle_reap_ms` defaults to
-`0` = disabled: no channels, no job, no loops, and sessions take the
-plain read (`reap == None`); a default that kills client connections
-must be opted into. **Connect-order rule (found as a live three-way
+`0` = disabled (a default that kills idle client connections must be
+opted into). **The stall rule (`stall_reap_ms`, default 30 000, `0`
+= off) is the opposite trade and rides the same plane**: a statement
+in flight longer than the bound condemns its session EVEN THOUGH it
+is not parked in its read. The containment: this environment (WSL2
+kernel 5.15 + glommio 0.9) occasionally never delivers an io_uring
+completion — cascade-wal's `OP_WATCHDOG` documents it for buffered
+file ops (idempotent, re-issued); a socket recv/send CQE can be lost
+too, and those are neither, so the session would hang forever. Found
+as a ~1-in-30 full-suite hang (`ticks_continue_under_client_load`):
+2/4 client threads wedged, per-worker connection gauges `[1, 1]`,
+rings alive (other sessions on the same rings completed), zero WAL
+watchdog firings — one lost CQE per worker ring, mid-statement or
+mid-response. The fix kills the backend at the bound (PG's own
+termination of a stuck backend): `ReapEntry.in_flight_since` is set
+at the statement's in-flight increment and cleared at its completion
+`touch`; `reap_overdue(idle_timeout, stall)` walks BOTH rules; the
+session side wraps the ENTIRE post-read window — framing refusals,
+draining refusal, execute, WAL, every response write — in
+`rescoped` (`session.rs`), the read wrapper generalized: it stores
+the poll's waker and checks `is_dropped` first, so the reaper's wake
+aborts the statement wherever it is parked, closing through the
+ordinary FR-15 cleanup with no further wire output (the wedged op may
+itself have been the response write). Clients reconnect — the load
+test in `tests/tick.rs` retries a dead connection with fresh ids and
+asserts the honest durability invariants (acked ids ⊆ WAL rows;
+WAL rows − acked ≤ kills). Revisit both bounds on bare metal.
+**Connect-order rule (found as a live three-way
 boot deadlock: all executors spinning at 100%)**: a `connect()` blocks
 until the peer endpoint connects on its own executor, so the serving
 side must connect the signal families in the same order the workers do
@@ -378,13 +403,15 @@ shared across every ArcSwap instance), which pushes that thread's other
 loads onto the slower refcount path. The ONLY write is
 `pub(crate) store(Arc<ClusterSnapshot>)`: no swap/rcu/compare_exchange
 is re-exposed, so "no second writer path" (I9) is grep-auditable and no
-external crate can write at all. Until T5.3's housekeeper writer lands,
-boot's `Catalog::new` is the only publication — the snapshot stays
-immutable after boot, the T2.4 posture. Consumers: router `route()`
-pointer-loads per connection; boot's WAL-home resolve reads once
-pre-serving. Per-reactor instances are T5.3's fan-out shape (R11's
-laggard adoption needs one ArcSwap per reactor); today ONE instance,
-held by the router plus boot's one resolve. The three §8.4 guarantees
+external crate can write at all. (Written at T5.2, when boot's
+`Catalog::new` was the only publication and the snapshot stayed
+immutable after boot; T5.3's writer took over — see below. `Catalog::new`
+survives as the TEST constructor; boot hands every reactor an EMPTY
+catalog and publication is the writer's first act.) Consumers: router
+`route()` pointer-loads per connection; boot's WAL-home resolve reads
+the built-but-unpublished initial once pre-serving. Per-reactor
+instances are T5.3's fan-out shape (R11's laggard adoption needs one
+ArcSwap per reactor). The three §8.4 guarantees
 are pinned by tests the review verified against arc-swap 1.9.3's actual
 swap/pay_all/debt mechanics: the race test (barrier-synchronized 3
 readers + writer over 5 000 whole snapshots riding the revision in
@@ -408,6 +435,57 @@ debt the old exit-code-only gate had let through — an
 the unresolved `first` future now drops inside the block),
 walgate's unused import and detached-task naming, and cascade-wal's
 doc-divider comment plus a `&PathBuf`→`&Path` in its writer test.
+
+**Tier C writer + bounded fan-out + boot publication order (T5.3,
+FR-6/FR-29/FR-30, §10.1 step 7, R11) — one writer, one budget, empty
+until published.** `src/tierc.rs` grew the serialized writer:
+`ClusterState` (the ONE mutable copy — applies changes in place,
+publishes immutable clones whole) is owned by `writer_loop`, the one
+task on the serving housekeeper's ring. The fan-in is per-worker write
+channels (`TIERC_WRITE_CAP` 16, eager `try_send` — a full channel
+refuses up-front instead of hiding pressure in a queue) whose job
+futures, running on the housekeeper ring via the T5.1 forwarders,
+reach `submit_change` → the `FUNNEL` thread_local (a same-ring
+`LocalSender<WriteCmd>`; `None` on any ring without a live writer is
+an honest `SubmitError::Lost`, never a hang). The fan-out
+(`fan_out`) submits one whole-snapshot store job per reactor with the
+ISSUING reactor swapped to the front and awaits under ONE shared
+deadline (`Instant::now() + tierc_fanout_wait_ms` taken BEFORE
+submission — the bound covers the whole fan-out wall time, the
+strictest reading of R11's "bounded wait"; each await races the
+remaining budget against the submit via a hand-rolled `Race` future
+because glommio's `timer::timeout` only fits ITS `Result` type, and
+the submit is polled first so a confirm+deadline same-wake counts as
+confirmed). The ack is `Applied` or `Pending(n)`; pending is never
+lost — `submit_to` admitted the store job eagerly, so it sits in the
+laggard's publication channel (`TIERC_PUBLISH_CAP` 64) and lands when
+that ring drains (lazy adoption on its next pointer load); dropping
+the awaited future at the deadline abandons only the ack, not the
+job. Boot-order (FR-6, §10.1 step 7 → 9): boot BUILDS the initial
+snapshot (the WAL-home resolve reads it) but publishes NOTHING —
+every reactor starts `Catalog::empty()`; `start_writer` runs inside
+`Router::serve` BEFORE the accept loop opens, publishes own-catalog
+first then fans out, and the `published` oneshot gates the loop;
+workers spawned early gate each handoff through `gate_handoff` — an
+unpublished catalog answers wire `57P03` ("the database system is
+starting up") and closes the fd exactly once (the same single
+adoption `session::run` would make). The router's `None` arm is the
+same refusal, defensive (publication precedes its loop). Tests: the
+happy path (two workers issue through real write channels; `Applied`
+ands the row visible on all THREE catalogs, other names inherit the
+default), the stalled reactor (instrumented gate on the publication
+loop, NOT a sleep guess: `Pending(1)` with a ≥350 ms lower-bound
+wait, issuer's catalog serves at ack time, opening the gate IS the
+lazy adoption, post-stall change acks `Applied`), the issuer-first
+DISCRIMINATOR (issuer on the unstalled worker, laggard gated:
+`Pending(1)` not `Pending(2)` — natural-order awaiting would burn
+the budget on the non-issuer), and the 57P03 gate over a real TCP
+pair both ways. Review findings: the fixture raced its own fan-out —
+it asserted worker publications synchronously after waiting only on
+the housekeeper's (a ~1-in-5 full-suite flake, caught by loop
+re-runs); the fix polls each ungated catalog. `Catalog` and
+`ClusterSnapshot` carry `Send`/`Sync` static asserts (what makes the
+fan-out job legal — pinned at T5.2).
 
 ## Open Design Questions
 

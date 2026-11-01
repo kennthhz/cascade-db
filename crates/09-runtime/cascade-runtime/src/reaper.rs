@@ -42,6 +42,25 @@
 //! first and closes. The window is one pass of channel latency wide and
 //! indistinguishable at the protocol level from a client that connected
 //! and stayed silent.
+//!
+//! **The stall rule** (`stall_reap_ms`, distinct from idle reaping): a
+//! statement in flight longer than the bound condemns its session even
+//! though it is not parked in a read. This is the containment for the
+//! same hazard [`cascade_wal::io`]'s `OP_WATCHDOG` documents — this
+//! environment (WSL2 kernel 5.15 + glommio 0.9) occasionally never
+//! delivers an io_uring completion, and a session awaiting a socket
+//! send/recv whose CQE is lost would otherwise hang forever: the WAL
+//! ops are idempotent and re-issue, socket ops are neither, so the only
+//! honest bound is to kill the backend and let the client reconnect
+//! (PG's own termination of a stuck backend). The stall window covers
+//! the whole statement — parse, execute, WAL, and the response/RFB
+//! writes — and the session observes condemnation through the same
+//! rescue wrapper the read uses (`rescoped` in `session.rs`): the reaper
+//! wakes the parked await's waker, the wrapper's next poll checks
+//! `is_dropped` first and aborts the statement, closing the connection
+//! through the ordinary FR-15 cleanup path. Off by default is NOT the
+//! default: `stall_reap_ms` defaults to 30 000 — a wedged backend is
+//! bounded, not immortal — and 0 disables. Revisit on bare metal.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -70,13 +89,23 @@ struct ReapEntry {
     /// not idle, whatever the clock says (the code-review demand that
     /// killed the naive "elapsed since completion" definition).
     waiting: bool,
-    /// The parked read's current waker. Re-stored on every poll of the
-    /// session's read wrapper; the reaper's wake must land on the waker
-    /// of the poll that is actually parked.
+    /// When the statement now executing began — `Some` from the
+    /// statement's first await-able moment (the in-flight increment)
+    /// until its completion (the same point `touch` fires). The STALL
+    /// rule keys on this: a statement in flight past `stall_reap_ms`
+    /// condemns its session even though it is not `waiting` — that is
+    /// the lost-completion containment (see the module doc), and it is
+    /// deliberately independent of the idle rule's parked-in-read
+    /// requirement.
+    in_flight_since: Option<Instant>,
+    /// The parked await's current waker. Re-stored on every poll of the
+    /// session's rescue wrappers (the message read AND the statement
+    /// body); the reaper's wake must land on the waker of the poll
+    /// that is actually parked.
     waker: Option<std::task::Waker>,
     /// Condemned. Set only by [`ReapRegistry::reap_overdue`]; the
-    /// session observes it at its next read poll and exits through the
-    /// FR-15 cleanup path.
+    /// session observes it at its next rescue-wrapper poll and exits
+    /// through the FR-15 cleanup path.
     dropped: bool,
 }
 
@@ -117,6 +146,7 @@ impl ReapRegistry {
             ReapEntry {
                 last_complete: Instant::now(),
                 waiting: false,
+                in_flight_since: None,
                 waker: None,
                 dropped: false,
             },
@@ -149,9 +179,21 @@ impl ReapRegistry {
         }
     }
 
-    /// Records the parked read's current waker (cloned). Called on every
-    /// poll before delegating to the underlying read, so a reaper wake
-    /// always lands on the live poll.
+    /// Marks the statement window: `true` at the in-flight increment
+    /// (the statement's first await-able moment), `false` at completion
+    /// — the same boundary `touch` fires at. The stall rule condemns on
+    /// this clock; it is deliberately independent of `waiting` (a
+    /// wedged statement is BY DEFINITION not parked in its read).
+    pub fn set_in_flight(&self, id: ConnId, in_flight: bool) {
+        if let Some(e) = self.entries.borrow_mut().get_mut(&id) {
+            e.in_flight_since = in_flight.then(Instant::now);
+        }
+    }
+
+    /// Records the parked await's current waker (cloned). Called on
+    /// every poll of either rescue wrapper — the message read between
+    /// statements, the statement body mid-statement — so a reaper wake
+    /// always lands on the poll that is actually parked.
     pub fn store_waker(&self, id: ConnId, waker: &std::task::Waker) {
         if let Some(e) = self.entries.borrow_mut().get_mut(&id) {
             e.waker = Some(waker.clone());
@@ -167,12 +209,15 @@ impl ReapRegistry {
             .unwrap_or(false)
     }
 
-    /// One reap pass: condemn every entry that is parked in its read AND
-    /// whose last completion is older than `timeout`, waking its parked
-    /// read so the session observes the condemnation. Returns the number
+    /// One reap pass: condemn every entry that is (a) parked in its
+    /// read AND whose last completion is older than `idle_timeout` —
+    /// the idle rule, active only when `idle_timeout > 0` — or (b) mid-
+    /// statement for longer than `stall` — the stall rule, active when
+    /// `stall` is `Some`. Either way the entry's parked await is woken
+    /// so the session observes the condemnation. Returns the number
     /// reaped. Runs on this ring — serialized with the sessions it
     /// walks, so the snapshot is exact, not approximate.
-    pub fn reap_overdue(&self, timeout: Duration) -> usize {
+    pub fn reap_overdue(&self, idle_timeout: Duration, stall: Option<Duration>) -> usize {
         let mut entries = self.entries.borrow_mut();
         let mut reaped = 0;
         for e in entries.values_mut() {
@@ -180,7 +225,13 @@ impl ReapRegistry {
             // session hasn't polled yet (a backed-up ring) must not be
             // re-counted — `reaped` is the tests' and diagnostics' oracle
             // (T4.5 review F1).
-            if !e.dropped && e.waiting && e.last_complete.elapsed() >= timeout {
+            let idle_due =
+                idle_timeout > Duration::ZERO && e.waiting && e.last_complete.elapsed() >= idle_timeout;
+            let stalled = match (stall, e.in_flight_since) {
+                (Some(bound), Some(since)) => since.elapsed() >= bound,
+                _ => false,
+            };
+            if !e.dropped && (idle_due || stalled) {
                 e.dropped = true;
                 // The entry STAYS in the map (the session must still find
                 // `dropped` at its next poll); the unregister guard
@@ -206,6 +257,15 @@ impl ReapRegistry {
     pub fn age_override(&self, id: ConnId, past: Duration) {
         if let Some(e) = self.entries.borrow_mut().get_mut(&id) {
             e.last_complete = Instant::now() - past;
+        }
+    }
+
+    /// Backdates a session's in-flight clock (test hook: stall-rule
+    /// eligibility without a genuinely stuck statement).
+    #[cfg(test)]
+    pub fn in_flight_override(&self, id: ConnId, past: Duration) {
+        if let Some(e) = self.entries.borrow_mut().get_mut(&id) {
+            e.in_flight_since = Some(Instant::now() - past);
         }
     }
 }
@@ -259,17 +319,20 @@ impl TickJob for IdleReaper {
 
 /// The worker-side reap loop: what a [`ReapTick`] acts on — one pass
 /// over this ring's registry. Shares the session's `Rc<ReapRegistry>`
-/// (same ring, Tier A), so a reap snapshot is exact. The loop dies with
-/// the ring or when the serving side drops its sender (shutdown joins
-/// the workers, whose ring drop closes the channel).
+/// (same ring, Tier A), so a reap snapshot is exact. `idle_timeout`
+/// gates the idle rule (`ZERO` = idle reaping off — the plane may be
+/// up for the stall rule alone); `stall` gates the stall rule. The
+/// loop dies with the ring or when the serving side drops its sender
+/// (shutdown joins the workers, whose ring drop closes the channel).
 pub async fn reap_loop(
     recv: ConnectedReceiver<ReapTick>,
     reap: Rc<ReapRegistry>,
-    timeout: Duration,
+    idle_timeout: Duration,
+    stall: Option<Duration>,
     reaped: Arc<AtomicU64>,
 ) {
     while let Some(ReapTick) = recv.recv().await {
-        let n = reap.reap_overdue(timeout);
+        let n = reap.reap_overdue(idle_timeout, stall);
         if n > 0 {
             reaped.fetch_add(n as u64, Ordering::Relaxed);
         }
@@ -278,8 +341,8 @@ pub async fn reap_loop(
 
 /// Aggregates for `Runtime` — the same counters the tick job and the
 /// workers' reap loops increment. `None` on boots with no listener or
-/// with reaping disabled (`idle_reap_ms == 0`, the default): nothing
-/// orchestrates.
+/// with both reap rules disabled (`idle_reap_ms == 0` AND
+/// `stall_reap_ms == 0`): nothing orchestrates.
 #[derive(Debug, Clone)]
 pub struct ReapStats {
     signals: Arc<AtomicU64>,
@@ -358,7 +421,7 @@ mod tests {
         reg.age_override(fresh, Duration::from_millis(0));
         reg.set_waiting(parked, true);
         reg.set_waiting(fresh, true);
-        let n = reg.reap_overdue(Duration::from_secs(1));
+        let n = reg.reap_overdue(Duration::from_secs(1), None);
         assert_eq!(n, 1, "busy-mid-statement and fresh-idle survive");
         assert!(reg.is_dropped(parked));
         assert!(!reg.is_dropped(busy));
@@ -374,7 +437,7 @@ mod tests {
         reg.store_waker(id, &flag_waker(&flag));
         assert!(!flag.load(Ordering::SeqCst));
         reg.age_override(id, Duration::from_secs(10));
-        assert_eq!(reg.reap_overdue(Duration::from_secs(1)), 1);
+        assert_eq!(reg.reap_overdue(Duration::from_secs(1), None), 1);
         assert!(flag.load(Ordering::SeqCst), "parked read must be woken");
         // The entry stays for the session to observe its own condemnation
         // (and the unregister guard to remove) — the reaper never drops
@@ -384,7 +447,7 @@ mod tests {
         // Observing the reap unregisters; a second pass finds nothing.
         reg.unregister(id);
         assert_eq!(reg.live(), 0);
-        assert_eq!(reg.reap_overdue(Duration::from_secs(1)), 0);
+        assert_eq!(reg.reap_overdue(Duration::from_secs(1), None), 0);
     }
 
     #[test]
@@ -398,7 +461,7 @@ mod tests {
         reg.set_waiting(id, true);
         reg.age_override(id, Duration::from_secs(10));
         reg.unregister(id);
-        assert_eq!(reg.reap_overdue(Duration::from_secs(1)), 0);
+        assert_eq!(reg.reap_overdue(Duration::from_secs(1), None), 0);
         assert_eq!(reg.live(), 0);
     }
 
@@ -412,7 +475,84 @@ mod tests {
         // when its RFB goes out): not overdue, whatever the connection's
         // age — idle is measured from LAST COMPLETION.
         reg.touch(id);
-        assert_eq!(reg.reap_overdue(Duration::from_secs(1)), 0);
+        assert_eq!(reg.reap_overdue(Duration::from_secs(1), None), 0);
         assert!(!reg.is_dropped(id));
+    }
+
+    #[test]
+    fn stall_rule_condemns_a_wedged_statement_despite_not_waiting() {
+        // The lost-completion containment: a statement in flight past
+        // the bound is condemned even though the session is NOT parked
+        // in its read — a wedged statement is by definition not waiting,
+        // so the idle rule could never reach it. The idle rule is armed
+        // OFF here (ZERO): the stall rule alone reaps.
+        let reg = Rc::new(ReapRegistry::new());
+        let wedged = reg.register();
+        let fresh = reg.register();
+        reg.set_in_flight(wedged, true);
+        reg.set_in_flight(fresh, true);
+        reg.in_flight_override(wedged, Duration::from_secs(10));
+        reg.in_flight_override(fresh, Duration::from_millis(1));
+        let n = reg.reap_overdue(Duration::from_secs(0), Some(Duration::from_secs(1)));
+        assert_eq!(n, 1, "only the over-bound statement is condemned");
+        assert!(reg.is_dropped(wedged));
+        assert!(!reg.is_dropped(fresh));
+    }
+
+    #[test]
+    fn stall_wake_reaches_the_stuck_statement_poll() {
+        // The wake path is shared, so the stuck statement's poll — the
+        // one parked on the never-completing socket op — is the one
+        // woken; the session aborts through the ordinary cleanup path.
+        let reg = Rc::new(ReapRegistry::new());
+        let id = reg.register();
+        reg.set_in_flight(id, true);
+        reg.in_flight_override(id, Duration::from_secs(10));
+        let flag = Arc::new(AtomicBool::new(false));
+        reg.store_waker(id, &flag_waker(&flag));
+        assert!(!flag.load(Ordering::SeqCst));
+        assert_eq!(
+            reg.reap_overdue(Duration::from_secs(0), Some(Duration::from_secs(1))),
+            1
+        );
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the stuck statement's poll must be woken"
+        );
+        assert!(reg.is_dropped(id));
+    }
+
+    #[test]
+    fn stall_disarmed_leaves_mid_statement_sessions_alone() {
+        // The T4.5 invariant under the new signature: with the stall
+        // bound `None` (idle-only config) an in-flight entry is
+        // untouchable, however long it has been in flight.
+        let reg = Rc::new(ReapRegistry::new());
+        let id = reg.register();
+        reg.set_in_flight(id, true);
+        reg.in_flight_override(id, Duration::from_secs(10_000));
+        assert_eq!(reg.reap_overdue(Duration::from_secs(0), None), 0);
+        assert!(!reg.is_dropped(id));
+    }
+
+    #[test]
+    fn both_rules_armed_reap_their_own_eligible_entries() {
+        // Idle rule and stall rule are independent disjuncts: each
+        // condemns exactly the entries that satisfy it, and a healthy
+        // in-flight session satisfies neither.
+        let reg = Rc::new(ReapRegistry::new());
+        let idle_due = reg.register();
+        let stalled = reg.register();
+        let healthy = reg.register();
+        reg.set_waiting(idle_due, true);
+        reg.age_override(idle_due, Duration::from_secs(10));
+        reg.set_in_flight(stalled, true);
+        reg.in_flight_override(stalled, Duration::from_secs(10));
+        reg.set_in_flight(healthy, true);
+        let n = reg.reap_overdue(Duration::from_secs(1), Some(Duration::from_secs(1)));
+        assert_eq!(n, 2, "each rule condemns exactly its own entry");
+        assert!(reg.is_dropped(idle_due));
+        assert!(reg.is_dropped(stalled));
+        assert!(!reg.is_dropped(healthy));
     }
 }

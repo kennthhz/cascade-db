@@ -34,7 +34,7 @@ use crate::{
     config::{AuthConfig, NumaAffinity},
     handoff::Handoff,
     pg::{handshake, send_fatal, AuthPolicy, Session},
-    tierc::{Catalog, Placement},
+    tierc::{Catalog, ClusterSnapshot, Placement, TierCPlane, CANNOT_CONNECT_NOW},
 };
 
 /// PG too_many_connections — the FR-12/R10 refusal code.
@@ -91,7 +91,23 @@ impl Router {
             .peer_addr()
             .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
         // FR-28's read on the routing path: one pointer copy, no lock.
-        let placement = self.tierc.load().resolve(session.startup.database());
+        // The serving catalog is published before the accept loop opens
+        // (FR-6, §10.1 step 7 → 9), so the `None` arm is defensive —
+        // refuse cannot_connect_now rather than route from an absent
+        // catalog.
+        let Some(placement) = self
+            .tierc
+            .load()
+            .as_ref()
+            .map(|snapshot| snapshot.resolve(session.startup.database()))
+        else {
+            let _ = send_fatal(
+                &mut stream,
+                CANNOT_CONNECT_NOW,
+                "the database system is starting up",
+            );
+            return None; // caller drops the stream → closed
+        };
         let Some(idx) = self.choose(&placement) else {
             // FR-12 (R10): a single-affinity DB with no available worker on
             // its bound NUMA is refused, naming the NUMA — never silently
@@ -158,9 +174,11 @@ impl Router {
     /// rather than routed, and after the loop the serving thread runs the
     /// whole §10.2 drain ([`crate::shutdown::run_drain`]).
     ///
-    /// Runs an unpinned glommio executor on the calling thread purely for the
-    /// sender-side channel connect; after that connect, the loop is plain
-    /// blocking I/O and the ring idles.
+    /// Runs an unpinned glommio executor on the calling thread for the
+    /// sender-side channel connects and the Tier C writer (T5.3: the
+    /// serialized mutation path runs here, and its boot publication gates
+    /// the accept loop — FR-6); after that, the loop is plain
+    /// blocking I/O and the ring idles between events.
     #[allow(clippy::too_many_arguments)]
     pub fn serve(
         listener: AcceptLoop,
@@ -168,7 +186,8 @@ impl Router {
         senders: Vec<SharedSender<Handoff>>,
         numas: Vec<u32>,
         counters: Vec<Arc<crate::stats::WorkerCounters>>,
-        tierc: Arc<Catalog>,
+        tierc_plane: TierCPlane,
+        initial: ClusterSnapshot,
         max_conns_per_worker: u32,
         tick_init: crate::orchestrator::OrchestratorInit,
         designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
@@ -196,7 +215,7 @@ impl Router {
                 policy,
                 routes,
                 max_conns_per_worker,
-                tierc,
+                tierc: Arc::clone(&tierc_plane.catalog),
             };
 
             // The orchestrator is serving-thread-local (its jobs may hold
@@ -274,6 +293,19 @@ impl Router {
                     senders, init.stats,
                 )));
             }
+            // Tier C's serialized writer and the boot publication (T5.3,
+            // FR-6/FR-29, §10.1 step 7): the writer installs on THIS ring —
+            // its write-channel forwarders and publication inits connect
+            // here, the families the workers' loops connect LAST (after
+            // the reap: this call site is the mirror of that order). The
+            // accept loop below stays closed until the initial snapshot
+            // has stored on every reactor's catalog — no route serves
+            // from an absent catalog, and workers spawned early gate
+            // their handoffs on the same publication.
+            let published = crate::tierc::start_writer(tierc_plane, initial).await;
+            published
+                .await
+                .expect("the writer publishes the boot snapshot before serving");
             // The shutdown flag read every loop pass. `None` on a
             // listenerless boot (nothing accepts, nothing drains — D9).
             let shutdown_flagged = |flag: Option<&Arc<std::sync::atomic::AtomicBool>>| {

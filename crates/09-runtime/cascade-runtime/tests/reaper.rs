@@ -55,7 +55,7 @@ struct Fixture {
     rt: Runtime,
 }
 
-fn boot(wal: bool, tick_ms: u64, reap_ms: u64) -> Fixture {
+fn boot(wal: bool, tick_ms: u64, reap_ms: u64, stall_ms: u64) -> Fixture {
     let mut allowed = pin::current_affinity();
     assert!(allowed.len() >= 3, "needs at least 3 CPUs");
     allowed.truncate(3);
@@ -75,6 +75,7 @@ fn boot(wal: bool, tick_ms: u64, reap_ms: u64) -> Fixture {
         wal_dir: wal_dir.clone(),
         tick_ms,
         idle_reap_ms: reap_ms,
+        stall_reap_ms: stall_ms,
         ..RuntimeConfig::default()
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
@@ -119,7 +120,7 @@ fn wait_reaped(fx: &Fixture, want: u64, secs: u64) -> u64 {
 #[test]
 fn reaped_midtxn_connection_leaves_only_committed_rows() {
     let _serial = serial();
-    let fx = boot(true, 200, 600);
+    let fx = boot(true, 200, 600, 0);
     let mut c = client(&fx);
     // Committed — survives the reap and the restart.
     c.simple_query("BEGIN").expect("begin");
@@ -170,7 +171,7 @@ fn active_connections_are_never_reaped() {
     // 300ms gaps vs a 1000ms timeout: ~700ms of margin per gap — nine
     // gaps must not give a loaded machine nine chances to overshoot into
     // a spurious reap (T4.5 review F3).
-    let fx = boot(false, 200, 1000);
+    let fx = boot(false, 200, 1000, 0);
     let mut c = client(&fx);
     // ~9 statements at ~300ms gaps: idle never exceeds ~350ms < 700ms,
     // while the reap machinery ticks (200ms) several times in between.
@@ -203,7 +204,7 @@ fn idle_is_measured_from_last_completion_not_connection_age() {
     // spurious-reap window — from first completion + timeout to the
     // second statement's completion — must survive a >100ms sleep
     // overshoot. timeout 1500ms with a 1100ms first gap leaves ~400ms.
-    let fx = boot(false, 200, 1500);
+    let fx = boot(false, 200, 1500, 0);
     let mut c = client(&fx);
     let t0 = Instant::now();
     // Completion at ~t0+30ms. The connection's age now runs while its
@@ -238,20 +239,44 @@ fn idle_is_measured_from_last_completion_not_connection_age() {
     );
 }
 
-/// The default (`idle_reap_ms == 0`) disables reaping entirely: no job,
-/// no stats, and a connection idle well past any timeout survives.
-/// A default that kills client connections must be opted into.
+/// The IDLE rule is opt-in (`idle_reap_ms == 0`, the default — a default
+/// that kills idle client connections must be asked for): with the stall
+/// rule also explicitly off there is no reap plane at all — no job, no
+/// stats — and a connection idle well past any timeout survives. (The
+/// STALL rule is the opposite: on by default, as the wedged-backend
+/// containment — `the_stall_rule_arms_the_reap_plane` pins that side.)
 #[test]
-fn reaping_is_off_by_default() {
+fn idle_reaping_is_opt_in() {
     let _serial = serial();
-    let fx = boot(false, 200, 0);
+    let fx = boot(false, 200, 0, 0);
     assert!(
         fx.rt.reap_stats().is_none(),
-        "a disabled reaper must not report stats"
+        "a fully disabled reaper must not report stats"
     );
     let mut c = client(&fx);
     c.simple_query("SELECT * FROM debug_table").expect("first statement");
     std::thread::sleep(Duration::from_millis(1_200));
     c.simple_query("SELECT * FROM debug_table")
         .expect("with reaping disabled, an idle connection is never touched");
+}
+
+/// A nonzero `stall_reap_ms` arms the reap plane even with idle reaping
+/// off — the wedged-backend containment rides the same plane. The value
+/// here is the default (30 000, pinned in config.rs); what this test pins
+/// is the on-switch: a serving boot with only the stall rule reports
+/// reap stats, and a short, healthy statement is untouched by it.
+#[test]
+fn the_stall_rule_arms_the_reap_plane() {
+    let _serial = serial();
+    let fx = boot(false, 200, 0, 30_000);
+    let stats = fx
+        .rt
+        .reap_stats()
+        .expect("a stall-armed boot reports reap stats");
+    assert_eq!(stats.reaped(), 0, "nothing wedged, nothing reaped");
+    let mut c = client(&fx);
+    c.simple_query("SELECT * FROM debug_table")
+        .expect("a statement far under the stall bound completes untouched");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(stats.reaped(), 0, "healthy statements are never condemned");
 }

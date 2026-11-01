@@ -67,6 +67,12 @@ fn config(wal_dir: Option<&Path>, tick_ms: u64) -> (SyntheticTopology, RuntimeCo
             size_mb: 1,
         }],
         wal_dir: wal_dir.map(|p| p.to_path_buf()),
+        // A tight stall bound (default is 30 s): this test is where the
+        // lost-completion containment is exercised under load — a
+        // statement wedged on an io_uring CQE that never arrives must be
+        // killed and its client must recover, not hang the suite for 14
+        // minutes (twice observed before the rule existed).
+        stall_reap_ms: 3_000,
         tick_ms,
         ..RuntimeConfig::default()
     };
@@ -141,31 +147,86 @@ fn ticks_continue_under_client_load() {
     // so the tick-loop window spans ~10 slots regardless of how fast a
     // single insert is (a fixed count would finish inside one tick).
     const LOAD_MS: u64 = 500;
+    // The completion channel bounds the WAIT (a wedged client converts
+    // into a loud failure with evidence instead of an eternal join — the
+    // ~14-minute full-suite wedge, twice observed); the handles still
+    // distinguish a panicked client (finished with Err) from a wedged
+    // one (unfinished) at the timeout. The clients RETRY a dead
+    // connection — with the stall reaper armed, the expected shape of a
+    // lost-CQE wedge is "connection killed at ~3 s", and a PG client
+    // reconnects; ids keep advancing across reconnects because the
+    // killed statement's fate (logged or not) is unknowable client-side.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Vec<i32>>();
     let load: Vec<_> = (0..4)
         .map(|w| {
             let url = url.clone();
+            let done_tx = done_tx.clone();
             std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_millis(LOAD_MS);
+                let mut acked: Vec<i32> = Vec::new();
+                let mut n = 0u32;
                 let mut c = postgres::Client::connect(&url, postgres::NoTls)
                     .expect("load client connects");
-                let deadline = std::time::Instant::now() + Duration::from_millis(LOAD_MS);
-                let mut n = 0u32;
                 while std::time::Instant::now() < deadline {
-                    c.simple_query(&format!(
-                        "INSERT INTO debug_table VALUES ({}, 'load-{}-{}')",
-                        1000 + w * 10_000 + n,
-                        w,
-                        n
-                    ))
-                    .expect("load insert");
-                    n += 1;
+                    let id = (1000 + w * 10_000 + n) as i32;
+                    match c.simple_query(&format!(
+                        "INSERT INTO debug_table VALUES ({id}, 'load-{w}-{n}')"
+                    )) {
+                        Ok(_) => {
+                            acked.push(id);
+                            n += 1;
+                        }
+                        Err(_) => {
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            c = postgres::Client::connect(&url, postgres::NoTls)
+                                .expect("load client reconnects after kill");
+                        }
+                    }
                 }
-                n
+                let _ = done_tx.send(acked);
             })
         })
         .collect();
-    let mut inserted = 0u32;
+    drop(done_tx);
+    let mut acked: Vec<i32> = Vec::new();
+    const JOIN_BUDGET: Duration = Duration::from_secs(30);
+    let joined_at = std::time::Instant::now();
+    for _ in 0..load.len() {
+        let remaining = JOIN_BUDGET.saturating_sub(joined_at.elapsed());
+        match done_rx.recv_timeout(remaining) {
+            Ok(ids) => acked.extend(ids),
+            Err(_) => {
+                let finished = load.iter().filter(|h| h.is_finished()).count();
+                // Root-cause evidence, not just the failure: the live
+                // per-worker connection gauge and the reaper's kill count.
+                // A FULL gauge means the sessions run and the wedge is in
+                // a socket op; reaped > 0 means the stall rule fired and
+                // a retry should have followed — reaped == 0 with a full
+                // gauge means the containment itself failed.
+                let gauges: Vec<u64> = fx
+                    .rt
+                    .workers()
+                    .iter()
+                    .map(|w| w.active_connections())
+                    .collect();
+                let reaped = fx.rt.reap_stats().map(|s| s.reaped()).unwrap_or(0);
+                panic!(
+                    "load clients did not all finish within {JOIN_BUDGET:?} \
+                     (the load window itself is {LOAD_MS} ms): {finished}/{} \
+                     threads finished (a finished thread panicked; an \
+                     unfinished one is wedged on a lost response); \
+                     per-worker live connection gauges {gauges:?}; \
+                     stall reaps so far {reaped}",
+                    load.len()
+                );
+            }
+        }
+    }
     for h in load {
-        inserted += h.join().expect("load client finishes");
+        // All senders reported; the join is the thread-exit formality.
+        h.join().expect("load client thread joins");
     }
 
     let ticks = stats.ticks() - t0;
@@ -191,17 +252,36 @@ fn ticks_continue_under_client_load() {
     // The load was real, and every committed insert is durable. Read the
     // truth from the WAL, not a connection: the debug table is per-worker
     // (`Rc<Table>`), so a SELECT sees only the rows routed to its worker —
-    // the log holds what all of them acked.
-    assert!(inserted >= 100, "load clients only managed {inserted} inserts");
+    // the log holds what all of them acked. With the stall reaper armed,
+    // a killed client's last statement may have committed without its ack
+    // ever arriving (the wedged op WAS the ack write), so strict equality
+    // is not the invariant any more; durability is:
+    //   every acked id is in the log, and the log's surplus over the
+    //   acked set is bounded by the kills (at most one in-flight
+    //   statement per kill can be in either state).
+    assert!(
+        acked.len() >= 100,
+        "load clients only managed {} inserts",
+        acked.len()
+    );
     let plan = cascade_runtime::recovery::prepare(
         &dir,
         cascade_runtime::tenant::dev_context().db,
     )
     .expect("wal walk");
-    assert_eq!(
-        plan.seed_rows.len(),
-        inserted as usize,
-        "every acked insert is in the log"
+    let wal_ids: std::collections::HashSet<i32> =
+        plan.seed_rows.iter().map(|(id, _)| *id).collect();
+    let kills = fx.rt.reap_stats().map(|s| s.reaped()).unwrap_or(0) as usize;
+    assert!(
+        acked.iter().all(|id| wal_ids.contains(id)),
+        "an acked insert is missing from the log"
+    );
+    assert!(
+        wal_ids.len() <= acked.len() + kills,
+        "{} log rows vs {} acked inserts and {kills} stall kills — \
+         the log holds rows the clients never could have acked",
+        wal_ids.len(),
+        acked.len()
     );
 }
 

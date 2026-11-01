@@ -81,11 +81,25 @@ fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
 #[test]
 fn single_routes_within_bound_numa_and_refuses_when_drained() {
     let fx = boot(NumaAffinity::Single);
+    let rt = &fx._rt;
+
+    // T5.3: publication lands on the serving housekeeper's ring
+    // (§10.1 step 7), concurrent with boot's return — this is the same
+    // signal the FR-6 gate reads, waited on directly.
+    wait_until(
+        || rt.tierc().load_full().is_some(),
+        "the boot publication lands on the serving catalog",
+    );
 
     // FR-10: routing reads the snapshot, and the snapshot's A13 pick is
     // NUMA 1 (one worker there vs two on NUMA 0).
     assert_eq!(
-        fx._rt.tierc().load().resolve(Some("dev")).bound_numa,
+        rt.tierc()
+            .load()
+            .as_ref()
+            .expect("boot published")
+            .resolve(Some("dev"))
+            .bound_numa,
         Some(1)
     );
 
@@ -93,7 +107,6 @@ fn single_routes_within_bound_numa_and_refuses_when_drained() {
     // NUMA's only worker.
     let _c1 = postgres::Client::connect(&url(&fx, "alice"), postgres::NoTls)
         .expect("first connection served");
-    let rt = &fx._rt;
     wait_until(
         || rt.workers()[2].active_connections() == 1,
         "connection lands on the bound NUMA 1 worker",
@@ -168,8 +181,17 @@ fn cross_routes_machine_wide() {
 #[test]
 fn cluster_default_is_inherited_by_dbs_without_explicit_affinity() {
     let fx = boot(NumaAffinity::Cross);
+    let rt = &fx._rt;
+    wait_until(
+        || rt.tierc().load_full().is_some(),
+        "the boot publication lands on the serving catalog",
+    );
     assert_eq!(
-        fx._rt.tierc().load().default_affinity(),
+        rt.tierc()
+            .load()
+            .as_ref()
+            .expect("boot published")
+            .default_affinity(),
         NumaAffinity::Cross,
         "snapshot carries the cluster default"
     );
@@ -178,7 +200,6 @@ fn cluster_default_is_inherited_by_dbs_without_explicit_affinity() {
     // `single_routes_within_bound_numa_and_refuses_when_drained`, same
     // layout, same client name). Counts settle between connects — see the
     // cross test for why.
-    let rt = &fx._rt;
     let mut c1 = postgres::Client::connect(&url(&fx, "u1"), postgres::NoTls)
         .expect("first connection");
     wait_until(|| rt.workers()[0].active_connections() == 1, "c1 on route 0");

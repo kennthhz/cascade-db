@@ -304,6 +304,36 @@ async fn reap_message<W: AsyncRead + Unpin>(
     res
 }
 
+/// One await-able window, interruptible by the reaper — [`reap_message`]
+/// generalized from the message read to the STATEMENT window (the stall
+/// rule's rescue path). The waker is re-stored on every poll, so the
+/// reaper's wake lands on the poll that is actually parked — mid-execute,
+/// mid-WAL, or mid-response-write, wherever the statement currently
+/// awaits. If the reaper condemned the connection during this window,
+/// returns `None`: the caller must close WITHOUT further protocol output
+/// (the wedged op may itself be a response write, so the stream's state
+/// is unknown) and let the ordinary FR-15 cleanup below run. `reap ==
+/// None` (reaping disabled) is the plain body, zero overhead.
+async fn rescoped<F: std::future::Future>(
+    reap: Option<&Rc<crate::reaper::ReapRegistry>>,
+    id: Option<crate::reaper::ConnId>,
+    body: F,
+) -> Option<F::Output> {
+    let (reg, id) = match (reap, id) {
+        (Some(r), Some(i)) => (r, i),
+        _ => return Some(body.await),
+    };
+    let mut inner = std::pin::pin!(body);
+    std::future::poll_fn(|cx| {
+        if reg.is_dropped(id) {
+            return std::task::Poll::Ready(None);
+        }
+        reg.store_waker(id, cx.waker());
+        std::future::Future::poll(inner.as_mut(), cx).map(Some)
+    })
+    .await
+}
+
 /// Per-connection environment handed to every session by its worker: the
 /// pieces of the shutdown protocol (T4.4) the session honors between
 /// statements. `draining` is §10.2 step 2b — once set, the *next*
@@ -383,154 +413,185 @@ pub async fn run(
     let mut sess = Session::new(table);
 
     loop {
-        let msg = match reap_message(reap.as_ref(), reap_id, &mut out.sink).await {
-            Ok(Some(m)) => m,
-            Ok(None) => break,
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                // Framing violation (bad length): answer, then close — the
-                // stream can no longer be trusted.
-                let err = PgError::new("08P01", format!("protocol violation: {e}"));
-                let _ = out.send_error(&err).await;
-                break;
-            }
-            Err(_) => break,
-        };
-        match msg.0 {
-            b'Q' => {
-                // §10.2 step 2b: draining refuses the *next* statement —
-                // anything already read before the flag was set still
-                // ran. Fatal severity, so the connection closes (PG
-                // semantics for 57P01), and FR-15's cleanup below runs.
-                if env.draining.load(Ordering::Relaxed) {
-                    let err = PgError::new(
-                        crate::shutdown::ADMIN_SHUTDOWN,
-                        "terminating connection: the server is shutting down",
-                    );
-                    let _ = out.send_error(&err).await;
-                    break;
-                }
-                // The drain's wait counts this statement as in-flight
-                // until its ReadyForQuery went out (§10.2 step 2c). The
-                // guard below balances the increment on EVERY exit —
-                // including a panic unwinding this task, which a manual
-                // decrement at the bottom would miss and which would stick
-                // the gauge above zero forever, silently turning every
-                // later shutdown into the deadline path (T4.4 review).
-                env.inflight.fetch_add(1, Ordering::Relaxed);
-                let _inflight = GaugeGuard(&env.inflight);
-                let mut closed = false;
-                // §10.2 step 2b's race window: the flag may have flipped
-                // between the check above and our increment. Re-check with
-                // the statement counted — the drain wait can then never
-                // declare victory over a statement it never saw.
-                if env.draining.load(Ordering::Relaxed) {
-                    let err = PgError::new(
-                        crate::shutdown::ADMIN_SHUTDOWN,
-                        "terminating connection: the server is shutting down",
-                    );
-                    let _ = out.send_error(&err).await;
-                    closed = true;
-                }
-                // Payload is one cstring — except the empty query, which has
-                // no payload at all and answers EmptyQueryResponse. The two
-                // framing failures answer and mark `closed`; `sql` is then
-                // unused.
-                let sql: &str = if closed || msg.1.is_empty() {
-                    ""
-                } else if let Some(nul) = msg.1.iter().position(|&b| b == 0) {
-                    match std::str::from_utf8(&msg.1[..nul]) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            let e = PgError::new("08P01", "query string is not UTF-8");
-                            let _ = out.send_error(&e).await;
-                            closed = true;
-                            ""
-                        }
+        let msg = reap_message(reap.as_ref(), reap_id, &mut out.sink).await;
+        // Everything after the read — framing refusals, the draining
+        // refusal, statement execution, and every response write — runs
+        // under ONE rescue wrapper: the reaper's stall rule (`rescoped`
+        // above) condemns a statement wedged past `stall_reap_ms` on an
+        // io_uring completion that never arrives (the socket-op sibling
+        // of cascade-wal's OP_WATCHDOG: the WAL ops are idempotent and
+        // re-issue, socket ops are neither, so the backend is killed —
+        // PG's own termination of a stuck backend), and this side aborts
+        // — `None` — closing through the ordinary FR-15 cleanup below
+        // instead of hanging forever. Every close the arms used to spell
+        // `break` maps to `true`; the loop breaks on anything but a
+        // clean `Some(false)`.
+        let close = rescoped(reap.as_ref(), reap_id, async {
+            match msg {
+                Ok(Some((b'Q', payload))) => {
+                    // §10.2 step 2b: draining refuses the *next* statement —
+                    // anything already read before the flag was set still
+                    // ran. Fatal severity, so the connection closes (PG
+                    // semantics for 57P01), and FR-15's cleanup below runs.
+                    if env.draining.load(Ordering::Relaxed) {
+                        let err = PgError::new(
+                            crate::shutdown::ADMIN_SHUTDOWN,
+                            "terminating connection: the server is shutting down",
+                        );
+                        let _ = out.send_error(&err).await;
+                        return true;
                     }
-                } else {
-                    let e = PgError::new("08P01", "unterminated query string");
-                    let _ = out.send_error(&e).await;
-                    closed = true;
-                    ""
-                };
-                if !closed {
-                    // Real PG: a multi-statement query string stops at the first
-                    // error; remaining statements are skipped, then RFB closes
-                    // the batch. An entirely empty query answers
-                    // EmptyQueryResponse.
-                    let stmts = crate::sql::split_statements(sql);
-                    let mut failed = false;
-                    if stmts.is_empty() {
-                        let _ = out.send(b'I', &[]).await;
+                    // The drain's wait counts this statement as in-flight
+                    // until its ReadyForQuery went out (§10.2 step 2c). The
+                    // guard below balances the increment on EVERY exit —
+                    // including a panic unwinding this task, which a manual
+                    // decrement at the bottom would miss and which would stick
+                    // the gauge above zero forever, silently turning every
+                    // later shutdown into the deadline path (T4.4 review).
+                    env.inflight.fetch_add(1, Ordering::Relaxed);
+                    let _inflight = GaugeGuard(&env.inflight);
+                    // The stall rule's clock starts here — the statement's
+                    // first await-able moment — and stops at the completion
+                    // touch below. A statement wedged past `stall_reap_ms`
+                    // (e.g. on a lost completion) is condemned even though
+                    // it is not parked in its read; the clock's clearing is
+                    // symmetric with the increment, and every other exit
+                    // path unregisters the entry outright (ReapGuard).
+                    if let (Some(r), Some(id)) = (reap.as_ref(), reap_id) {
+                        r.set_in_flight(id, true);
                     }
-                    for stmt_sql in stmts {
-                        if failed {
-                            break;
-                        }
-                        match crate::sql::parse(stmt_sql.trim()) {
-                            Ok(stmt) => {
-                                match execute(
-                                    &mut sess,
-                                    stmt,
-                                    &mut out,
-                                    &ctx,
-                                    &span,
-                                    &tenants,
-                                    &stats,
-                                    wal.as_ref(),
-                                    heap.as_ref(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        let _ = out.send_error(&e).await;
-                                        if sess.txn == TxnStatus::InTxn {
-                                            sess.txn = TxnStatus::Failed;
-                                        }
-                                        failed = true;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = out.send_error(&PgError::from(e)).await;
-                                if sess.txn == TxnStatus::InTxn {
-                                    sess.txn = TxnStatus::Failed;
-                                }
-                                failed = true;
-                            }
-                        }
-                    }
-                    if out.send(b'Z', &[sess.rfb_byte()]).await.is_err() {
+                    let mut closed = false;
+                    // §10.2 step 2b's race window: the flag may have flipped
+                    // between the check above and our increment. Re-check with
+                    // the statement counted — the drain wait can then never
+                    // declare victory over a statement it never saw.
+                    if env.draining.load(Ordering::Relaxed) {
+                        let err = PgError::new(
+                            crate::shutdown::ADMIN_SHUTDOWN,
+                            "terminating connection: the server is shutting down",
+                        );
+                        let _ = out.send_error(&err).await;
                         closed = true;
                     }
-                    // The statement just COMPLETED — the RFB is out. This
-                    // is where the reaper's idle clock resets: idle is
-                    // measured from last completion, never from connection
-                    // age (T4.5).
-                    if let (Some(r), Some(id)) = (reap.as_ref(), reap_id) {
-                        r.touch(id);
+                    // Payload is one cstring — except the empty query, which has
+                    // no payload at all and answers EmptyQueryResponse. The two
+                    // framing failures answer and mark `closed`; `sql` is then
+                    // unused.
+                    let sql: &str = if closed || payload.is_empty() {
+                        ""
+                    } else if let Some(nul) = payload.iter().position(|&b| b == 0) {
+                        match std::str::from_utf8(&payload[..nul]) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                let e = PgError::new("08P01", "query string is not UTF-8");
+                                let _ = out.send_error(&e).await;
+                                closed = true;
+                                ""
+                            }
+                        }
+                    } else {
+                        let e = PgError::new("08P01", "unterminated query string");
+                        let _ = out.send_error(&e).await;
+                        closed = true;
+                        ""
+                    };
+                    if !closed {
+                        // Real PG: a multi-statement query string stops at the first
+                        // error; remaining statements are skipped, then RFB closes
+                        // the batch. An entirely empty query answers
+                        // EmptyQueryResponse.
+                        let stmts = crate::sql::split_statements(sql);
+                        let mut failed = false;
+                        if stmts.is_empty() {
+                            let _ = out.send(b'I', &[]).await;
+                        }
+                        for stmt_sql in stmts {
+                            if failed {
+                                break;
+                            }
+                            match crate::sql::parse(stmt_sql.trim()) {
+                                Ok(stmt) => {
+                                    match execute(
+                                        &mut sess,
+                                        stmt,
+                                        &mut out,
+                                        &ctx,
+                                        &span,
+                                        &tenants,
+                                        &stats,
+                                        wal.as_ref(),
+                                        heap.as_ref(),
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {}
+                                        Err(e) => {
+                                            let _ = out.send_error(&e).await;
+                                            if sess.txn == TxnStatus::InTxn {
+                                                sess.txn = TxnStatus::Failed;
+                                            }
+                                            failed = true;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = out.send_error(&PgError::from(e)).await;
+                                    if sess.txn == TxnStatus::InTxn {
+                                        sess.txn = TxnStatus::Failed;
+                                    }
+                                    failed = true;
+                                }
+                            }
+                        }
+                        if out.send(b'Z', &[sess.rfb_byte()]).await.is_err() {
+                            closed = true;
+                        }
+                        // The statement just COMPLETED — the RFB is out. This
+                        // is where the reaper's idle clock resets: idle is
+                        // measured from last completion, never from connection
+                        // age (T4.5) — and where the stall clock stops.
+                        if let (Some(r), Some(id)) = (reap.as_ref(), reap_id) {
+                            r.set_in_flight(id, false);
+                            r.touch(id);
+                        }
                     }
+                    // `_inflight` (the gauge guard) drops here — or on the
+                    // early returns above, or on unwind — balancing the
+                    // increment.
+                    closed
                 }
-                // `_inflight` (the gauge guard) drops here — or on the
-                // break above, or on unwind — balancing the increment.
-                if closed {
-                    break;
+                // Terminate: clean client goodbye.
+                Ok(Some((b'X', _))) => true,
+                // Extended protocol or anything else desyncs our framing —
+                // respond and close rather than misread the stream (slice runs
+                // the simple protocol only, FR-16).
+                Ok(Some((t, _))) => {
+                    let e = PgError::new(
+                        "08P01",
+                        format!("protocol violation: unsupported message type {:?}", t),
+                    );
+                    let _ = out.send_error(&e).await;
+                    true
                 }
+                // EOF — or the idle reaper condemned the connection while it
+                // waited for the client; indistinguishable here, both close.
+                Ok(None) => true,
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => {
+                    // Framing violation (bad length): answer, then close — the
+                    // stream can no longer be trusted.
+                    let err = PgError::new("08P01", format!("protocol violation: {e}"));
+                    let _ = out.send_error(&err).await;
+                    true
+                }
+                Err(_) => true,
             }
-            // Terminate: clean client goodbye.
-            b'X' => break,
-            // Extended protocol or anything else desyncs our framing —
-            // respond and close rather than misread the stream (slice runs
-            // the simple protocol only, FR-16).
-            t => {
-                let e = PgError::new(
-                    "08P01",
-                    format!("protocol violation: unsupported message type {:?}", t),
-                );
-                let _ = out.send_error(&e).await;
-                break;
-            }
+        })
+        .await;
+        // `None` is the stall abort: close with no further protocol output
+        // (the wedged op may itself have been a response write);
+        // `Some(true)` is every ordinary close.
+        if close != Some(false) {
+            break;
         }
     }
     // Disconnect cleanup (FR-15): a mid-txn disconnect aborts. Pending rows
