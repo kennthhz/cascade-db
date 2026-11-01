@@ -44,6 +44,10 @@ pub struct ParseError {
 pub enum Stmt {
     Select(Select),
     Insert(Insert),
+    /// `CREATE ROLE name` — the modeled DDL shape (bare form only: options
+    /// like `WITH LOGIN` change what is created, and dropping them silently
+    /// would lie, so they stay `Unsupported`).
+    CreateRole { name: String },
     Begin,
     Commit,
     Rollback,
@@ -188,6 +192,7 @@ fn lower_stmt(raw: &pb::RawStmt) -> Stmt {
     match node {
         Node::SelectStmt(sel) => lower_select(sel),
         Node::InsertStmt(ins) => lower_insert(ins),
+        Node::CreateRoleStmt(rr) => lower_create_role(rr),
         Node::TransactionStmt(txn) => match txn.kind() {
             TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => Stmt::Begin,
             TransactionStmtKind::TransStmtCommit => Stmt::Commit,
@@ -199,6 +204,23 @@ fn lower_stmt(raw: &pb::RawStmt) -> Stmt {
         other => Stmt::Unsupported {
             command: unsupported_command(other).into(),
         },
+    }
+}
+
+/// The one CREATE ROLE shape modeled: bare `CREATE ROLE name` (ROLE
+/// statement kind, no options, non-empty name). `CREATE USER`/`CREATE
+/// GROUP` are distinct grammar productions with different semantics —
+/// named refusals, never folded into "create role".
+fn lower_create_role(rr: &pb::CreateRoleStmt) -> Stmt {
+    let unsupported = |command: &str| Stmt::Unsupported { command: command.into() };
+    match rr.stmt_type() {
+        pb::RoleStmtType::RolestmtRole => match (rr.role.as_str(), rr.options.as_slice()) {
+            (name, []) if !name.is_empty() => Stmt::CreateRole { name: name.to_owned() },
+            _ => unsupported("create role"),
+        },
+        pb::RoleStmtType::RolestmtUser => unsupported("create user"),
+        pb::RoleStmtType::RolestmtGroup => unsupported("create group"),
+        _ => unsupported("create role"),
     }
 }
 
@@ -459,6 +481,33 @@ mod tests {
                 table: "debug_table".into(),
                 values: vec![Value::Int(2), Value::Text("x".into())],
             })
+        );
+    }
+
+    #[test]
+    fn create_role_bare_form_models_the_name() {
+        assert_eq!(one("CREATE ROLE alice"), Stmt::CreateRole { name: "alice".into() });
+        assert_eq!(one("create role bob"), Stmt::CreateRole { name: "bob".into() });
+        // Quoted identifiers keep their case — the name is the text.
+        assert_eq!(one(r#"CREATE ROLE "Mixed""#), Stmt::CreateRole { name: "Mixed".into() });
+    }
+
+    #[test]
+    fn create_role_variants_outside_the_slice_name_their_command() {
+        // Options change what is created — refusing, not silently dropping.
+        assert_eq!(
+            one("CREATE ROLE alice WITH LOGIN"),
+            Stmt::Unsupported { command: "create role".into() }
+        );
+        // CREATE USER = CREATE ROLE + LOGIN; a different production, its
+        // own refusal name.
+        assert_eq!(
+            one("CREATE USER alice"),
+            Stmt::Unsupported { command: "create user".into() }
+        );
+        assert_eq!(
+            one("CREATE GROUP staff"),
+            Stmt::Unsupported { command: "create group".into() }
         );
     }
 

@@ -89,6 +89,7 @@ fn boot(wal: bool, tick_ms: u64, drain_deadline_s: u64) -> Fixture {
     };
     let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
     let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
     let checkpoint = rt.checkpoint_stats().cloned();
@@ -290,6 +291,7 @@ fn shutdown_without_a_listener_is_quiet() {
         }],
         ..RuntimeConfig::default()
     };
+    cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, None, AuthConfig::default(), None)
         .expect("compute-only boot");
     let report = rt.shutdown();
@@ -346,6 +348,7 @@ fn draining_session_refuses_the_next_statement_with_57p01() {
                     Arc::new(TenantCounters::new()),
                     None,
                     None,
+                    None, // no Tier C wiring: the drain drives this session, not DDL
                     64,
                     env,
                     None, // no reaper: the drain drives this session, not idle

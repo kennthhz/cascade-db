@@ -77,6 +77,13 @@ pub enum Stmt {
         filter: Option<i32>,
     },
     DebugWorker,
+    /// `SELECT debug_roles()` — the Tier C catalog's role names, read
+    /// from THIS reactor's snapshot (the pointer load is the read; T5.4).
+    DebugRoles,
+    /// `CREATE ROLE name` — the T5.4 DDL. Execution leaves the session:
+    /// the statement bounces through the Tier C writer (FR-29) and the
+    /// reply comes from its ack, never from local state.
+    CreateRole { name: String },
     Insert {
         id: i32,
         val: String,
@@ -140,6 +147,7 @@ fn resolve(stmt: &pgp::Stmt) -> Result<Stmt, SqlError> {
         }),
         pgp::Stmt::Insert(ins) => resolve_insert(ins),
         pgp::Stmt::Select(sel) => resolve_select(sel),
+        pgp::Stmt::CreateRole { name } => Ok(Stmt::CreateRole { name: name.clone() }),
     }
 }
 
@@ -160,14 +168,19 @@ fn resolve_insert(ins: &pgp::Insert) -> Result<Stmt, SqlError> {
 
 fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
     let Some(table) = &sel.from else {
-        // A bare SELECT (no FROM): the slice knows one — the debug
-        // function call. `SELECT 1` and friends parse; they are just not
-        // executable here.
+        // A bare SELECT (no FROM): the slice knows two — the debug
+        // function calls. `SELECT 1` and friends parse; they are just
+        // not executable here.
         return match (sel.targets.as_slice(), &sel.filter) {
             ([pgp::Target::Function { name }], None)
                 if name.eq_ignore_ascii_case("debug_worker") =>
             {
                 Ok(Stmt::DebugWorker)
+            }
+            ([pgp::Target::Function { name }], None)
+                if name.eq_ignore_ascii_case("debug_roles") =>
+            {
+                Ok(Stmt::DebugRoles)
             }
             _ => Err(SqlError::Unsupported { command: "select".into() }),
         };
@@ -275,6 +288,16 @@ mod tests {
             "debug_table's columns do not exist on demo"
         );
         assert_eq!(parse("SELECT debug_worker()"), Ok(Stmt::DebugWorker));
+        assert_eq!(parse("select DEBUG_ROLES()"), Ok(Stmt::DebugRoles));
+        // The T5.4 DDL resolves to the engine statement the session
+        // bounces through the Tier C writer.
+        assert_eq!(
+            parse("CREATE ROLE alice"),
+            Ok(Stmt::CreateRole { name: "alice".into() })
+        );
+        // Options are refused upstream as 0A000 (parsed, unmodeled) —
+        // the parser's boundary, restated here as a code pin.
+        assert_eq!(parse("CREATE ROLE alice WITH LOGIN").unwrap_err().code(), "0A000");
         assert_eq!(
             parse("INSERT INTO debug_table VALUES (1, 'hello')"),
             Ok(Stmt::Insert { id: 1, val: "hello".into() })

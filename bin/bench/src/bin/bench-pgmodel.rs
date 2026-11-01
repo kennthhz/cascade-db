@@ -67,6 +67,11 @@ struct Engine {
     pending: Vec<(i32, String)>,
     txn_open: bool,
     txn_failed: bool,
+    /// Modeled cluster roles (T5.4's DDL): PG refuses duplicates with
+    /// 42710, so a set. Per-backend process — the bench forks one backend
+    /// per connection, and its DDL workloads are single-connection, so
+    /// the model never lies where it is measured.
+    roles: std::collections::BTreeSet<String>,
 }
 
 fn main() {
@@ -462,6 +467,33 @@ fn execute(
                 rows: rendered,
                 tag,
             })
+        }
+        Stmt::DebugRoles => {
+            // Same wire shape as cascade's debug_roles(): one TEXT column,
+            // sorted names, `SELECT n` — the perf comparison stays
+            // apples-to-apples if a DDL check ever rides the workload.
+            let rows: Vec<Vec<u8>> = eng
+                .roles
+                .iter()
+                .map(|name| data_row(&[name.as_bytes().to_vec()]))
+                .collect();
+            let mut desc = (1i16).to_be_bytes().to_vec();
+            desc.extend(field("role", 25, -2));
+            let tag = format!("SELECT {}", rows.len());
+            Ok(Reply::Select {
+                desc,
+                rows,
+                tag,
+            })
+        }
+        Stmt::CreateRole { name } => {
+            // The modeled DDL: instant apply, duplicate refused with PG's
+            // duplicate_object — the same contract cascade's writer gives.
+            if eng.roles.contains(&name) {
+                return Err(("42710".into(), format!("role \"{name}\" already exists")));
+            }
+            eng.roles.insert(name);
+            Ok(Reply::Tag("CREATE ROLE"))
         }
         Stmt::DebugWorker => {
             // The architectural tell: cascade answers with the reactor

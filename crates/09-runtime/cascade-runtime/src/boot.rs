@@ -78,6 +78,10 @@ pub struct Runtime {
     /// T2.4, T5.2). The single writer + `submit_to` fan-out arrive with
     /// T5.3; live catalog updates with T5.5.
     tierc: Arc<Catalog>,
+    /// The Tier C write channels' debug counters (T5.4, FR-36) — one per
+    /// worker, config order. Their `submitted` counter is the
+    /// zero-`submit_to` probe's read: OLTP must never move it.
+    tierc_write_stats: Vec<Arc<crate::submit::SubmitStats>>,
     /// The orchestrator tick-loop observables (T4.1), present only when a
     /// listener was given — D9 centralizes background work on the
     /// *serving* housekeeper, so a compute-only boot never ticks.
@@ -389,6 +393,10 @@ impl Runtime {
             tierc_publish_inits.push(pinit);
             tierc_publish_receivers.push(prx);
         }
+        // The Runtime's probe handle on the write channels (T5.4, FR-36):
+        // the SAME Arcs the plane's forwarders count into, kept one clone
+        // behind for the zero-submit_to read.
+        let tierc_write_stats_runtime = tierc_write_stats.clone();
         let tierc_plane = TierCPlane {
             catalog: Arc::new(Catalog::empty()),
             worker_catalogs: tierc_worker_catalogs.clone(),
@@ -801,6 +809,7 @@ impl Runtime {
             wal_homes,
             pools,
             tierc,
+            tierc_write_stats: tierc_write_stats_runtime,
             demo_heap,
             orchestrator: orchestrator_stats,
             checkpoint: checkpoint_stats,
@@ -917,6 +926,15 @@ impl Runtime {
     /// arrives with T5.3; live catalog updates with T5.5.
     pub fn tierc(&self) -> &Arc<Catalog> {
         &self.tierc
+    }
+
+    /// The Tier C write channels' debug counters (T5.4, FR-36): one per
+    /// worker in config order, the same `Arc`s the serving side's
+    /// forwarders count into. `submitted` moves ONLY when a DDL change
+    /// crosses a write channel — the zero-`submit_to` probe reads it
+    /// over an OLTP workload and expects zero movement.
+    pub fn tierc_write_stats(&self) -> &[Arc<crate::submit::SubmitStats>] {
+        &self.tierc_write_stats
     }
 
     /// §10.2 graceful shutdown (T4.4, FR-8) — the caller's half, consuming
@@ -1326,7 +1344,14 @@ fn spawn_workers(
                 // the handoff loop below refuses every connection (FR-6)
                 // instead of serving from an absent snapshot.
                 let task_catalog = tierc_catalog;
-                let _tierc_write = tierc_write_init.connect().await;
+                // The write funnel route (T5.4): this worker's sessions
+                // submit DDL through it — the closure crosses to the
+                // serving housekeeper's ring, where the funnel
+                // thread_local lives. In a compute boot the receiving
+                // half dropped with the plane (the parked housekeeper
+                // never serves), so connects resolve dead and submits
+                // would report Lost — sessions never run there anyway.
+                let tierc_write = tierc_write_init.connect().await;
                 let tierc_publish = tierc_publish_rx.connect().await;
                 glommio::spawn_local(crate::submit::submit_loop(
                     tierc_publish,
@@ -1358,7 +1383,13 @@ fn spawn_workers(
                         handle: Rc::clone(handle),
                     });
                     glommio::spawn_local(crate::session::run(
-                        handoff, table, counter, tenants, wal, heap, batch_rows,
+                        handoff, table, counter, tenants, wal, heap,
+                        Some(crate::session::Tierc {
+                            write: tierc_write.clone(),
+                            core,
+                            catalog: Arc::clone(&task_catalog),
+                        }),
+                        batch_rows,
                         task_env.clone(),
                         task_reap_registry.as_ref().map(Rc::clone),
                     ))

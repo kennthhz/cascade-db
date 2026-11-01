@@ -31,6 +31,7 @@ use crate::{
     handoff::Handoff,
     sql::{Col, SqlError, Stmt, TableKind},
     tenant::{dev_context, TenantCounters},
+    tierc::TierCAck,
 };
 
 // FR-14, compile-enforced: if this ever starts to fail, connection state
@@ -334,6 +335,18 @@ async fn rescoped<F: std::future::Future>(
     .await
 }
 
+/// The session's Tier C wiring (T5.4), handed over by its worker: the
+/// write-funnel route (the DDL bounce's first hop — FR-29), this
+/// reactor's core id (the fan-out's issuer-first ordering key), and the
+/// worker's own catalog (the pointer-load read behind `debug_roles()`).
+/// All three are ring-local by construction — the handle is `Rc`-based,
+/// the catalog is an `Arc` read only from this ring.
+pub struct Tierc {
+    pub(crate) write: crate::submit::SubmitHandle,
+    pub(crate) core: u32,
+    pub(crate) catalog: std::sync::Arc<crate::tierc::Catalog>,
+}
+
 /// Per-connection environment handed to every session by its worker: the
 /// pieces of the shutdown protocol (T4.4) the session honors between
 /// statements. `draining` is §10.2 step 2b — once set, the *next*
@@ -386,6 +399,7 @@ pub async fn run(
     tenants: Arc<TenantCounters>,
     wal: Option<Wal>,
     heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
+    tierc: Option<Tierc>,
     batch_rows: u32,
     env: SessionEnv,
     reap: Option<Rc<crate::reaper::ReapRegistry>>,
@@ -521,6 +535,7 @@ pub async fn run(
                                         &stats,
                                         wal.as_ref(),
                                         heap.as_ref(),
+                                        tierc.as_ref(),
                                     )
                                     .await
                                     {
@@ -626,6 +641,7 @@ async fn execute<W: AsyncWrite + Unpin>(
     stats: &crate::stats::WorkerCounters,
     wal: Option<&Wal>,
     heap: Option<&std::sync::Arc<crate::demoheap::DemoHeap>>,
+    tierc: Option<&Tierc>,
 ) -> Result<(), PgError> {
     // The hot-path shape (FR-20/FR-21): context and span borrowed, per
     // statement, nothing global.
@@ -785,6 +801,99 @@ async fn execute<W: AsyncWrite + Unpin>(
             out.flush().await.map_err(io_err)?;
             send_tag(out, "SELECT 1").await
         }
+        Stmt::DebugRoles => {
+            // T5.4's observable: the role names live in THIS reactor's
+            // Tier C snapshot. The read is the FR-28 pointer copy —
+            // names are extracted synchronously inside the guard's
+            // scope (a Guard never spans an .await), then the wire
+            // writes happen from the owned Vec. No invalidation exists
+            // in the system: a role appears here exactly when this
+            // reactor's catalog adopted a newer snapshot, which is the
+            // property the DDL test asserts across workers.
+            let Some(tierc) = tierc else {
+                return Err(PgError::new(
+                    "58000",
+                    "the Tier C catalog is not wired to this session",
+                ));
+            };
+            let names: Vec<String> = {
+                let guard = tierc.catalog.load();
+                let Some(snap) = guard.as_ref() else {
+                    return Err(PgError::new(
+                        crate::tierc::CANNOT_CONNECT_NOW,
+                        "the database system is starting up",
+                    ));
+                };
+                snap.roles().map(str::to_owned).collect()
+            };
+            out.send(b'T', &debug_roles_description())
+                .await
+                .map_err(io_err)?;
+            for name in &names {
+                out.row(&[name.as_bytes()]);
+            }
+            out.flush().await.map_err(io_err)?;
+            send_tag(out, &format!("SELECT {}", names.len())).await
+        }
+        Stmt::CreateRole { name } => {
+            // FR-29's DDL path (T5.4): the statement LEAVES the session —
+            // it bounces through the write channel to the serialized Tier
+            // C writer, and the reply is built from the writer's ack.
+            // Nothing role-shaped is decided, cached, or stored here.
+            //
+            // In a transaction block it is refused: the writer applies at
+            // once, so pretending the change would roll back with the
+            // block would lie — the same refusal PG gives statements that
+            // cannot join a block (25001).
+            if sess.txn == TxnStatus::InTxn {
+                return Err(PgError::new(
+                    "25001",
+                    "CREATE ROLE cannot run inside a transaction block",
+                ));
+            }
+            let Some(tierc) = tierc else {
+                return Err(PgError::new(
+                    "58000",
+                    "the Tier C mutation path is not wired to this session",
+                ));
+            };
+            let issuer = tierc.core;
+            let change = crate::tierc::TierCChange::CreateRole { name };
+            // The T5.1 crossing: the closure (issuer + change) rides the
+            // write channel to the serving housekeeper; the future runs
+            // THERE (the funnel is a thread_local on that ring) and only
+            // the ack comes back. This is the query path's ONLY submit_to
+            // — OLTP never takes this arm (FR-36, pinned by the
+            // zero-submit_to probe in tests/ddl.rs).
+            match tierc
+                .write
+                .submit_to(move || async move { crate::tierc::submit_change(issuer, change).await })
+                .await
+            {
+                // Both confirmations answer CREATE ROLE: the change IS in
+                // the writer's state and stored on THIS reactor (the
+                // issuer's store is awaited first); Pending only names
+                // laggards elsewhere, whose stores land lazily — never
+                // lost.
+                Ok(Ok(TierCAck::Applied)) | Ok(Ok(TierCAck::Pending(_))) => {
+                    send_tag(out, "CREATE ROLE").await
+                }
+                // The writer refused the change (e.g. duplicate role,
+                // 42710): its snapshot is unchanged, nothing fanned out,
+                // and the client gets the writer's own SQLSTATE.
+                Ok(Ok(TierCAck::Failed(e))) => {
+                    let (code, message) = e.pg();
+                    Err(PgError::new(code, message))
+                }
+                // The transport lost the round trip (writer gone,
+                // funnel refused, ring dead): honest failure at the
+                // caller — nothing half-applied anywhere.
+                Ok(Err(e)) | Err(e) => Err(PgError::new(
+                    "58000",
+                    format!("the Tier C writer did not confirm the change: {e}"),
+                )),
+            }
+        }
     }
 }
 
@@ -918,6 +1027,12 @@ async fn demo_select<W: AsyncWrite + Unpin>(
 fn debug_worker_description() -> Vec<u8> {
     let mut payload = 1i16.to_be_bytes().to_vec();
     payload.extend(field("debug_worker", TEXT_OID, -2));
+    payload
+}
+
+fn debug_roles_description() -> Vec<u8> {
+    let mut payload = 1i16.to_be_bytes().to_vec();
+    payload.extend(field("role", TEXT_OID, -2));
     payload
 }
 

@@ -22,6 +22,7 @@ use std::{
         atomic::Ordering,
         Arc,
     },
+    time::Duration,
 };
 
 use glommio::{
@@ -177,8 +178,10 @@ impl Router {
     /// Runs an unpinned glommio executor on the calling thread for the
     /// sender-side channel connects and the Tier C writer (T5.3: the
     /// serialized mutation path runs here, and its boot publication gates
-    /// the accept loop — FR-6); after that, the loop is plain
-    /// blocking I/O and the ring idles between events.
+    /// the accept loop — FR-6); after that the loop is plain blocking
+    /// I/O that yields once per pass so the ring's OTHER tasks — the
+    /// writer and its forwarders, which serve the DDL bounce (T5.4,
+    /// FR-29) — keep running between accepts.
     #[allow(clippy::too_many_arguments)]
     pub fn serve(
         listener: AcceptLoop,
@@ -314,11 +317,37 @@ impl Router {
 
             let (stats, listener) = listener.into_parts();
             loop {
+                // The ring is not ours alone: the Tier C writer (FR-29) and
+                // its write-channel forwarders live HERE, and the accept
+                // pass itself is blocking I/O that never awaits. One
+                // delegation per pass is what lets a DDL change cross the
+                // funnel and its ack come back; without it the writer sat
+                // unpolled forever behind the accept loop (the T5.4 bug:
+                // a session awaiting the ack wedged until the stall rule
+                // killed it). When no sibling has work, a no-op.
+                glommio::yield_if_needed().await;
                 // One wakeup = one accept(2) return, timed out or not. The
                 // idle-rate observable for FR-5/T4.1: an idle server wakes
                 // ~once per tick — a `loop {}` would show millions.
                 wakeups.fetch_add(1, Ordering::Relaxed);
-                crate::accept::set_recv_timeout(&listener, orchestrator.until_next())
+                // The serving quantum: every cross-ring stage of the DDL
+                // bounce (the write forwarder, the writer's budgeted
+                // fan-out wait, the ack) resumes only when an accept
+                // return hands the ring back to its other tasks, so a
+                // tick-paced park would pace the whole bounce at the tick
+                // interval — measured at ~6 s per CREATE ROLE under the
+                // 1 s default tick, which quietly broke R11's bounded
+                // ack. The quantum bounds it at a few tens of ms instead;
+                // ticks still fire exactly, via `poll_due` on every
+                // return — only the idle WAKEUP RATE rises to the quantum
+                // when `tick_ms` exceeds it (fixtures ticking at or below
+                // 50 ms — where the FR-5 wakeups ≈ ticks assertions live —
+                // are unaffected: their `until_next` is already the
+                // quantum). The endgame is an async accept whose awaits
+                // let task wakers through directly; until then, this.
+                const SERVING_QUANTUM: Duration = Duration::from_millis(50);
+                let park = orchestrator.until_next().min(SERVING_QUANTUM);
+                crate::accept::set_recv_timeout(&listener, park)
                     .expect("SO_RCVTIMEO set");
                 let mut stream = match listener.accept() {
                     Ok((s, _)) => s,

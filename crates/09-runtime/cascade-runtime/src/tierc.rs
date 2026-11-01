@@ -126,6 +126,10 @@ pub struct ClusterSnapshot {
     /// Per-database affinity rows (FR-10). Names absent from the map —
     /// and `None` — inherit the cluster default.
     databases: std::collections::BTreeMap<String, DbRow>,
+    /// Cluster-wide role names (T5.4's CREATE ROLE-class DDL). A set —
+    /// duplicates are the writer's refusal (42710), so entries are unique
+    /// by construction. Sorted iteration for stable wire output.
+    roles: std::collections::BTreeSet<String>,
 }
 
 impl ClusterSnapshot {
@@ -143,6 +147,7 @@ impl ClusterSnapshot {
             default_affinity,
             default_bound,
             databases: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeSet::new(),
         }
     }
 
@@ -161,6 +166,14 @@ impl ClusterSnapshot {
     /// The cluster default the snapshot was built with (diagnostics).
     pub fn default_affinity(&self) -> NumaAffinity {
         self.default_affinity
+    }
+
+    /// The cluster's role names (T5.4), sorted — the read side of the
+    /// CREATE ROLE-class DDL. Served from whichever snapshot a pointer
+    /// load produced: no invalidation, no callback — a reactor learns a
+    /// new role exactly when its catalog adopts a newer snapshot.
+    pub fn roles(&self) -> impl Iterator<Item = &str> {
+        self.roles.iter().map(String::as_str)
     }
 }
 
@@ -271,14 +284,39 @@ pub(crate) const TIERC_WRITE_CAP: usize = 16;
 pub(crate) const TIERC_PUBLISH_CAP: usize = 64;
 
 /// A Tier C change request (FR-29): the serialized writer applies these,
-/// one at a time. T5.5's DDL surface grows the variants; today the only
-/// change is setting a database's affinity.
+/// one at a time. Grew its first DDL variant in T5.4.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TierCChange {
     /// Binds `name` to `affinity` (FR-10's per-DB rows, name-keyed
     /// until T5.5). `Single` picks its bound NUMA per A13 at apply time —
     /// the least-loaded NUMA when the change lands.
     SetDatabaseAffinity { name: String, affinity: NumaAffinity },
+    /// Creates a cluster role (T5.4, FR-29's DDL path). Applied against
+    /// the writer's [`ClusterState`], published whole, and visible to
+    /// every reactor through its next pointer load — no cache
+    /// invalidation anywhere.
+    CreateRole { name: String },
+}
+
+/// Why the writer refused a change: the apply failed against the current
+/// state, and the snapshot is UNCHANGED — nothing published, no fan-out,
+/// nothing to roll back (the refusal happens before the state moves).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyError {
+    /// A role with this name already exists — PG's `duplicate_object`.
+    DuplicateRole { name: String },
+}
+
+impl ApplyError {
+    /// The SQLSTATE + message pair the wire carries for this refusal.
+    pub fn pg(&self) -> (&'static str, String) {
+        match self {
+            ApplyError::DuplicateRole { name } => (
+                "42710",
+                format!("role \"{name}\" already exists"),
+            ),
+        }
+    }
 }
 
 /// R11's mutation result. `Applied` when every reactor confirmed its
@@ -286,11 +324,13 @@ pub enum TierCChange {
 /// count otherwise. Pending never means lost: the laggards' store jobs
 /// are queued in their publication channels and land when those rings
 /// drain (lazy adoption on the next pointer load) — the budget bounds
-/// only the WRITER's wait, never the delivery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// only the WRITER's wait, never the delivery. `Failed` is the refused
+/// apply: the snapshot is unchanged and no fan-out ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TierCAck {
     Applied,
     Pending(u32),
+    Failed(ApplyError),
 }
 
 /// The writer's in-memory Tier C state — the ONE mutable copy (FR-29:
@@ -312,10 +352,12 @@ impl ClusterState {
     }
 
     /// Applies one change in place (single-threaded by construction —
-    /// nothing else holds this state). `single` binds per A13, the same
-    /// least-loaded proxy boot uses; T5.6's live load view replaces the
-    /// proxy.
-    fn apply(&mut self, change: &TierCChange) {
+    /// nothing else holds this state), or refuses it: `Err` means the
+    /// state is EXACTLY as it was (every variant validates before its
+    /// first mutation, so a refusal can never leave a half-applied
+    /// change behind). `single` binds per A13, the same least-loaded
+    /// proxy boot uses; T5.6's live load view replaces the proxy.
+    fn apply(&mut self, change: &TierCChange) -> Result<(), ApplyError> {
         match change {
             TierCChange::SetDatabaseAffinity { name, affinity } => {
                 let bound_numa = match affinity {
@@ -329,6 +371,14 @@ impl ClusterState {
                         bound_numa,
                     },
                 );
+                Ok(())
+            }
+            TierCChange::CreateRole { name } => {
+                if self.current.roles.contains(name) {
+                    return Err(ApplyError::DuplicateRole { name: name.clone() });
+                }
+                self.current.roles.insert(name.clone());
+                Ok(())
             }
         }
     }
@@ -506,12 +556,22 @@ async fn writer_loop(
 
     while let Some(cmd) = cmds.recv().await {
         let WriteCmd::Apply(issuer, change, ack) = cmd;
-        state.apply(&change);
-        let snap = state.publish();
-        // Own catalog first — the router on this ring serves the next
-        // connection from it even before the fan-out confirms.
-        catalog.store(Arc::clone(&snap));
-        let ack_value = fan_out(&handles, Some(issuer), &snap, budget).await;
+        // The ack is ALWAYS last and the stores ALWAYS follow one
+        // successful apply: a refused change (Failed) publishes nothing
+        // and fans nothing out — the ack travels alone. The ordering is
+        // R11's contract: no caller ever learns "applied" from anything
+        // but a completed store sequence.
+        let ack_value = match state.apply(&change) {
+            Ok(()) => {
+                let snap = state.publish();
+                // Own catalog first — the router on this ring serves the
+                // next connection from it even before the fan-out
+                // confirms.
+                catalog.store(Arc::clone(&snap));
+                fan_out(&handles, Some(issuer), &snap, budget).await
+            }
+            Err(e) => TierCAck::Failed(e),
+        };
         let _ = ack.send(ack_value);
     }
 }
@@ -652,6 +712,7 @@ mod tests {
             default_affinity: NumaAffinity::Single,
             default_bound: bound,
             databases: std::collections::BTreeMap::new(),
+            roles: std::collections::BTreeSet::new(),
         }
     }
 
@@ -700,6 +761,54 @@ mod tests {
                 bound_numa: None
             }
         );
+    }
+
+    /// T5.4's apply contract, on the writer's own state: a CreateRole
+    /// applies and publishes into `roles`; a duplicate is REFUSED with
+    /// the 42710 error and leaves the state exactly as it was (no
+    /// half-applied residue, no second entry) — the review bullet's
+    /// "partial-failure" case, pinned at the state layer.
+    #[test]
+    fn create_role_applies_once_and_refuses_duplicates_without_mutation() {
+        let mut state = ClusterState::from_boot(
+            ClusterSnapshot::build(NumaAffinity::Cross, &[0]),
+            vec![0],
+        );
+        state
+            .apply(&TierCChange::CreateRole { name: "alice".into() })
+            .expect("first create applies");
+        assert_eq!(state.current.roles.iter().collect::<Vec<_>>(), ["alice"]);
+
+        let err = state
+            .apply(&TierCChange::CreateRole { name: "alice".into() })
+            .expect_err("duplicate is refused");
+        assert_eq!(
+            err,
+            ApplyError::DuplicateRole { name: "alice".into() }
+        );
+        assert_eq!(err.pg(), ("42710", "role \"alice\" already exists".into()));
+        // The refusal mutated nothing: still exactly one role, and the
+        // affinity half untouched.
+        assert_eq!(state.current.roles.iter().collect::<Vec<_>>(), ["alice"]);
+        assert!(state.current.databases.is_empty());
+
+        // Roles and affinity rows coexist; each stays in its own half.
+        state
+            .apply(&TierCChange::CreateRole { name: "bob".into() })
+            .expect("second role applies");
+        state
+            .apply(&TierCChange::SetDatabaseAffinity {
+                name: "dev".into(),
+                affinity: NumaAffinity::Single,
+            })
+            .expect("affinity row applies");
+        assert_eq!(
+            state.current.roles.iter().collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert_eq!(state.current.databases.len(), 1);
+        // Sorted, for stable wire output.
+        assert_eq!(state.publish().roles().collect::<Vec<_>>(), ["alice", "bob"]);
     }
 
     /// The T5.2 race test, with real interleaving forced and asserted: a
