@@ -342,7 +342,7 @@ fn draining_session_refuses_the_next_statement_with_57p01() {
                         database: Some("dev".into()),
                     },
                     Rc::new(Table::default()),
-                    Arc::new(AtomicU64::new(0)),
+                    Arc::new(cascade_runtime::WorkerCounters::new()),
                     Arc::new(TenantCounters::new()),
                     None,
                     None,

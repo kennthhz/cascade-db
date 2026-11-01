@@ -133,17 +133,20 @@ pub struct Worker {
     pool: usize,
     /// §10.1 step 6b (FR-37): the arena this reactor reserved in-task.
     arena_bytes: u64,
-    counter: Arc<AtomicU64>,
+    /// This reactor's counter set (T4.6): the connection gauge the
+    /// router reads, plus the pg_stat_database-style tallies
+    /// `Runtime::stats()` sums on read (FR-33).
+    stats: Arc<crate::stats::WorkerCounters>,
     tenant_counters: Arc<TenantCounters>,
     stall: Arc<ReactorStall>,
     join: ExecutorJoinHandle<()>,
 }
 
 impl Worker {
-    /// Live connections on this reactor — the same counter the router reads
+    /// Live connections on this reactor — the same gauge the router reads
     /// for least-loaded routing (FR-11 count component; FR-15 decrement).
     pub fn active_connections(&self) -> u64 {
-        self.counter.load(Ordering::Relaxed)
+        self.stats.connections.load(Ordering::Relaxed)
     }
 
     /// Per-tenant counters recorded by this reactor's sessions (FR-20).
@@ -310,15 +313,18 @@ impl Runtime {
         let cmdline = std::fs::read_to_string("/proc/cmdline").ok();
         deployment::verify_and_log(cfg, cmdline.as_deref());
 
-        // One handoff channel + one live-connection counter per worker,
-        // in config order. The router reads the counters; the workers own
-        // the receivers.
+        // One handoff channel + one per-core counter set per worker, in
+        // config order. The router reads the connection gauge for
+        // least-loaded routing; every session's tallies land on exactly
+        // one set (connections are pinned for life — invariant 2), and
+        // the aggregate is summed on read (T4.6, FR-33).
         let n_workers: usize = cfg.worker_cores.iter().map(|w| w.cores.len()).sum();
         let mut senders = Vec::with_capacity(n_workers);
         let mut receivers = Vec::with_capacity(n_workers);
         let mut control_tx = Vec::with_capacity(n_workers);
         let mut control_rx = Vec::with_capacity(n_workers);
-        let mut counters: Vec<Arc<AtomicU64>> = Vec::with_capacity(n_workers);
+        let mut counters: Vec<Arc<crate::stats::WorkerCounters>> =
+            Vec::with_capacity(n_workers);
         let mut tenant_counters: Vec<Arc<TenantCounters>> = Vec::with_capacity(n_workers);
         let mut stalls: Vec<Arc<ReactorStall>> = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
@@ -328,7 +334,7 @@ impl Runtime {
             receivers.push(rx);
             control_tx.push(ctx);
             control_rx.push(crx);
-            counters.push(Arc::new(AtomicU64::new(0)));
+            counters.push(Arc::new(crate::stats::WorkerCounters::new()));
             tenant_counters.push(Arc::new(TenantCounters::new()));
             stalls.push(Arc::new(ReactorStall::new()));
         }
@@ -782,6 +788,17 @@ impl Runtime {
         self.reap.as_ref()
     }
 
+    /// The summed-on-read aggregate (T4.6, FR-33): every worker's
+    /// per-core counter set, summed at the call instant — connections,
+    /// statements, commits, rollbacks. The staged form of the spec's
+    /// `submit_to` fan-in read (T5.1 will ask each reactor for its own
+    /// slice; the counters' Arc-atomic substrate makes the direct sum
+    /// exact in the meantime — see `crate::stats`).
+    pub fn stats(&self) -> crate::stats::StatsSnapshot {
+        let counters: Vec<_> = self.workers.iter().map(|w| Arc::clone(&w.stats)).collect();
+        crate::stats::StatsSnapshot::sum(&counters)
+    }
+
     /// The WAL-truncatable frontier (T4.2/FR-31, consumed by the T4.3
     /// recycler): WAL strictly below this LSN is reclaimable. `None`
     /// without a WAL; `Some(Lsn(0))` means nothing is reclaimable — the
@@ -951,7 +968,7 @@ fn spawn_housekeepers(
     auth: AuthConfig,
     senders: Vec<SharedSender<Handoff>>,
     worker_numas: Vec<u32>,
-    counters: Vec<Arc<AtomicU64>>,
+    counters: Vec<Arc<crate::stats::WorkerCounters>>,
     tierc: Arc<TierCSnapshot>,
     tick_init: Option<crate::orchestrator::OrchestratorInit>,
     designated: Vec<(u32, SharedSender<ControlMsg>)>,
@@ -1071,7 +1088,7 @@ fn spawn_workers(
     checkpoint_passes: &Arc<AtomicU64>,
     recycle_passes: &Arc<AtomicU64>,
     recycle_reclaimed: &Arc<AtomicU64>,
-    counters: &[Arc<AtomicU64>],
+    counters: &[Arc<crate::stats::WorkerCounters>],
     tenant_counters: &[Arc<TenantCounters>],
     stalls: &[Arc<ReactorStall>],
     wal: Option<&Arc<WalWriter>>,
@@ -1250,7 +1267,7 @@ fn spawn_workers(
             core,
             pool,
             arena_bytes: 0,
-            counter: Arc::clone(counter),
+            stats: Arc::clone(counter),
             tenant_counters: Arc::clone(tenant_counters),
             stall: Arc::clone(stall),
             join,

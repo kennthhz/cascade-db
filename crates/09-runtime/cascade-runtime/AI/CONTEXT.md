@@ -278,7 +278,49 @@ condemned across workers; `None` when disabled or listenerless).
 Review follow-ups acknowledged, not T4.5: the session's connection
 counter decrement (`session.rs`) is a manual line rather than an RAII
 guard — the same unwind discipline ReapGuard/GaugeGuard follow would
-apply to it.
+apply to it. T4.6's review extends the same class: the FR-15 tail's
+`rollbacks` increment (`session.rs`) is a second manual line beside it
+— a panicking mid-txn session undercounts rollbacks as well as leaking
+the gauge; one RAII tail guard would cover both.
+
+**Statistics collector (T4.6, FR-33) — per-core counters, summed on
+read.** `src/stats.rs`: each worker owns a `WorkerCounters` set (§4
+Tier B — `Arc`-shared atomics), created in boot's per-core loop and
+`Arc`-cloned only into that reactor's router route, session tasks, and
+the read-side sum; attribution is by construction (a connection is
+pinned for life to one ring, invariant 2) and nothing on a session's
+hot path ever touches another core's counters. Semantics track
+pg_stat_database's per-database tallies: `connections` is the live
+gauge the router's least-loaded pick reads (FR-11) — the same set
+doubles as the routing counter, one source of truth;
+`statements` counts at `execute()` entry (attempted — parse errors
+never reach the engine; empty statements are protocol no-ops and are
+NOT counted, PG parity); `commits` counts explicit `COMMIT` of an open
+txn plus autocommit writes (each INSERT its own transaction, PG
+parity); `rollbacks` counts explicit `ROLLBACK`, the 25P02
+`COMMIT`-acts-as-`ROLLBACK` path, a failed autocommit write's aborted
+implicit transaction (counted at the failure — the txn never left
+Idle, so no later path would count it; a failed explicit COMMIT is the
+mirror case: its txn is still InTxn and deterministically ends in
+exactly one counted rollback downstream), and the FR-15 mid-txn
+disconnect cleanup (the same tail the reaper's sessions exit through —
+T4.5's reap path shows up here too). The aggregate exists ONLY in
+`StatsSnapshot`, materialized by `Runtime::stats()` summing the
+per-core sets in one pass with Relaxed loads — sound without a fence
+because every counter is monotonic (a snapshot is a lower bound at its
+read instant; none can go backwards). The read is the STAGED stand-in
+for §6.1's `submit_to` fan-in (ask each reactor to produce its own
+slice, which is what would make these Tier A): T5.1 is not built, so
+the sum reads the shared atomics directly from the caller — correct on
+the §4 Tier B substrate, documented as the deviation, same discipline
+as the checkpointer's staged control channel. Tests answer the plan's
+review question with real traffic, not synthetic sums: one real txn
+per worker with the split OBSERVED (least-loaded pick, per-worker
+gauges assert exactly two reactors at load 1) and exact totals — any
+double count in the plumbing (boot double registration, worker vs
+router sharing, summing one set twice) breaks an equality; plus a
+150-statement benchmark-sized workload with exact totals and the
+abandoned-mid-txn rollback through the FR-15 tail.
 
 ## Open Design Questions
 

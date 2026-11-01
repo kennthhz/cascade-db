@@ -25,6 +25,7 @@ pub mod router;
 pub mod scram;
 pub mod session;
 pub mod shutdown;
+pub mod stats;
 pub mod sql;
 pub mod tenant;
 pub mod tierc;
@@ -47,6 +48,7 @@ pub use shutdown::{
     drain_loop, run_drain, send_final_flush, DrainMsg, FinalFlushCtx, ServingShutdown,
     ShutdownTrace,
 };
+pub use stats::{StatsSnapshot, WorkerCounters};
 pub use orchestrator::{Orchestrator, OrchestratorStats, StallWatch, Tick, TickJob};
 pub use pools::{NumaPoolHandle, PoolRegistry};
 pub use tierc::{Placement, TierCSnapshot};

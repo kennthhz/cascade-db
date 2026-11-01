@@ -352,7 +352,7 @@ impl Drop for ReapGuard<'_> {
 pub async fn run(
     handoff: Handoff,
     table: Rc<Table>,
-    counter: Arc<AtomicU64>,
+    stats: Arc<crate::stats::WorkerCounters>,
     tenants: Arc<TenantCounters>,
     wal: Option<Wal>,
     heap: Option<std::sync::Arc<crate::demoheap::DemoHeap>>,
@@ -360,7 +360,7 @@ pub async fn run(
     env: SessionEnv,
     reap: Option<Rc<crate::reaper::ReapRegistry>>,
 ) {
-    counter.fetch_add(1, Ordering::Relaxed);
+    stats.connections.fetch_add(1, Ordering::Relaxed);
     // The idle reaper (T4.5, FR-34): one registry entry per connection,
     // armed before the first read and unregistered by an RAII guard on
     // every exit — a panic must not leave a zombie entry for every later
@@ -476,6 +476,7 @@ pub async fn run(
                                     &ctx,
                                     &span,
                                     &tenants,
+                                    &stats,
                                     wal.as_ref(),
                                     heap.as_ref(),
                                 )
@@ -540,9 +541,13 @@ pub async fn run(
     if sess.txn != TxnStatus::Idle {
         sess.pending.clear();
         sess.txn = TxnStatus::Idle;
+        // pg_stat_database parity: a transaction abandoned mid-flight —
+        // by disconnect, protocol violation, or the reaper (T4.5) — is
+        // a rolled-back transaction (T4.6).
+        stats.rollbacks.fetch_add(1, Ordering::Relaxed);
     }
     drop(out); // closes the fd
-    counter.fetch_sub(1, Ordering::Relaxed);
+    stats.connections.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Execute one parsed statement, writing its full result set. Errors carry
@@ -557,12 +562,20 @@ async fn execute<W: AsyncWrite + Unpin>(
     ctx: &TenantContext,
     span: &Span,
     tenants: &TenantCounters,
+    stats: &crate::stats::WorkerCounters,
     wal: Option<&Wal>,
     heap: Option<&std::sync::Arc<crate::demoheap::DemoHeap>>,
 ) -> Result<(), PgError> {
     // The hot-path shape (FR-20/FR-21): context and span borrowed, per
     // statement, nothing global.
     crate::tenant::debug_hot_path(ctx, span, tenants);
+    // FR-33: attempted statements (parse errors never got here).
+    // Empty statements (";;") are protocol no-ops — an
+    // EmptyQueryResponse and nothing else — and real PostgreSQL counts
+    // neither a command nor a transaction for them.
+    if !matches!(stmt, Stmt::Empty) {
+        stats.statements.fetch_add(1, Ordering::Relaxed);
+    }
 
     // Aborted transaction: every statement but ROLLBACK is refused (PG 25P02);
     // COMMIT acts as ROLLBACK.
@@ -570,6 +583,7 @@ async fn execute<W: AsyncWrite + Unpin>(
         if stmt == Stmt::Commit {
             sess.pending.clear();
             sess.txn = TxnStatus::Idle;
+            stats.rollbacks.fetch_add(1, Ordering::Relaxed);
             return send_tag(out, "ROLLBACK").await;
         }
         return Err(PgError::new(
@@ -607,6 +621,7 @@ async fn execute<W: AsyncWrite + Unpin>(
                     for row in sess.pending.drain(..) {
                         sess.table.insert(row);
                     }
+                    stats.commits.fetch_add(1, Ordering::Relaxed);
                 }
                 TxnStatus::Failed => unreachable!("handled above"),
             }
@@ -619,6 +634,7 @@ async fn execute<W: AsyncWrite + Unpin>(
             }
             sess.pending.clear();
             sess.txn = TxnStatus::Idle;
+            stats.rollbacks.fetch_add(1, Ordering::Relaxed);
             send_tag(out, "ROLLBACK").await
         }
         Stmt::Insert { id, val } => {
@@ -629,9 +645,23 @@ async fn execute<W: AsyncWrite + Unpin>(
                 // order — its WAL record is durable before the ack.
                 TxnStatus::Idle => {
                     if let Some(wal) = wal {
-                        durable_commit(wal, std::slice::from_ref(&row)).await?;
+                        // A failed autocommit write is an aborted
+                        // implicit transaction (PG counts xact_rollback
+                        // for it); the txn never left Idle, so no later
+                        // rollback path would count it — count it here
+                        // or it vanishes from the ledger (unlike a
+                        // failed explicit COMMIT, whose txn is still
+                        // InTxn and deterministically ends in exactly
+                        // one counted rollback downstream).
+                        if let Err(e) =
+                            durable_commit(wal, std::slice::from_ref(&row)).await
+                        {
+                            stats.rollbacks.fetch_add(1, Ordering::Relaxed);
+                            return Err(e);
+                        }
                     }
                     sess.table.insert(row);
+                    stats.commits.fetch_add(1, Ordering::Relaxed);
                 }
                 TxnStatus::Failed => unreachable!("handled above"),
             }

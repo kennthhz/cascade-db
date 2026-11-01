@@ -19,7 +19,7 @@ use std::{
     net::TcpStream,
     os::unix::io::{FromRawFd, IntoRawFd},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::Ordering,
         Arc,
     },
 };
@@ -45,7 +45,7 @@ const TOO_MANY_CONNECTIONS: &str = "53300";
 struct Route {
     sender: ConnectedSender<Handoff>,
     numa: u32,
-    counter: Arc<AtomicU64>,
+    counter: Arc<crate::stats::WorkerCounters>,
 }
 
 pub struct Router {
@@ -70,7 +70,7 @@ impl Router {
             {
                 continue;
             }
-            let load = route.counter.load(Ordering::Relaxed);
+            let load = route.counter.connections.load(Ordering::Relaxed);
             if load >= self.max_conns_per_worker as u64 {
                 continue; // A7: per-worker availability cap
             }
@@ -166,7 +166,7 @@ impl Router {
         auth: AuthConfig,
         senders: Vec<SharedSender<Handoff>>,
         numas: Vec<u32>,
-        counters: Vec<Arc<AtomicU64>>,
+        counters: Vec<Arc<crate::stats::WorkerCounters>>,
         tierc: Arc<TierCSnapshot>,
         max_conns_per_worker: u32,
         tick_init: crate::orchestrator::OrchestratorInit,
