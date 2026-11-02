@@ -32,6 +32,17 @@ pub enum NumaAffinity {
     Cross,
 }
 
+impl NumaAffinity {
+    /// The config-file / wire spelling (lowercase, like the TOML and the
+    /// DDL value).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NumaAffinity::Single => "single",
+            NumaAffinity::Cross => "cross",
+        }
+    }
+}
+
 /// Worker cores for one NUMA node (spec §10.1 step 2: workers grouped by NUMA).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]

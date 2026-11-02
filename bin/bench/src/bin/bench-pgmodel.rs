@@ -72,6 +72,12 @@ struct Engine {
     /// per connection, and its DDL workloads are single-connection, so
     /// the model never lies where it is measured.
     roles: std::collections::BTreeSet<String>,
+    /// Modeled per-database affinity rows (T5.5's DDL): name → the
+    /// affinity the row froze at creation. PG as written has no NUMA
+    /// binding, so the model binds nothing (numa renders `-`) — the
+    /// honest asymmetry in a DDL comparison, like debug_worker's
+    /// backend-pid.
+    databases: std::collections::BTreeMap<String, String>,
 }
 
 fn main() {
@@ -507,6 +513,61 @@ fn execute(
                 rows: vec![row],
                 tag: "SELECT 1".to_owned(),
             })
+        }
+        Stmt::CreateDatabase { name, affinity } => {
+            // The modeled DDL, on cascade's terms: instant apply, refused
+            // inside a transaction block (cascade's session refuses it
+            // there too — instant-apply DDL cannot roll back), duplicate
+            // refused with PG's duplicate_database. The row freezes the
+            // given affinity, or the model's cluster default (cross —
+            // nothing bound) for the bare form.
+            if eng.txn_open {
+                return Err((
+                    "25001".into(),
+                    "CREATE DATABASE cannot run inside a transaction block".into(),
+                ));
+            }
+            let affinity = affinity
+                .map(|a| a.as_str().to_owned())
+                .unwrap_or_else(|| "cross".to_owned());
+            if eng.databases.contains_key(&name) {
+                return Err(("42P04".into(), format!("database \"{name}\" already exists")));
+            }
+            eng.databases.insert(name, affinity);
+            Ok(Reply::Tag("CREATE DATABASE"))
+        }
+        Stmt::AlterDatabaseAffinity { name, .. } => {
+            // Cascade's honest refusal, mirrored: parsed and validated,
+            // then unsupported_feature — no migration runner here either.
+            Err((
+                "0A000".into(),
+                format!(
+                    "ALTER DATABASE {name} SET numa_affinity is not supported by this engine \
+                     (the migration runner is a later deliverable)"
+                ),
+            ))
+        }
+        Stmt::DebugDatabases => {
+            // Same wire shape as cascade's debug_databases(): three TEXT
+            // columns, sorted names, `SELECT n` — numa `-` everywhere
+            // (the model binds nothing; see the field doc).
+            let rows: Vec<Vec<u8>> = eng
+                .databases
+                .iter()
+                .map(|(name, affinity)| {
+                    data_row(&[
+                        name.as_bytes().to_vec(),
+                        affinity.as_bytes().to_vec(),
+                        b"-".to_vec(),
+                    ])
+                })
+                .collect();
+            let mut desc = (3i16).to_be_bytes().to_vec();
+            desc.extend(field("database", 25, -2));
+            desc.extend(field("affinity", 25, -2));
+            desc.extend(field("numa", 25, -2));
+            let tag = format!("SELECT {}", rows.len());
+            Ok(Reply::Select { desc, rows, tag })
         }
     }
 }

@@ -48,6 +48,21 @@ pub enum Stmt {
     /// like `WITH LOGIN` change what is created, and dropping them silently
     /// would lie, so they stay `Unsupported`).
     CreateRole { name: String },
+    /// `CREATE DATABASE name [WITH (…)]` — the DDL surface FR-38 names.
+    /// The options are a generic `name = constant` view (PG's DefElem):
+    /// which option *means* something stays with the caller — the
+    /// `numa_affinity` semantics are resolved downstream, not here.
+    CreateDatabase { name: String, options: Vec<DbOption> },
+    /// `ALTER DATABASE name SET parameter = value` — parsed so the
+    /// `numa_affinity` surface exists and can be validated-then-refused
+    /// downstream (FR-38: unsupported_feature until the migration
+    /// runner). Other SET shapes (RESET, DEFAULT, FROM CURRENT, lists)
+    /// stay `Unsupported`.
+    AlterDatabaseSet {
+        name: String,
+        parameter: String,
+        value: Option<Value>,
+    },
     Begin,
     Commit,
     Rollback,
@@ -127,6 +142,14 @@ pub struct Insert {
     pub values: Vec<Value>,
 }
 
+/// One `CREATE DATABASE … WITH (name = value)` option — PG's DefElem seen
+/// syntactically. A bare option (`name` with no `= value`) carries `None`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbOption {
+    pub name: String,
+    pub value: Option<Value>,
+}
+
 /// A parsed string: usually one statement, never more than the caller's
 /// own statement split produced.
 #[derive(Debug, Clone, PartialEq)]
@@ -193,6 +216,8 @@ fn lower_stmt(raw: &pb::RawStmt) -> Stmt {
         Node::SelectStmt(sel) => lower_select(sel),
         Node::InsertStmt(ins) => lower_insert(ins),
         Node::CreateRoleStmt(rr) => lower_create_role(rr),
+        Node::CreatedbStmt(db) => lower_create_database(db),
+        Node::AlterDatabaseSetStmt(a) => lower_alter_database_set(a),
         Node::TransactionStmt(txn) => match txn.kind() {
             TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => Stmt::Begin,
             TransactionStmtKind::TransStmtCommit => Stmt::Commit,
@@ -224,6 +249,73 @@ fn lower_create_role(rr: &pb::CreateRoleStmt) -> Stmt {
     }
 }
 
+/// The one CREATE DATABASE shape modeled: a non-empty name with a generic
+/// `name [= constant]` option list. The grammar accepts any option name —
+/// PG validates them in analysis, which this crate deliberately skips —
+/// so the caller sees the list as written and refuses unmodeled options
+/// itself (silently dropping `OWNER`/`TEMPLATE` would lie about what was
+/// created).
+fn lower_create_database(db: &pb::CreatedbStmt) -> Stmt {
+    let options = db
+        .options
+        .iter()
+        .filter_map(|opt| match opt.node.as_ref() {
+            Some(Node::DefElem(d)) => Some(DbOption {
+                name: d.defname.clone(),
+                value: d.arg.as_deref().and_then(inner).and_then(def_elem_value),
+            }),
+            _ => None,
+        })
+        .collect();
+    Stmt::CreateDatabase {
+        name: db.dbname.clone(),
+        options,
+    }
+}
+
+/// The one ALTER DATABASE shape modeled: `ALTER DATABASE name SET
+/// parameter = value` (kind `SET` with exactly one constant argument —
+/// PG's `VariableSetStmt` under `AlterDatabaseSetStmt`). RESET, SET
+/// DEFAULT, SET FROM CURRENT, and multi-value lists change meaning, so
+/// they stay `Unsupported` rather than losing their shape.
+fn lower_alter_database_set(a: &pb::AlterDatabaseSetStmt) -> Stmt {
+    let unsupported = || Stmt::Unsupported { command: "alter database".into() };
+    let Some(set) = &a.setstmt else {
+        return unsupported();
+    };
+    if set.kind() != pb::VariableSetKind::VarSetValue {
+        return unsupported();
+    }
+    let value = match set.args.as_slice() {
+        [one] => match one.node.as_ref() {
+            Some(Node::AConst(c)) => Some(const_value(c)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if set.name.is_empty() {
+        return unsupported();
+    }
+    Stmt::AlterDatabaseSet {
+        name: a.dbname.clone(),
+        parameter: set.name.clone(),
+        value,
+    }
+}
+
+/// A DefElem's argument as a constant. PG's option values are grammar
+/// literals: strings and bare identifiers arrive as `String` nodes, and
+/// createdb option numbers arrive as bare `Integer` nodes (not wrapped in
+/// `A_Const`).
+fn def_elem_value(arg: &Node) -> Option<Value> {
+    match arg {
+        Node::AConst(c) => Some(const_value(c)),
+        Node::String(s) => Some(Value::Text(s.sval.clone())),
+        Node::Integer(i) => Some(Value::Int(i.ival as i64)),
+        _ => None,
+    }
+}
+
 /// A short lowercase command name for `Unsupported` — for error messages,
 /// not for dispatch.
 fn unsupported_command(node: &Node) -> &'static str {
@@ -232,7 +324,10 @@ fn unsupported_command(node: &Node) -> &'static str {
         Node::DeleteStmt(_) => "delete",
         Node::DropStmt(_) => "drop",
         Node::CreateStmt(_) | Node::CreateSchemaStmt(_) | Node::CreateTableAsStmt(_) => "create",
+        Node::CreatedbStmt(_) => "create database",
         Node::AlterTableStmt(_) => "alter",
+        Node::AlterDatabaseStmt(_) | Node::AlterDatabaseRefreshCollStmt(_) => "alter database",
+        Node::RenameStmt(_) => "rename",
         Node::TruncateStmt(_) => "truncate",
         Node::CopyStmt(_) => "copy",
         Node::ExplainStmt(_) => "explain",
@@ -508,6 +603,106 @@ mod tests {
         assert_eq!(
             one("CREATE GROUP staff"),
             Stmt::Unsupported { command: "create group".into() }
+        );
+    }
+
+    #[test]
+    fn create_database_bare_and_with_numa_affinity() {
+        // PG's real grammar: the WITH list has NO parentheses (the
+        // parenthesized form is a different production — the raw parser
+        // refuses it, and this wrapper refuses to pretend otherwise).
+        // The option itself is generic (DefElem) — validation is the
+        // caller's job.
+        assert_eq!(
+            one("CREATE DATABASE oltp_prod WITH numa_affinity = 'single'"),
+            Stmt::CreateDatabase {
+                name: "oltp_prod".into(),
+                options: vec![DbOption {
+                    name: "numa_affinity".into(),
+                    value: Some(Value::Text("single".into())),
+                }],
+            }
+        );
+        assert_eq!(
+            one("create database bulk_warehouse WITH numa_affinity = 'cross'"),
+            Stmt::CreateDatabase {
+                name: "bulk_warehouse".into(),
+                options: vec![DbOption {
+                    name: "numa_affinity".into(),
+                    value: Some(Value::Text("cross".into())),
+                }],
+            }
+        );
+        // Bare form: the option list is simply empty.
+        assert_eq!(
+            one("CREATE DATABASE plain"),
+            Stmt::CreateDatabase {
+                name: "plain".into(),
+                options: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn create_database_options_beyond_the_modeled_value_stay_visible() {
+        // PG's real options carry creation semantics — the view keeps
+        // them as written so the caller can refuse rather than invent a
+        // silently-flattened database.
+        // PG folds unquoted option names to lowercase — the view mirrors
+        // what the grammar saw.
+        assert_eq!(
+            one("CREATE DATABASE owned WITH OWNER = 'alice'"),
+            Stmt::CreateDatabase {
+                name: "owned".into(),
+                options: vec![DbOption {
+                    name: "owner".into(),
+                    value: Some(Value::Text("alice".into())),
+                }],
+            }
+        );
+        // An unknown option name survives too — same reasoning.
+        assert_eq!(
+            one("CREATE DATABASE weird WITH frobnicate = 7"),
+            Stmt::CreateDatabase {
+                name: "weird".into(),
+                options: vec![DbOption {
+                    name: "frobnicate".into(),
+                    value: Some(Value::Int(7)),
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn alter_database_set_models_the_affinity_parameter() {
+        assert_eq!(
+            one("ALTER DATABASE oltp_prod SET numa_affinity = 'cross'"),
+            Stmt::AlterDatabaseSet {
+                name: "oltp_prod".into(),
+                parameter: "numa_affinity".into(),
+                value: Some(Value::Text("cross".into())),
+            }
+        );
+        // RESET and SET DEFAULT lose their meaning in a `SET = value`
+        // view — Unsupported, never a fabricated value.
+        assert_eq!(
+            one("ALTER DATABASE oltp_prod RESET numa_affinity"),
+            Stmt::Unsupported { command: "alter database".into() }
+        );
+        // Other parameters are the caller's refusal to name.
+        assert_eq!(
+            one("ALTER DATABASE oltp_prod SET work_mem = '64MB'"),
+            Stmt::AlterDatabaseSet {
+                name: "oltp_prod".into(),
+                parameter: "work_mem".into(),
+                value: Some(Value::Text("64MB".into())),
+            }
+        );
+        // The rest of the ALTER DATABASE family — RENAME is its own
+        // statement kind, named for what it is.
+        assert_eq!(
+            one("ALTER DATABASE oltp_prod RENAME TO other"),
+            Stmt::Unsupported { command: "rename".into() }
         );
     }
 

@@ -134,7 +134,10 @@ pub struct ClusterSnapshot {
 
 impl ClusterSnapshot {
     /// Builds the snapshot from the cluster default and the boot-time
-    /// worker layout (numa → worker count, in config order). `single`
+    /// worker layout — ONE ENTRY PER WORKER, the entry being that
+    /// worker's NUMA id, in config order (boot.rs flattens
+    /// `worker_cores` exactly so; `least_loaded_numa` counts entries).
+    /// `single`
     /// binds per A13; `cross` binds nothing. The per-DB map starts
     /// empty — no rows exist until the first change applies (T5.3's
     /// writer; T5.5 wires the DDL surface to it).
@@ -174,6 +177,17 @@ impl ClusterSnapshot {
     /// new role exactly when its catalog adopts a newer snapshot.
     pub fn roles(&self) -> impl Iterator<Item = &str> {
         self.roles.iter().map(String::as_str)
+    }
+
+    /// The per-database affinity rows (T5.5, FR-38's `datnumaffinity` /
+    /// `datnumanode`): `(name, affinity spelling, bound NUMA)` in name
+    /// order — `None` when the row binds nothing (`cross`). Only rows
+    /// the DDL (or an affinity change) created appear here; names
+    /// absent from the map inherit the cluster default (FR-10).
+    pub fn databases(&self) -> impl Iterator<Item = (&str, &'static str, Option<u32>)> {
+        self.databases
+            .iter()
+            .map(|(name, row)| (name.as_str(), row.affinity.as_str(), row.bound_numa))
     }
 }
 
@@ -296,6 +310,15 @@ pub enum TierCChange {
     /// every reactor through its next pointer load — no cache
     /// invalidation anywhere.
     CreateRole { name: String },
+    /// Creates a database (T5.5, FR-38's `datnumaffinity`). `None`
+    /// resolves to the cluster default AT CREATION and freezes into the
+    /// row (PG-faithful: inheritance is a creation-time decision, and
+    /// the row is what makes a duplicate name refusable — `42P04`).
+    /// `Single` binds per A13 at apply, like [`TierCChange::SetDatabaseAffinity`].
+    CreateDatabase {
+        name: String,
+        affinity: Option<NumaAffinity>,
+    },
 }
 
 /// Why the writer refused a change: the apply failed against the current
@@ -305,6 +328,9 @@ pub enum TierCChange {
 pub enum ApplyError {
     /// A role with this name already exists — PG's `duplicate_object`.
     DuplicateRole { name: String },
+    /// A database with this name already exists — PG's
+    /// `duplicate_database`.
+    DuplicateDatabase { name: String },
 }
 
 impl ApplyError {
@@ -314,6 +340,10 @@ impl ApplyError {
             ApplyError::DuplicateRole { name } => (
                 "42710",
                 format!("role \"{name}\" already exists"),
+            ),
+            ApplyError::DuplicateDatabase { name } => (
+                "42P04",
+                format!("database \"{name}\" already exists"),
             ),
         }
     }
@@ -378,6 +408,31 @@ impl ClusterState {
                     return Err(ApplyError::DuplicateRole { name: name.clone() });
                 }
                 self.current.roles.insert(name.clone());
+                Ok(())
+            }
+            TierCChange::CreateDatabase { name, affinity } => {
+                // Validate before the first mutation, like every variant:
+                // a refusal leaves the state exactly as it was.
+                if self.current.databases.contains_key(name) {
+                    return Err(ApplyError::DuplicateDatabase { name: name.clone() });
+                }
+                // The bare form freezes the cluster default at creation
+                // (PG-faithful inheritance); the explicit form records
+                // what the caller asked for. `Single` binds per A13's
+                // standing proxy (fewest workers, config-order ties) —
+                // the same rule boot used for the default.
+                let affinity = affinity.unwrap_or(self.current.default_affinity);
+                let bound_numa = match affinity {
+                    NumaAffinity::Single => least_loaded_numa(&self.worker_numas),
+                    NumaAffinity::Cross => None,
+                };
+                self.current.databases.insert(
+                    name.clone(),
+                    DbRow {
+                        affinity,
+                        bound_numa,
+                    },
+                );
                 Ok(())
             }
         }
@@ -809,6 +864,88 @@ mod tests {
         assert_eq!(state.current.databases.len(), 1);
         // Sorted, for stable wire output.
         assert_eq!(state.publish().roles().collect::<Vec<_>>(), ["alice", "bob"]);
+    }
+
+    /// T5.5's apply contract, on the writer's own state: CreateDatabase
+    /// records its row (explicit affinity, or the frozen cluster default
+    /// for the bare form), `Single` binds per A13, and a duplicate is
+    /// REFUSED with 42P04 leaving the state exactly as it was — the
+    /// partial-failure property, pinned at the state layer like T5.4's
+    /// duplicate-role test.
+    #[test]
+    fn create_database_records_the_row_and_refuses_duplicates_without_mutation() {
+        let mut state = ClusterState::from_boot(
+            ClusterSnapshot::build(NumaAffinity::Single, &[7, 7, 3]),
+            vec![7, 7, 3],
+        );
+        // A13's proxy: the layout is one entry per worker — two workers
+        // on numa 7, one on numa 3 — so a created `single` DB binds
+        // THERE (fewest workers), not to the config-order-first numa.
+        state
+            .apply(&TierCChange::CreateDatabase {
+                name: "oltp".into(),
+                affinity: Some(NumaAffinity::Single),
+            })
+            .expect("single create applies");
+        assert_eq!(
+            state.current.databases.get("oltp"),
+            Some(&DbRow { affinity: NumaAffinity::Single, bound_numa: Some(3) })
+        );
+
+        // Bare form: the cluster default (Single here) frozen at
+        // creation, bound per the same proxy.
+        state
+            .apply(&TierCChange::CreateDatabase { name: "plain".into(), affinity: None })
+            .expect("bare create applies");
+        assert_eq!(
+            state.current.databases.get("plain"),
+            Some(&DbRow { affinity: NumaAffinity::Single, bound_numa: Some(3) })
+        );
+
+        // `cross` records no binding at all.
+        state
+            .apply(&TierCChange::CreateDatabase {
+                name: "bulk".into(),
+                affinity: Some(NumaAffinity::Cross),
+            })
+            .expect("cross create applies");
+        assert_eq!(
+            state.current.databases.get("bulk"),
+            Some(&DbRow { affinity: NumaAffinity::Cross, bound_numa: None })
+        );
+
+        // The duplicate is refused — 42P04, PG's wording — and the
+        // refusal mutated nothing: three rows, the affinity half
+        // untouched, roles untouched.
+        let err = state
+            .apply(&TierCChange::CreateDatabase {
+                name: "oltp".into(),
+                affinity: Some(NumaAffinity::Cross),
+            })
+            .expect_err("duplicate is refused");
+        assert_eq!(err, ApplyError::DuplicateDatabase { name: "oltp".into() });
+        assert_eq!(
+            err.pg(),
+            ("42P04", "database \"oltp\" already exists".into())
+        );
+        assert_eq!(state.current.databases.len(), 3);
+        assert_eq!(
+            state.current.databases.get("oltp").map(|r| r.affinity),
+            Some(NumaAffinity::Single),
+            "the refused CROSS re-create did not overwrite the row"
+        );
+        assert!(state.current.roles.is_empty());
+
+        // The snapshot view: sorted names, the text spellings, the
+        // bindings — what debug_databases serves.
+        assert_eq!(
+            state.publish().databases().collect::<Vec<_>>(),
+            [
+                ("bulk", "cross", None),
+                ("oltp", "single", Some(3)),
+                ("plain", "single", Some(3)),
+            ]
+        );
     }
 
     /// The T5.2 race test, with real interleaving forced and asserted: a

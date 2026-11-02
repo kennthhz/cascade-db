@@ -38,4 +38,12 @@ The safe Rust API over `libpg_query`. The boundary between the FFI exception (§
 
 Implemented and live in the runtime's query path: SELECT (projection +
 `WHERE col = const`), INSERT (single-row VALUES), BEGIN/COMMIT/ROLLBACK,
-debug functions. Parse errors carry PG's own message text.
+debug functions, `CREATE ROLE` (T5.4), and T5.5's affinity DDL —
+`CREATE DATABASE [WITH name = value]` as a generic DefElem option list
+(PG's grammar has no parenthesized WITH list for CREATE DATABASE;
+option validation is the caller's job, so unmodeled options like
+`OWNER` survive the view and are refused downstream) and
+`ALTER DATABASE … SET param = value` (modeled so the `numa_affinity`
+surface can be validated-then-refused downstream; RESET/DEFAULT/
+FROM CURRENT stay `Unsupported`). Parse errors carry PG's own message
+text.

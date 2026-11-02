@@ -117,11 +117,14 @@ irqaffinity=<housekeepers>  # force all hardware IRQs to housekeeper cores
 NUMA-local allocation (§2.3) preserves cache-line locality only if **the workers serving a database and the memory backing its pages live on the same NUMA node.** On multi-NUMA hosts there are two ways to honor this — and they trade off latency vs. throughput. Cascade DB exposes the choice as **per-database configuration**:
 
 ```sql
--- Latency-optimized: DB bound to one NUMA node.
-CREATE DATABASE oltp_prod WITH (numa_affinity = 'single');
+-- Latency-optimized: DB bound to one NUMA node. (PG's grammar has no
+-- parenthesized WITH list for CREATE DATABASE — the option form is
+-- `WITH name = value`, and cascade parses via libpg_query, so the
+-- dialect is PG's.)
+CREATE DATABASE oltp_prod WITH numa_affinity = 'single';
 
 -- Throughput-optimized: DB spans all NUMA nodes.
-CREATE DATABASE bulk_warehouse WITH (numa_affinity = 'cross');
+CREATE DATABASE bulk_warehouse WITH numa_affinity = 'cross';
 ```
 
 Cluster-level default (inherited by new DBs that don't specify):

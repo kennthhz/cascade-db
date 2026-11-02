@@ -15,6 +15,7 @@
 //! Resolution results feed [`Stmt`], the same enum the session executed
 //! before this was a real parser — the engine below it is unchanged.
 
+use crate::config::NumaAffinity;
 use cascade_pg_parser as pgp;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -29,6 +30,11 @@ pub enum SqlError {
     UndefinedColumn { name: String },
     #[error("{command} is not supported by this engine")]
     Unsupported { command: String },
+    /// A well-known parameter got a value outside its domain — PG's
+    /// `invalid_parameter_value` (FR-38's "parses and validates": the
+    /// numa_affinity value is checked before the feature is refused).
+    #[error("invalid value for parameter \"{parameter}\": \"{value}\"")]
+    InvalidParameterValue { parameter: String, value: String },
     #[error("{0}")]
     Protocol(&'static str),
 }
@@ -41,6 +47,7 @@ impl SqlError {
             SqlError::UndefinedTable { .. } => "42P01",
             SqlError::UndefinedColumn { .. } => "42703",
             SqlError::Unsupported { .. } => "0A000",
+            SqlError::InvalidParameterValue { .. } => "22023",
             SqlError::Protocol(_) => "08P01",
         }
     }
@@ -84,6 +91,23 @@ pub enum Stmt {
     /// the statement bounces through the Tier C writer (FR-29) and the
     /// reply comes from its ack, never from local state.
     CreateRole { name: String },
+    /// `CREATE DATABASE name [WITH …]` — T5.5's affinity DDL (FR-38).
+    /// Like CreateRole, execution bounces through the Tier C writer; the
+    /// `numa_affinity` option (when given) becomes the row the snapshot
+    /// records (`datnumaffinity`). Other WITH options are refused
+    /// upstream — they change what is created and would be dropped.
+    CreateDatabase {
+        name: String,
+        affinity: Option<NumaAffinity>,
+    },
+    /// `ALTER DATABASE name SET numa_affinity = …` — parsed and validated
+    /// (the value must be `single`/`cross`, else 22023), then refused
+    /// `unsupported_feature` (0A000): the migration runner (§2.5.4) is a
+    /// Phase 7+ deliverable. Nothing bounces, nothing changes.
+    AlterDatabaseAffinity { name: String, affinity: NumaAffinity },
+    /// `SELECT debug_databases()` — the per-database affinity rows of
+    /// THIS reactor's snapshot (the pointer load is the read; T5.5).
+    DebugDatabases,
     Insert {
         id: i32,
         val: String,
@@ -148,6 +172,12 @@ fn resolve(stmt: &pgp::Stmt) -> Result<Stmt, SqlError> {
         pgp::Stmt::Insert(ins) => resolve_insert(ins),
         pgp::Stmt::Select(sel) => resolve_select(sel),
         pgp::Stmt::CreateRole { name } => Ok(Stmt::CreateRole { name: name.clone() }),
+        pgp::Stmt::CreateDatabase { name, options } => resolve_create_database(name, options),
+        pgp::Stmt::AlterDatabaseSet {
+            name,
+            parameter,
+            value,
+        } => resolve_alter_database_set(name, parameter, value.as_ref()),
     }
 }
 
@@ -166,6 +196,72 @@ fn resolve_insert(ins: &pgp::Insert) -> Result<Stmt, SqlError> {
     }
 }
 
+/// FR-38's creation surface. The one understood option is
+/// `numa_affinity = 'single'|'cross'` — its value is validated HERE (a
+/// bad value is 22023, not a generic refusal, because the caller named a
+/// parameter the engine knows). PG's real creation options (OWNER,
+/// TEMPLATE, …) carry semantics this engine does not model, so they are
+/// refused 0A000 — creating the database without them would lie about
+/// what was created. The bare form inherits the cluster default at
+/// creation (the resolution is frozen into the row, PG-faithful: later
+/// default changes don't reach an existing database).
+fn resolve_create_database(name: &str, options: &[pgp::DbOption]) -> Result<Stmt, SqlError> {
+    let affinity = match options {
+        [] => None,
+        [opt] if opt.name.eq_ignore_ascii_case("numa_affinity") => {
+            Some(numa_affinity_value(opt.value.as_ref())?)
+        }
+        _ => return Err(SqlError::Unsupported { command: "create database".into() }),
+    };
+    Ok(Stmt::CreateDatabase {
+        name: name.to_owned(),
+        affinity,
+    })
+}
+
+/// FR-38's honest ALTER: the `numa_affinity` parameter is recognized and
+/// its value validated (22023 for garbage), and the well-formed statement
+/// resolves only to be refused downstream — `unsupported_feature` until
+/// the Phase 7+ migration runner (§2.5.4). Any other parameter is a GUC
+/// store this engine does not have: 0A000.
+fn resolve_alter_database_set(
+    name: &str,
+    parameter: &str,
+    value: Option<&pgp::Value>,
+) -> Result<Stmt, SqlError> {
+    if parameter.eq_ignore_ascii_case("numa_affinity") {
+        let affinity = numa_affinity_value(value)?;
+        return Ok(Stmt::AlterDatabaseAffinity {
+            name: name.to_owned(),
+            affinity,
+        });
+    }
+    Err(SqlError::Unsupported { command: "alter database".into() })
+}
+
+/// The `numa_affinity` option's value: the two cluster modes, or 22023
+/// with the value as written (non-text values render, since the caller
+/// named a real parameter with a wrong-typed value).
+fn numa_affinity_value(value: Option<&pgp::Value>) -> Result<NumaAffinity, SqlError> {
+    let invalid = |value: String| {
+        Err(SqlError::InvalidParameterValue {
+            parameter: "numa_affinity".into(),
+            value,
+        })
+    };
+    match value {
+        Some(pgp::Value::Text(t)) => match t.to_ascii_lowercase().as_str() {
+            "single" => Ok(NumaAffinity::Single),
+            "cross" => Ok(NumaAffinity::Cross),
+            _ => invalid(t.clone()),
+        },
+        Some(pgp::Value::Int(n)) => invalid(n.to_string()),
+        Some(pgp::Value::Float(f)) => invalid(f.clone()),
+        Some(pgp::Value::Bool(b)) => invalid(b.to_string()),
+        Some(pgp::Value::Null) | Some(pgp::Value::Unsupported) | None => invalid("…".into()),
+    }
+}
+
 fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
     let Some(table) = &sel.from else {
         // A bare SELECT (no FROM): the slice knows two — the debug
@@ -181,6 +277,11 @@ fn resolve_select(sel: &pgp::Select) -> Result<Stmt, SqlError> {
                 if name.eq_ignore_ascii_case("debug_roles") =>
             {
                 Ok(Stmt::DebugRoles)
+            }
+            ([pgp::Target::Function { name }], None)
+                if name.eq_ignore_ascii_case("debug_databases") =>
+            {
+                Ok(Stmt::DebugDatabases)
             }
             _ => Err(SqlError::Unsupported { command: "select".into() }),
         };
@@ -298,6 +399,49 @@ mod tests {
         // Options are refused upstream as 0A000 (parsed, unmodeled) —
         // the parser's boundary, restated here as a code pin.
         assert_eq!(parse("CREATE ROLE alice WITH LOGIN").unwrap_err().code(), "0A000");
+        // T5.5: the affinity DDL resolves — the numa_affinity option
+        // becomes the snapshot row (datnumaffinity), the bare form
+        // inherits, garbage values are 22023 (validated, then refused),
+        // and PG's real creation options stay 0A000.
+        assert_eq!(
+            parse("CREATE DATABASE oltp WITH numa_affinity = 'single'"),
+            Ok(Stmt::CreateDatabase { name: "oltp".into(), affinity: Some(NumaAffinity::Single) })
+        );
+        assert_eq!(
+            parse("CREATE DATABASE bulk WITH numa_affinity = 'cross'"),
+            Ok(Stmt::CreateDatabase { name: "bulk".into(), affinity: Some(NumaAffinity::Cross) })
+        );
+        assert_eq!(
+            parse("CREATE DATABASE plain"),
+            Ok(Stmt::CreateDatabase { name: "plain".into(), affinity: None })
+        );
+        assert_eq!(
+            parse("CREATE DATABASE bad WITH numa_affinity = 'sideways'")
+                .unwrap_err()
+                .code(),
+            "22023",
+            "the value is validated before the feature question"
+        );
+        assert_eq!(
+            parse("CREATE DATABASE owned WITH OWNER = 'alice'").unwrap_err().code(),
+            "0A000",
+            "unmodeled creation options are refused, never dropped"
+        );
+        // ALTER validates then resolves — the session refuses it with
+        // unsupported_feature; nothing here bounces or mutates.
+        assert_eq!(
+            parse("ALTER DATABASE oltp SET numa_affinity = 'cross'"),
+            Ok(Stmt::AlterDatabaseAffinity { name: "oltp".into(), affinity: NumaAffinity::Cross })
+        );
+        assert_eq!(
+            parse("ALTER DATABASE oltp SET numa_affinity = 'wrong'").unwrap_err().code(),
+            "22023"
+        );
+        assert_eq!(
+            parse("ALTER DATABASE oltp SET work_mem = '64MB'").unwrap_err().code(),
+            "0A000"
+        );
+        assert_eq!(parse("SELECT debug_databases()"), Ok(Stmt::DebugDatabases));
         assert_eq!(
             parse("INSERT INTO debug_table VALUES (1, 'hello')"),
             Ok(Stmt::Insert { id: 1, val: "hello".into() })

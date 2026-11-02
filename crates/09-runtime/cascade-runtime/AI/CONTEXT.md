@@ -53,7 +53,7 @@ default_db_numa_affinity = "single"  # default — DB bound to one NUMA, latency
 | Knob | Scope | Behavior |
 |---|---|---|
 | `topology.mode` | **Cluster-wide** | All databases on the host share the SMT choice. |
-| `default_db_numa_affinity` + per-DB `WITH (numa_affinity = …)` | **Per-database** | One DB can be `single` (NUMA-bound), another `cross` (machine-spanning), in the same cluster. |
+| `default_db_numa_affinity` + per-DB `WITH numa_affinity = …` | **Per-database** | One DB can be `single` (NUMA-bound), another `cross` (machine-spanning), in the same cluster. (PG's CREATE DATABASE has no parenthesized WITH list — the raw grammar refuses it; T5.5 rides PG's real option form.) |
 
 Both modes mandate NUMA-local allocation per worker.
 
@@ -486,6 +486,38 @@ the housekeeper's (a ~1-in-5 full-suite flake, caught by loop
 re-runs); the fix polls each ungated catalog. `Catalog` and
 `ClusterSnapshot` carry `Send`/`Sync` static asserts (what makes the
 fan-out job legal — pinned at T5.2).
+
+**Affinity DDL surface (T5.5, FR-10/FR-12/FR-38, §2.5.1) — created rows
+decide routing; ALTER is validated, then honestly refused.**
+`CREATE DATABASE … [WITH numa_affinity = 'single'|'cross']` rides the
+T5.4 bounce exactly: the parser lowers PG's real option form (NO
+parentheses — the raw grammar refuses the parenthesized list; the
+DefElem list stays generic, so unmodeled options like `OWNER` are
+refused 0A000 upstream rather than silently dropped), `sql.rs`
+validates the value (22023 for garbage — the parameter is known —
+BEFORE the feature question), and the session bounces
+`TierCChange::CreateDatabase` through the write channel; the writer
+refuses duplicates 42P04 with zero mutation (validate before first
+mutate, like CreateRole). The bare form freezes the cluster default
+INTO the row at creation (PG-faithful: inheritance is a creation-time
+decision); `Single` binds per A13's least-loaded proxy at apply.
+Routing needed NO code: the router already resolves placement from the
+live snapshot (T2.4), so the created row decides the next connection's
+candidates — single → bound NUMA's workers only, 53300 naming the NUMA
+when it is drained, now driven by a CREATED row rather than only boot
+config. `ALTER DATABASE … SET numa_affinity` is validated then refused
+0A000 — the migration runner is Phase 7+ (§2.5.4), and pretending to
+migrate (re-homing the DB's whole Tier B set) would be the lie;
+nothing bounces, no snapshot changes. The observable is
+`SELECT debug_databases()` — this reactor's snapshot rows (name,
+affinity spelling, bound NUMA, `-` when unbound), a pointer load like
+debug_roles; the FR-36 probe extends to it: reads submit zero, each
+DDL exactly one. Tests: `tests/db_affinity.rs` — created-single routes
+only to its bound NUMA and refuses at cap; rows visible on another
+reactor; ALTER validated-then-refused leaving rows AND routing
+untouched; duplicate + txn-block refusals. The fixture boots CROSS on
+purpose so the created ROW is the discriminator, not the cluster
+default.
 
 ## Open Design Questions
 

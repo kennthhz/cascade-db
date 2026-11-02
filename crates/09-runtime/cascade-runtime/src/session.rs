@@ -862,8 +862,9 @@ async fn execute<W: AsyncWrite + Unpin>(
             // The T5.1 crossing: the closure (issuer + change) rides the
             // write channel to the serving housekeeper; the future runs
             // THERE (the funnel is a thread_local on that ring) and only
-            // the ack comes back. This is the query path's ONLY submit_to
-            // — OLTP never takes this arm (FR-36, pinned by the
+            // the ack comes back. The query path's submit_to arms are
+            // exactly the DDL ones (CREATE ROLE and, since T5.5, CREATE
+            // DATABASE) — OLTP never takes them (FR-36, pinned by the
             // zero-submit_to probe in tests/ddl.rs).
             match tierc
                 .write
@@ -888,6 +889,100 @@ async fn execute<W: AsyncWrite + Unpin>(
                 // The transport lost the round trip (writer gone,
                 // funnel refused, ring dead): honest failure at the
                 // caller — nothing half-applied anywhere.
+                Ok(Err(e)) | Err(e) => Err(PgError::new(
+                    "58000",
+                    format!("the Tier C writer did not confirm the change: {e}"),
+                )),
+            }
+        }
+        Stmt::DebugDatabases => {
+            // T5.5's observable, on the same terms as debug_roles: the
+            // per-database affinity rows live in THIS reactor's snapshot,
+            // read by a pointer copy with the extraction synchronous
+            // inside the guard's scope. `numa` renders `-` when the row
+            // binds nothing (`cross`, or the cluster has no workers) —
+            // the row writer carries text fields only.
+            let Some(tierc) = tierc else {
+                return Err(PgError::new(
+                    "58000",
+                    "the Tier C catalog is not wired to this session",
+                ));
+            };
+            let rows: Vec<(String, &'static str, Option<u32>)> = {
+                let guard = tierc.catalog.load();
+                let Some(snap) = guard.as_ref() else {
+                    return Err(PgError::new(
+                        crate::tierc::CANNOT_CONNECT_NOW,
+                        "the database system is starting up",
+                    ));
+                };
+                snap.databases()
+                    .map(|(name, affinity, numa)| (name.to_owned(), affinity, numa))
+                    .collect()
+            };
+            out.send(b'T', &debug_databases_description())
+                .await
+                .map_err(io_err)?;
+            for (name, affinity, numa) in &rows {
+                let numa = numa
+                    .map(|n| n.to_string().into_bytes())
+                    .unwrap_or_else(|| b"-".to_vec());
+                out.row(&[name.as_bytes(), affinity.as_bytes(), &numa]);
+            }
+            out.flush().await.map_err(io_err)?;
+            send_tag(out, &format!("SELECT {}", rows.len())).await
+        }
+        Stmt::AlterDatabaseAffinity { name, .. } => {
+            // FR-38's honest refusal: the statement parsed, its value was
+            // validated at resolution (a bad value never got here), and
+            // the answer is unsupported_feature — the migration runner
+            // (§2.5.4) is a Phase 7+ deliverable. Nothing bounces, no
+            // snapshot changes, no migration is attempted: affinity
+            // changes later mean re-homing the DB's whole Tier B set,
+            // and pretending that happened would be the lie the review
+            // bullet warns about.
+            Err(PgError::new(
+                "0A000",
+                format!(
+                    "ALTER DATABASE {name} SET numa_affinity is not supported by this engine \
+                     (the migration runner is a later deliverable)"
+                ),
+            ))
+        }
+        Stmt::CreateDatabase { name, affinity } => {
+            // T5.5's DDL, the CreateRole bounce exactly: leave the
+            // session through the write channel, let the ONE writer
+            // apply it, answer from the ack. Refused in a transaction
+            // block like its sibling (PG refuses CREATE DATABASE in a
+            // block too — it cannot roll back).
+            if sess.txn == TxnStatus::InTxn {
+                return Err(PgError::new(
+                    "25001",
+                    "CREATE DATABASE cannot run inside a transaction block",
+                ));
+            }
+            let Some(tierc) = tierc else {
+                return Err(PgError::new(
+                    "58000",
+                    "the Tier C mutation path is not wired to this session",
+                ));
+            };
+            let issuer = tierc.core;
+            let change = crate::tierc::TierCChange::CreateDatabase { name, affinity };
+            // Same crossing as CREATE ROLE (the query path's submit_to
+            // arms are the DDL ones — OLTP never takes them, FR-36).
+            match tierc
+                .write
+                .submit_to(move || async move { crate::tierc::submit_change(issuer, change).await })
+                .await
+            {
+                Ok(Ok(TierCAck::Applied)) | Ok(Ok(TierCAck::Pending(_))) => {
+                    send_tag(out, "CREATE DATABASE").await
+                }
+                Ok(Ok(TierCAck::Failed(e))) => {
+                    let (code, message) = e.pg();
+                    Err(PgError::new(code, message))
+                }
                 Ok(Err(e)) | Err(e) => Err(PgError::new(
                     "58000",
                     format!("the Tier C writer did not confirm the change: {e}"),
@@ -1033,6 +1128,14 @@ fn debug_worker_description() -> Vec<u8> {
 fn debug_roles_description() -> Vec<u8> {
     let mut payload = 1i16.to_be_bytes().to_vec();
     payload.extend(field("role", TEXT_OID, -2));
+    payload
+}
+
+fn debug_databases_description() -> Vec<u8> {
+    let mut payload = 3i16.to_be_bytes().to_vec();
+    payload.extend(field("database", TEXT_OID, -2));
+    payload.extend(field("affinity", TEXT_OID, -2));
+    payload.extend(field("numa", TEXT_OID, -2));
     payload
 }
 

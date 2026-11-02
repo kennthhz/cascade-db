@@ -28,5 +28,5 @@ Real `pg_catalog` + `information_schema`. The compatibility-critical layer for O
 - Bootstrap sequence: how the catalog tables come into existence at first start.
 - OID assignment: copy PG's exact built-in OIDs (compatibility) or assign our own with a translation map. Lean toward exact match for well-known types.
 - `information_schema` — implemented as views over `pg_catalog`? PG does this; we can too.
-- NUMA-affinity DDL surface: where does `WITH (numa_affinity = …)` parse / live? Likely a Cascade-prefixed reloption (e.g., `cascade.numa_affinity`) so it doesn't collide with PG syntax. Confirm before Phase 4.
+- NUMA-affinity DDL surface: **resolved at T5.5 (runtime)** — parses via libpg_query's real `CREATE DATABASE … WITH numa_affinity = value` (no parens: PG's grammar refuses the parenthesized form) into a generic DefElem option list; the runtime resolves `numa_affinity` and refuses other options with `0A000`. `single`-affinity binding at first activation stays per the line below.
 - `single`-affinity DB placement at first activation: **resolved 2026-10-24** (runtime spec §11) — the housekeeper picks the least-loaded NUMA at first activation; round-robin and admin-pinned (`WITH (numa_node = N)`) are not in v1. The chosen binding persists in `datnumanode`.
