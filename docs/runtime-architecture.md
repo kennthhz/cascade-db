@@ -356,6 +356,8 @@ The housekeeper consults the Tier C catalog snapshot to resolve the connection's
 
 The housekeeper maintains this load view from periodic samples published by each reactor (via Tier C-style snapshot, or a lightweight per-reactor atomic counter polled by housekeeper). Sampling defaults: 1 s interval, EWMA α = 0.5 (implementation-plan ruling A2).
 
+The composite is evaluated **lexicographically, in the order listed** (the T5.6 reading): connection count first; the CPU EWMA distinguishes candidates only at equal counts; NIC proximity distinguishes only at equal counts *and* equal EWMA. The EWMA itself is computed on the sampling reactor from its own thread's CPU (`RUSAGE_THREAD` — a pinned reactor is one thread), never on the housekeeper, so no stale-samples-in-transit window exists; the housekeeper only polls the published value.
+
 A worker is *available* while its active connection count is below `max_conns_per_worker` (default 200) — this is the availability test behind the refusal rule below (implementation-plan ruling A7).
 
 If a `single`-affinity DB's bound NUMA has no available workers (drained / failed), connection is refused with a clear error — we do **not** silently fall back to another NUMA, since that would silently violate the latency contract the customer chose. The error is PG `53300` (too_many_connections) with a message naming the bound NUMA (implementation-plan ruling R10).

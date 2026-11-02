@@ -91,6 +91,9 @@ fn cfg_for(
         numa_pools: pools,
         default_db_numa_affinity: default,
         wal_dir: Some(dir.to_path_buf()),
+        // NIC tie-breaker pinned off: these landings assume the count-only
+        // tie order (first-wins) — loadview.rs owns the composite's determinism.
+        nic_numa: None,
         max_conns_per_worker: if cap1 { 1 } else { base.max_conns_per_worker },
         ..base
     };

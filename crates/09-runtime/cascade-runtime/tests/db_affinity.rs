@@ -65,6 +65,9 @@ fn boot() -> Fixture {
             NumaPool { numa: 1, size_mb: 1 },
         ],
         default_db_numa_affinity: NumaAffinity::Cross,
+        // NIC tie-breaker pinned off: these landings assume the count-only
+        // tie order (first-wins) — loadview.rs owns the composite's determinism.
+        nic_numa: None,
         max_conns_per_worker: 1,
         ..RuntimeConfig::default()
     };

@@ -194,6 +194,25 @@ pub struct RuntimeConfig {
     /// reactor-stall kill switch, still unsupported) — this is §9's
     /// backend-level bound.
     pub stall_reap_ms: u64,
+    /// Load-sample interval for the §5.2 composite's CPU component
+    /// (T5.6, FR-11, ruling A2: default 1 000 ms; `0` disables the
+    /// sampler and the EWMA stays 0 — routing then falls back to the
+    /// count + NIC components). Each reactor samples its OWN thread's
+    /// CPU (`RUSAGE_THREAD` — the pinned thread IS the reactor), weights
+    /// it into an α = 0.5 EWMA on the reactor, and publishes the
+    /// milli-value the router polls. The EWMA is computed at the sampler,
+    /// never on the housekeeper — no stale-samples-in-transit window
+    /// exists.
+    pub load_sample_ms: u64,
+    /// The NIC's NUMA node for the §5.2 composite's proximity
+    /// tie-breaker (T5.6, FR-11 — consulted only for `cross` DBs, only
+    /// when connection counts AND CPU EWMAs tie). `None` discovers from
+    /// sysfs (`/sys/class/net/<if>/device/numa_node`, first interface —
+    /// sorted — reporting a real node); nothing discoverable keeps
+    /// `None` and the tie-breaker is inert. Set it explicitly for
+    /// synthetic topologies and single-NUMA rigs where discovery would
+    /// find nothing.
+    pub nic_numa: Option<u32>,
     pub stall: StallConfig,
     pub auth: AuthConfig,
 }
@@ -217,6 +236,8 @@ impl Default for RuntimeConfig {
             tick_ms: 1000,
             idle_reap_ms: 0,
             stall_reap_ms: 30_000,
+            load_sample_ms: 1_000,
+            nic_numa: None,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),
         }

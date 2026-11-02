@@ -248,6 +248,9 @@ fn capacity_cap_refuses_instead_of_overloading() {
             numa: 0,
             size_mb: 1,
         }],
+        // NIC tie-breaker pinned off: these landings assume the count-only
+        // tie order (first-wins) — loadview.rs owns the composite's determinism.
+        nic_numa: None,
         max_conns_per_worker: 1,
         ..RuntimeConfig::default()
     };

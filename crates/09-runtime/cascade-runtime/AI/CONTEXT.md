@@ -519,6 +519,40 @@ untouched; duplicate + txn-block refusals. The fixture boots CROSS on
 purpose so the created ROW is the discriminator, not the cluster
 default.
 
+**Load view completion (T5.6, FR-11, R9 phase two, §5.2) — the composite
+is lexicographic, and the EWMA lives on the reactor.** Routing's pick
+is now ONE ordering key in the spec's listed order: connection count
+primary → the reactor's CPU-utilization EWMA (decides only at equal
+counts) → NIC proximity (decides only at equal counts AND equal EWMA,
+`cross` DBs only — a `single` candidate set is already one NUMA, so
+proximity holds at 0 across it; `None` NIC discovery is inert the same
+way). Strict `<` keeps first-route-wins on full ties — the T2.4
+determinism survives the composite. The CPU half is
+`src/cpuload.rs`: each reactor spawns a sibling sampler task (next to
+control/recycle/drain/reap) that reads ITS OWN thread's
+`getrusage(RUSAGE_THREAD)` every `load_sample_ms` (default 1 000 ms,
+A2; `0` disables), computes `ewma ← (ewma + sample) / 2` in integer
+milli-units (α = 0.5; the FIRST sample seeds rather than halves in
+from 0), and publishes into `WorkerCounters.cpu_ewma_milli` — the
+spec's "lightweight per-reactor atomic counter polled by
+housekeeper". **The EWMA is computed at the sampler, never on the
+housekeeper** — a self-observation is synchronous with its sample, so
+the review bullet's stale-samples-in-transit shape has no code to
+fail; the router only ever Relaxed-loads the latest milli-value (same
+as the connection gauge it already read). NIC proximity anchors on
+`nic_numa` (config override; else sysfs
+`/sys/class/net/<if>/device/numa_node`, first sorted interface with a
+real node ≥ 0, `-1` = unknown → skipped; loopback-only rigs discover
+nothing). `pick()` is extracted pure (Candidate view of Route) so the
+full ordering matrix is unit-tested EXACT — the NIC-decisive cases
+construct literal equality in the leading components; integration
+(`tests/loadview.rs`, NIC pinned to NUMA 1 against the 2+1 layout)
+drives the real samplers: an all-zero boot's first connection lands
+nic-local (the exact tie asserted from the same counters the router
+reads), count still outranks proximity, and a hammered worker is
+rejected at a count tie (its EWMA strictly-greater-with-margin —
+deliberately NOT a tie — while the idle workers publish exact 0).
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

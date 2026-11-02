@@ -10,6 +10,7 @@ pub mod boot;
 pub mod checkpointer;
 pub mod config;
 pub mod coop;
+pub mod cpuload;
 pub mod demoheap;
 pub mod deployment;
 pub mod handoff;

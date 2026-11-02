@@ -48,6 +48,15 @@ pub struct WorkerCounters {
     /// count it), and the FR-15 disconnect cleanup of a
     /// mid-transaction session (reaped or otherwise).
     pub rollbacks: AtomicU64,
+    /// The §5.2 composite's CPU component (T5.6, FR-11): this reactor's
+    /// EWMA of its own sampled utilization in milli-units (0..=1 000),
+    /// published by the per-reactor sampler ([`crate::cpuload`]) and
+    /// polled by the router — the spec's "lightweight per-reactor
+    /// atomic counter polled by housekeeper". The count above stays the
+    /// composite's primary key; this distinguishes candidates only at
+    /// equal counts. Zero until the first sample (and for an idle
+    /// reactor — a parked executor burns ~nothing per interval).
+    pub cpu_ewma_milli: AtomicU64,
 }
 
 impl WorkerCounters {

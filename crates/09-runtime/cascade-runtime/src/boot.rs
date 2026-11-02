@@ -156,6 +156,13 @@ impl Worker {
         self.stats.connections.load(Ordering::Relaxed)
     }
 
+    /// This reactor's published CPU-utilization EWMA in milli-units
+    /// (T5.6, FR-11) — the composite's second component, what the router
+    /// reads for exactly this value.
+    pub fn cpu_ewma_milli(&self) -> u64 {
+        self.stats.cpu_ewma_milli.load(Ordering::Relaxed)
+    }
+
     /// Per-tenant counters recorded by this reactor's sessions (FR-20).
     pub fn tenant_counters(&self) -> &TenantCounters {
         &self.tenant_counters
@@ -1067,6 +1074,20 @@ fn spawn_housekeepers(
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
+    // The §5.2 composite's NIC anchor (T5.6): config overrides discovery;
+    // nothing discovered leaves the tie-breaker inert (loopback-only
+    // rigs, single-NUMA hosts). Discovered once — the NIC does not move.
+    let nic_numa = cfg.nic_numa.or_else(|| {
+        let found = crate::topology::discover_nic_numa(crate::topology::NET_DEVICES_ROOT);
+        if let Some(numa) = found {
+            cascade_telemetry::log(
+                cascade_telemetry::Level::Info,
+                "nic_numa_discovered",
+                &[("numa", numa.to_string().as_str())],
+            );
+        }
+        found
+    });
     let mut serving = match (listener, tick_init, checkpoint, recycle, shutdown, drain, reap) {
         (Some(loop_), Some(init), Some(stats), recycle, shutdown, drain, reap) => {
             Some((loop_, auth, senders, worker_numas, counters, tierc_plane, initial, init, designated, stats, recycle, shutdown, drain, reap))
@@ -1103,7 +1124,7 @@ fn spawn_housekeepers(
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
                     loop_, auth, senders, numas, counters, tierc_plane, initial, max_conns,
-                    tick_init, designated, stats, recycle, shutdown, drain, reap,
+                    nic_numa, tick_init, designated, stats, recycle, shutdown, drain, reap,
                 );
             }),
             None => {
@@ -1238,6 +1259,7 @@ fn spawn_workers(
         let task_is_home = Some(numa) == dev_home;
         let reap_reaped_counter = Arc::clone(reap_reaped);
         let reap_timeout_ms = cfg.idle_reap_ms;
+        let task_sample_ms = cfg.load_sample_ms;
         let reap_stall_ms = cfg.stall_reap_ms;
         let task_writer = wal.map(Arc::clone);
         let task_wal_dir = cfg.wal_dir.clone();
@@ -1261,6 +1283,21 @@ fn spawn_workers(
                 // before any session can run on this ring.
                 coop::configure_for_reactor(Arc::clone(&task_stall), deadline);
                 coop::spawn_heartbeat();
+                // The load view's CPU component (T5.6, FR-11): this
+                // reactor samples its OWN thread (pinned — the thread IS
+                // the reactor) every `load_sample_ms` and publishes the
+                // α = 0.5 EWMA milli-value the router polls. `0` disables
+                // (the EWMA stays 0 and routing falls back to count +
+                // NIC). No channel: the published counter is the spec's
+                // "lightweight per-reactor atomic" shape, and the EWMA is
+                // computed here at the sampler — never on the housekeeper
+                // from samples that could go stale in transit.
+                if task_sample_ms > 0 {
+                    crate::cpuload::spawn_sampler(
+                        Duration::from_millis(task_sample_ms),
+                        Arc::clone(&task_counter),
+                    );
+                }
                 // T1.11 (I2): this reactor's WAL handle, opened on — and
                 // owned by — this ring, shared by all its sessions.
                 let wal = match (task_writer, task_wal_dir) {

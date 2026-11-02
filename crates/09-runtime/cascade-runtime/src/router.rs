@@ -9,11 +9,12 @@
 //! Routing resolves the connection's database placement against the Tier C
 //! snapshot (FR-10 — the snapshot, not boot config), restricts the
 //! candidate set (`single` → the bound NUMA's workers only, `cross` → the
-//! whole machine, I13), and picks least-loaded by connection count — the
-//! count component of FR-11's composite (CPU sampling + NIC tie-breaker
-//! arrive in M5 per R9's two phases). A `single` DB whose bound NUMA has
-//! no available worker is refused with PG `53300` naming the NUMA — never
-//! silently crossed (FR-12, R10).
+//! whole machine, I13), and picks by the §5.2 load composite (FR-11, T5.6
+//! — R9's phase two complete): connection count, then the reactor's
+//! published CPU EWMA ([`crate::cpuload`]), then NIC proximity as a
+//! cross-only tie-breaker — see [`composite_key`]. A `single` DB whose
+//! bound NUMA has no available worker is refused with PG `53300` naming
+//! the NUMA — never silently crossed (FR-12, R10).
 
 use std::{
     net::TcpStream,
@@ -54,32 +55,90 @@ pub struct Router {
     routes: Vec<Route>,
     max_conns_per_worker: u32,
     tierc: Arc<Catalog>,
+    /// The NIC's NUMA node (§5.2's proximity tie-breaker, T5.6). Boot
+    /// resolves it once — from config or sysfs discovery — and the NIC
+    /// does not move; `None` leaves the tie-breaker inert.
+    nic_numa: Option<u32>,
+}
+
+/// One candidate for the composite pick — the pure decision's input view,
+/// extracted from [`Route`] (which holds executor-bound senders) so the
+/// full ordering matrix is unit-testable without an executor.
+struct Candidate {
+    numa: u32,
+    load: u64,
+    cpu_milli: u64,
+}
+
+/// The §5.2 load composite (FR-11, R9 phase two) as ONE ordering key,
+/// lexicographic in the spec's listed order: active connections, then
+/// recent CPU utilization (the reactor's published EWMA), then NIC
+/// proximity — which is a TIE-BREAKER ONLY, and meaningful only for
+/// `cross` DBs: a `single` DB's candidate set is already one NUMA, so
+/// proximity cannot discriminate within it, and the key holds its
+/// component at 0 across that set. `None` NIC (undiscovered) is inert
+/// the same way. Each component is consulted only when every earlier
+/// one ties; strict `<` keeps first-route-wins on full ties —
+/// deterministic, as the count-only router was.
+fn composite_key(
+    c: &Candidate,
+    placement: &Placement,
+    nic_numa: Option<u32>,
+) -> (u64, u64, u64) {
+    let nic = match (placement.affinity, nic_numa) {
+        (NumaAffinity::Cross, Some(nic)) if c.numa != nic => 1,
+        _ => 0,
+    };
+    (c.load, c.cpu_milli, nic)
+}
+
+/// The pure pick: filter to the placement's candidate set (I13 affinity
+/// restriction, A7 availability cap), order by the composite key, return
+/// the winner's index. Extracted for the exact-matrix unit tests.
+fn pick(
+    candidates: &[Candidate],
+    placement: &Placement,
+    nic_numa: Option<u32>,
+    cap: u32,
+) -> Option<usize> {
+    let mut best: Option<(usize, (u64, u64, u64))> = None;
+    for (i, c) in candidates.iter().enumerate() {
+        // I13: single-affinity DBs consider only their bound NUMA's
+        // workers; cross DBs the whole machine.
+        if placement.affinity == NumaAffinity::Single && Some(c.numa) != placement.bound_numa {
+            continue;
+        }
+        if c.load >= cap as u64 {
+            continue; // A7: per-worker availability cap
+        }
+        let key = composite_key(c, placement, nic_numa);
+        if best.map_or(true, |(_, b)| key < b) {
+            best = Some((i, key));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 impl Router {
-    /// Pick the least-loaded *candidate* with capacity (FR-11 count
-    /// component, A7 cap, I13 candidate restriction). Ties go to the first
-    /// route — deterministic. Returns `None` when the placement's candidate
-    /// set has no available worker.
+    /// Pick the least-loaded candidate by the §5.2 composite (FR-11):
+    /// see [`composite_key`] for the ordering. Returns `None` when the
+    /// placement's candidate set has no available worker.
     fn choose(&self, placement: &Placement) -> Option<usize> {
-        let mut best: Option<(usize, u64)> = None;
-        for (i, route) in self.routes.iter().enumerate() {
-            // I13: single-affinity DBs consider only their bound NUMA's
-            // workers; cross DBs the whole machine.
-            if placement.affinity == NumaAffinity::Single
-                && Some(route.numa) != placement.bound_numa
-            {
-                continue;
-            }
-            let load = route.counter.connections.load(Ordering::Relaxed);
-            if load >= self.max_conns_per_worker as u64 {
-                continue; // A7: per-worker availability cap
-            }
-            if best.map_or(true, |(_, b)| load < b) {
-                best = Some((i, load));
-            }
-        }
-        best.map(|(i, _)| i)
+        let candidates: Vec<Candidate> = self
+            .routes
+            .iter()
+            .map(|r| Candidate {
+                numa: r.numa,
+                load: r.counter.connections.load(Ordering::Relaxed),
+                cpu_milli: r.counter.cpu_ewma_milli.load(Ordering::Relaxed),
+            })
+            .collect();
+        pick(
+            &candidates,
+            placement,
+            self.nic_numa,
+            self.max_conns_per_worker,
+        )
     }
 
     /// Hand the connection to the chosen worker as a bare fd (FR-13). Takes
@@ -192,6 +251,7 @@ impl Router {
         tierc_plane: TierCPlane,
         initial: ClusterSnapshot,
         max_conns_per_worker: u32,
+        nic_numa: Option<u32>,
         tick_init: crate::orchestrator::OrchestratorInit,
         designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
         checkpoint: crate::checkpointer::CheckpointStats,
@@ -219,6 +279,7 @@ impl Router {
                 routes,
                 max_conns_per_worker,
                 tierc: Arc::clone(&tierc_plane.catalog),
+                nic_numa,
             };
 
             // The orchestrator is serving-thread-local (its jobs may hold
@@ -426,5 +487,92 @@ impl Router {
                 crate::shutdown::run_drain(ctx, &drain_senders);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The full §5.2 ordering matrix, EXACT — synthetic candidates, no
+    /// executor. The tie-review rule (exactly-tied, asserted, not
+    /// approximately) lives here: the NIC-decisive cases construct
+    /// literal equality in the leading components.
+    fn cand(numa: u32, load: u64, cpu_milli: u64) -> Candidate {
+        Candidate { numa, load, cpu_milli }
+    }
+
+    fn place(affinity: NumaAffinity, bound: Option<u32>) -> Placement {
+        Placement { affinity, bound_numa: bound }
+    }
+
+    #[test]
+    fn count_is_primary_cpu_secondary() {
+        let cs = [cand(0, 0, 900), cand(1, 1, 0)];
+        // Count 0 wins over count 1 even with nine times the CPU —
+        // utilization never overturns the primary key.
+        assert_eq!(pick(&cs, &place(NumaAffinity::Cross, None), None, 200), Some(0));
+        // At an exact count tie the EWMA decides.
+        let tied = [cand(0, 2, 500), cand(1, 2, 100)];
+        assert_eq!(pick(&tied, &place(NumaAffinity::Cross, None), None, 200), Some(1));
+    }
+
+    #[test]
+    fn nic_decides_only_on_exact_ties_and_only_cross() {
+        let cs = [cand(0, 1, 0), cand(1, 1, 0)]; // exact (count, cpu) tie
+        let cross = place(NumaAffinity::Cross, None);
+        // NIC on numa 1: the nic-local candidate wins the exact tie...
+        assert_eq!(pick(&cs, &cross, Some(1), 200), Some(1));
+        // ...the same tie with NO nic discovery stays first-wins.
+        assert_eq!(pick(&cs, &cross, None, 200), Some(0));
+        // The same exact tie under `single` binding to numa 0: proximity
+        // is NOT consulted — the candidate set is already one NUMA, so
+        // the tie is full and first-wins keeps the bound-NUMA candidate.
+        assert_eq!(
+            pick(&cs, &place(NumaAffinity::Single, Some(0)), Some(1), 200),
+            Some(0)
+        );
+        // NIC never overturns a count: the distant candidate's count is
+        // LOWER, so it wins despite the nic-local one being occupied.
+        let counts = [cand(0, 0, 0), cand(1, 1, 0)];
+        assert_eq!(pick(&counts, &cross, Some(1), 200), Some(0));
+    }
+
+    #[test]
+    fn cpu_and_nic_only_matter_in_listed_order() {
+        // cpu can overturn NIC-influence within a count tie: the distant
+        // but LESS-USED-cpu candidate beats the nic-local hot one.
+        let cs = [cand(0, 1, 10), cand(1, 1, 900)];
+        assert_eq!(pick(&cs, &place(NumaAffinity::Cross, None), Some(1), 200), Some(0));
+        // ...and NIC resolves only after cpu ties: equal counts, unequal
+        // cpu already decided above; here cpu ties and NIC flips it.
+        let tied = [cand(0, 1, 10), cand(1, 1, 10)];
+        assert_eq!(pick(&tied, &place(NumaAffinity::Cross, None), Some(1), 200), Some(1));
+    }
+
+    #[test]
+    fn full_ties_stay_first_wins_and_filters_hold() {
+        // Full tie: first route (deterministic, as the count-only router).
+        let cs = [cand(0, 1, 5), cand(1, 1, 5)];
+        assert_eq!(pick(&cs, &place(NumaAffinity::Cross, None), Some(0), 200), Some(0));
+        // A7 cap: at-cap candidates are unavailable even if perfect.
+        assert_eq!(pick(&cs, &place(NumaAffinity::Cross, None), None, 1), None);
+        let capped = [cand(0, 1, 0), cand(1, 0, 0)];
+        assert_eq!(pick(&capped, &place(NumaAffinity::Cross, None), None, 1), Some(1));
+        // I13: single binding filters the candidate set, whatever the
+        // other candidates' keys look like.
+        let scattered = [cand(0, 0, 0), cand(1, 1, 0), cand(2, 2, 0)];
+        assert_eq!(
+            pick(&scattered, &place(NumaAffinity::Single, Some(2)), None, 200),
+            Some(2),
+            "only the bound NUMA is a candidate, even at higher load"
+        );
+        // Single bound to a NUMA whose candidates are all at cap: refused.
+        let drained = [cand(7, 1, 0), cand(3, 3, 0)];
+        assert_eq!(
+            pick(&drained, &place(NumaAffinity::Single, Some(7)), None, 1),
+            None,
+            "FR-12's precondition: no available worker on the bound NUMA"
+        );
     }
 }

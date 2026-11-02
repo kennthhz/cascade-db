@@ -245,3 +245,76 @@ impl TopologyProvider for AllowedCpuTopology {
         None
     }
 }
+
+/// Sysfs root for NIC discovery — factored for the unit test, which builds
+/// the same shape under a temp root.
+pub const NET_DEVICES_ROOT: &str = "/sys/class/net";
+
+/// The NIC's NUMA node for the §5.2 composite's proximity tie-breaker
+/// (T5.6, FR-11) — the node whose memory and driver queues the NIC's PCI
+/// device is local to. Discovered from sysfs, no C deps (plan R4):
+/// the first interface (sorted by name, so the pick is deterministic)
+/// whose `device/numa_node` exists and reports a real node (>= 0).
+/// `None` when nothing is discoverable — loopback-only hosts (the usual
+/// test rig; loopback has no PCI device at all) and NICs whose firmware
+/// reports `-1` — and the tie-breaker is then inert, exactly like an
+/// unset `nic_numa` config.
+pub fn discover_nic_numa(root: &str) -> Option<u32> {
+    let mut ifaces: Vec<_> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect();
+    ifaces.sort();
+    for iface in ifaces {
+        let path = std::path::Path::new(root)
+            .join(iface)
+            .join("device/numa_node");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue; // virtual interface, or no PCI device behind it
+        };
+        match text.trim().parse::<i64>() {
+            // -1 is the kernel's "unknown node" — a discovery miss, not
+            // node 0; keep looking (a later interface may report one).
+            Ok(node) if node >= 0 => return Some(node as u32),
+            _ => continue,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod nic_tests {
+    use super::*;
+
+    /// Discovery walks the sorted interfaces, skips virtual ones (no
+    /// `device/numa_node`) and unknown-node ones (`-1`), and takes the
+    /// first real node — deterministically, whatever the OS's
+    /// directory order.
+    #[test]
+    fn nic_discovery_skips_virtual_and_unknown_takes_the_first_real_node() {
+        let root = std::env::temp_dir().join(format!("cascade-nic-{}", std::process::id()));
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // eth0: virtual (no device link at all — just the interface dir).
+        // lo: loopback (same). eth1: PCI device whose firmware reports no
+        // node (-1). eth2: a real node 0. eth3: a real node 1 — must NOT
+        // win; the sort put eth2 first.
+        std::fs::create_dir_all(root.join("eth0")).unwrap();
+        std::fs::create_dir_all(root.join("lo")).unwrap();
+        write("eth1/device/numa_node", "-1\n");
+        write("eth2/device/numa_node", "0\n");
+        write("eth3/device/numa_node", "1\n");
+        assert_eq!(discover_nic_numa(root.to_str().unwrap()), Some(0));
+        // Only an unknown-node NIC: no discovery, inert tie-breaker.
+        let only_unknown = root.join("only-unknown");
+        std::fs::create_dir_all(only_unknown.join("device")).unwrap();
+        std::fs::write(only_unknown.join("device/numa_node"), "-1\n").unwrap();
+        assert_eq!(discover_nic_numa(only_unknown.to_str().unwrap()), None);
+        // A missing root is the same honest miss (no panic, no guess).
+        assert_eq!(discover_nic_numa("/nonexistent-cascade-nic"), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+}
