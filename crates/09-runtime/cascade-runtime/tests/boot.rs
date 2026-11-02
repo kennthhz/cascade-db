@@ -100,7 +100,7 @@ fn refuses_core_provider_claims_but_kernel_rejects() {
 /// by default (it pins real threads); run explicitly with
 /// `cargo test -- --ignored`.
 #[test]
-#[ignore]
+#[ignore = "pins real threads; run explicitly with --ignored (due at the T5.7 bare-metal gate)"]
 fn boots_bare_metal() {
     let allowed = pin::current_affinity();
     assert!(

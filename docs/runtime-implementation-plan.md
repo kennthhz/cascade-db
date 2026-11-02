@@ -395,6 +395,7 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - Tests: real pinning; kernel-cmdline verification against a genuinely isolated host; NUMA locality (numa_maps); affinity refusal on a 2-NUMA box; crash matrix at scale; **soak: 10 000 idle + 1 000 active connections** (§1 goal sanity, not a gate blocker).
 - Code review: full-milestone diff re-reviewed against §5 end to end (not just the last task).
 - Test review: every `#[ignore]` reason string verified still-accurate; flaky candidates from CI history re-run N times.
+- **DEFERRED (2026-11-01):** no bare-metal multi-NUMA host is available; the gate runs unchanged when one is. T5.1–T5.6 are committed and green, and nothing else in the plan depends on this task — M5 is otherwise closed. The three `#[ignore]` tests (`pools_are_node_local_on_bare_metal`, `provisioned_host_boots_without_warnings`, `boots_bare_metal`) are the entry points; their reason strings name what each needs.
 
 ### Milestone gates
 
