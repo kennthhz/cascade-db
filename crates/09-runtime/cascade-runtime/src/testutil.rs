@@ -19,7 +19,10 @@
 //! aborts the process. Idempotent per binary; arm it in every fixture
 //! that boots a runtime.
 
-use std::sync::{Mutex, Once};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex, Once,
+};
 use std::time::Duration;
 
 /// Default whole-binary budget: the slowest suite runs in well under 10 s
@@ -105,4 +108,26 @@ pub fn arm_suite_watchdog() {
             })
             .expect("suite watchdog thread spawns");
     });
+}
+
+// ---- The H2 discriminator's deterministic park ----
+
+/// Set by a test to hold the Tier C writer: a received change parks
+/// received-but-unapplied — its session's gauge is up, its ack unsent —
+/// until released. The shutdown-drain test arms the hold BEFORE the DDL
+/// is even sent, so the change is provably mid-bounce when shutdown
+/// begins; `writer_loop` polls this once per DDL (one relaxed load —
+/// DDLs are rare and the park loop runs only while a test holds).
+static WRITER_PRE_APPLY_HOLD: AtomicBool = AtomicBool::new(false);
+
+/// Arms (`true`) or releases (`false`) the writer hold. See
+/// [`WRITER_PRE_APPLY_HOLD`].
+pub fn hold_writer_before_apply(hold: bool) {
+    WRITER_PRE_APPLY_HOLD.store(hold, Ordering::Relaxed);
+}
+
+/// The writer-side read. `pub(crate)` — production code consults it,
+/// only tests set it.
+pub(crate) fn writer_held_before_apply() -> bool {
+    WRITER_PRE_APPLY_HOLD.load(Ordering::Relaxed)
 }

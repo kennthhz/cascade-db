@@ -269,6 +269,102 @@ fn idle_connections_do_not_block_the_drain() {
     }
 }
 
+/// H2 (post-M5 review): a DDL in flight at SIGTERM must DRAIN, not die.
+/// Pre-fix, `run_drain` blocked the serving ring in `wait_inflight`'s
+/// `std::thread::sleep` loop — but the in-flight CREATE ROLE completes
+/// only when the ring polls `writer_loop`, so the gauge never dropped,
+/// the whole deadline burned (force-abort), the flush acks inherited a
+/// zero budget, and a HEALTHY system exited shutdown with the clean
+/// marker refused. The cooperative drain keeps the ring alive: the
+/// bounce completes mid-drain, the gauge drops, the acks get their
+/// budget, the marker stamps.
+///
+/// Deterministic park: the test holds the writer BEFORE the DDL is even
+/// sent (testutil's hold — the env-gated WAL crash barriers are unusable
+/// here: they sit in the ordinary INSERT path, and arming them
+/// in-process would park every later INSERT in this binary), proves the
+/// statement is in flight via the statements counter (counted at
+/// `execute()` entry; it cannot COMPLETE — the writer that would apply
+/// it is held — so its gauge is up), then shuts down, waits out the
+/// drain's entry, and releases.
+#[test]
+fn ddl_in_flight_at_shutdown_drains_cleanly() {
+    let _serial = serial();
+    let fx = boot(true, 10_000, 5);
+    cascade_runtime::testutil::hold_writer_before_apply(true);
+    let addr = fx.addr.clone();
+
+    // One CREATE ROLE from a helper thread; its ack is the first
+    // discriminator (the bounce must be carried, not waited out).
+    let (ddl_tx, ddl_rx) = std::sync::mpsc::channel();
+    let ddl_thread = std::thread::spawn(move || {
+        let mut c = postgres::Client::connect(
+            &format!("postgres://alice:pw@{addr}/dev"),
+            postgres::NoTls,
+        )
+        .expect("client connects");
+        c.simple_query("CREATE ROLE h2_inflight")
+            .expect("the in-flight DDL completes");
+        let _ = ddl_tx.send(());
+    });
+
+    // The statement has ENTERED (counted at execute entry) and provably
+    // cannot complete: the writer that would apply it is held.
+    let entered = Instant::now();
+    while fx.rt.stats().statements == 0 {
+        assert!(
+            entered.elapsed() < Duration::from_secs(10),
+            "the DDL never reached the session"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    // Shutdown while the DDL is mid-bounce — INLINE, because `Runtime`
+    // is deliberately !Send (ring-local state); the release runs on a
+    // helper thread instead (a bare bool store, no runtime needed). The
+    // grace before release is LOAD-BEARING: by ~100 ms the accept loop
+    // has broken and the drain entered its wait (shutdown(2) wakes a
+    // blocked accept immediately) — releasing earlier would let the
+    // still-running accept loop's yields complete the bounce before the
+    // drain ever looked, gutting the discrimination.
+    let releaser = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(100));
+        cascade_runtime::testutil::hold_writer_before_apply(false);
+    });
+    let report = fx.rt.shutdown();
+    releaser.join().expect("releaser joins");
+    // The phase vector first: a regression fails HERE, loudly naming the
+    // burned-deadline shape, instead of after the ack wait below.
+    assert_eq!(
+        report.phases,
+        [
+            "accept-stopped",
+            "refuse-new",
+            "sessions-drained",
+            "final-wal-flush",
+            "final-bpm-flush",
+            "clean-marker",
+            "reactors-dropped",
+        ],
+        "the drain carried the bounce to a fully clean shutdown: {:?}",
+        report.phases
+    );
+    ddl_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the client's CREATE ROLE was acked, not abandoned");
+    // Joining the client thread too: a panic inside it (connect failed,
+    // the server answered with an error) must fail this test loudly, not
+    // vanish into a detached thread.
+    ddl_thread.join().expect("the DDL client thread joins cleanly");
+    // The WAL is clean for the next boot — the marker the pre-fix drain
+    // refused is exactly what a healthy system must stamp.
+    let db = DatabaseId(0);
+    let marker = fx.wal_dir.join(format!("db_{}.clean", db.0));
+    assert!(marker.exists(), "the clean marker was written");
+    let plan = cascade_runtime::recovery::prepare(&fx.wal_dir, db).expect("recovery reads");
+    assert!(!plan.unclean, "a clean shutdown never replays a crash");
+}
+
 /// A listenerless boot orchestrates nothing (D9): shutdown degenerates to
 /// the joins, and the trace records exactly that — no drain phases, no
 /// marker, no flushes.

@@ -504,7 +504,7 @@ impl Router {
             // `drain_loop`.
             if let Some(ctx) = &shutdown {
                 ctx.trace.record("accept-stopped");
-                crate::shutdown::run_drain(ctx, &drain_senders);
+                crate::shutdown::run_drain(ctx, &drain_senders).await;
             }
         });
     }

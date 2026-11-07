@@ -611,6 +611,13 @@ async fn writer_loop(
 
     while let Some(cmd) = cmds.recv().await {
         let WriteCmd::Apply(issuer, change, ack) = cmd;
+        // Test-only hold (testutil's H2 discriminator park): a held
+        // change sits received-but-unapplied — its session's gauge is
+        // up, its ack unsent — until the test releases. Production
+        // cost: one relaxed load per DDL.
+        while crate::testutil::writer_held_before_apply() {
+            glommio::timer::sleep(Duration::from_millis(1)).await;
+        }
         // The ack is ALWAYS last and the stores ALWAYS follow one
         // successful apply: a refused change (Failed) publishes nothing
         // and fans nothing out — the ack travels alone. The ordering is

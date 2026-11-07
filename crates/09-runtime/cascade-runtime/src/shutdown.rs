@@ -15,6 +15,14 @@
 //!                           The wait counts *in-flight statements*, not
 //!                           connections — an idle client blocks nothing,
 //!                           exactly like an idle txn-free backend in PG.
+//!                           The wait is COOPERATIVE (the H2 review fix):
+//!                           it sleeps on glommio's timer, yielding the
+//!                           ring, so an in-flight DDL's writer keeps
+//!                           running and the bounce completes mid-drain —
+//!                           the first draft blocked the ring, and every
+//!                           shutdown with a DDL in flight burned the
+//!                           deadline, ran the acks at a zero budget, and
+//!                           refused its own clean marker.
 //!                           Past `drain_deadline` the rest force-abort:
 //!                           the waiter is bounded (unit-tested), and the
 //!                           reactor drop in step 5 closes whatever fds
@@ -51,7 +59,7 @@ use std::{
     rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, RecvTimeoutError},
+        mpsc::{Receiver, RecvTimeoutError, TryRecvError},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -196,13 +204,19 @@ impl ShutdownTrace {
     }
 }
 
-/// §10.2 step 2c's waiter: returns once every gauge is at zero, or
-/// `true` (the deadline expired; the rest force-abort) at exactly the
-/// deadline — never later, and never on a *hang* path that silently
-/// turns every shutdown into the deadline path. One millisecond of
-/// granularity is far below any real drain budget and costs a single
-/// poll per ms on a thread whose next job is to shut the server down.
-pub fn wait_inflight(gauges: &[Arc<AtomicU64>], deadline: Duration) -> bool {
+/// §10.2 step 2c's waiter: resolves once every gauge is at zero
+/// (`false`), or at exactly the deadline (`true` — the rest force-abort)
+/// — never later, and never on a *hang* path that silently turns every
+/// shutdown into the deadline path. The wait is COOPERATIVE (the H2
+/// review fix): each poll sleeps on glommio's timer, which yields the
+/// ring, so the sibling tasks whose completions this wait exists for —
+/// above all the Tier C writer carrying an in-flight DDL — keep running
+/// while it polls. The first draft blocked in `std::thread::sleep`: a
+/// DDL in flight at SIGTERM could never finish (its writer sat frozen
+/// mid-ring), so the gauge never dropped, the deadline always burned,
+/// and the ack waits below inherited a zero budget. One millisecond of
+/// granularity is far below any real drain budget.
+pub async fn wait_inflight(gauges: &[Arc<AtomicU64>], deadline: Duration) -> bool {
     let end = Instant::now() + deadline;
     loop {
         if gauges.iter().all(|g| g.load(Ordering::Relaxed) == 0) {
@@ -211,7 +225,7 @@ pub fn wait_inflight(gauges: &[Arc<AtomicU64>], deadline: Duration) -> bool {
         if Instant::now() >= end {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(1));
+        glommio::timer::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -236,17 +250,44 @@ pub struct ServingShutdown {
     pub wal: Option<(Arc<cascade_wal::WalWriter>, std::path::PathBuf)>,
 }
 
+/// The ack wait, cooperative for the same reason as [`wait_inflight`]:
+/// a blocking `recv_timeout` would park this ring for the whole budget
+/// (or — at the zero budget the deadline path leaves — report Timeout
+/// for acks that were microseconds away), and a parked ring is exactly
+/// what the flushes' sibling tasks don't need at shutdown. Mirrors
+/// `recv_timeout`'s three outcomes.
+async fn recv_acked(
+    rx: &Receiver<Result<(), String>>,
+    budget: Duration,
+) -> Result<Result<(), String>, RecvTimeoutError> {
+    let end = Instant::now() + budget;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return Ok(v),
+            Err(TryRecvError::Disconnected) => return Err(RecvTimeoutError::Disconnected),
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= end {
+            return Err(RecvTimeoutError::Timeout);
+        }
+        glommio::timer::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// §10.2 steps 2–4 on the serving thread, after its accept loop broke on
 /// the flag ("accept-stopped" is recorded by the caller, which knows the
-/// loop broke). `senders` are the *connected* drain-channel senders with
-/// each site's home flag — the serving side keeps its own family, so the
-/// drain never contends with the orchestrator's tick jobs for a sender
-/// slot.
-pub fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSender<DrainMsg>)]) {
+/// loop broke). The waits are COOPERATIVE — this is `async` on the
+/// serving ring, the H2 review fix: a ring blocked in a sleep loop could
+/// never complete the very work the drain waits on, so any shutdown
+/// with a DDL in flight burned the deadline and refused its marker.
+/// `senders` are the *connected* drain-channel senders with each site's
+/// home flag — the serving side keeps its own family, so the drain
+/// never contends with the orchestrator's tick jobs for a sender slot.
+pub async fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSender<DrainMsg>)]) {
     // Step 2: refuse new statements, wait the in-flight ones out.
     ctx.draining.store(true, Ordering::Relaxed);
     ctx.trace.record("refuse-new");
-    let aborted = wait_inflight(&ctx.inflight, ctx.deadline);
+    let aborted = wait_inflight(&ctx.inflight, ctx.deadline).await;
     ctx.trace.record(if aborted {
         "force-abort"
     } else {
@@ -275,7 +316,7 @@ pub fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSender<D
     let budget_start = Instant::now();
     for (i, rx) in acks.iter().enumerate() {
         let left = ctx.deadline.saturating_sub(budget_start.elapsed());
-        match rx.recv_timeout(left) {
+        match recv_acked(rx, left).await {
             Ok(Ok(())) => {
                 // The home ack (slot 0 after the ordering, and
                 // `home_present` says a home site actually exists) means
@@ -337,6 +378,15 @@ pub fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSender<D
 mod tests {
     use super::*;
 
+    /// The drain's waits are cooperative — run them on an executor.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("shutdown-unit-ring")
+            .make()
+            .expect("executor builds")
+            .run(fut)
+    }
+
     /// The trace preserves real completion order — the whole point of the
     /// sequence assertion.
     #[test]
@@ -352,7 +402,7 @@ mod tests {
     fn wait_inflight_returns_immediately_when_idle() {
         let gauges = vec![Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
         let started = Instant::now();
-        assert!(!wait_inflight(&gauges, Duration::from_secs(30)));
+        assert!(!block_on(wait_inflight(&gauges, Duration::from_secs(30))));
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "an idle fleet must not wait the deadline: {:?}",
@@ -368,7 +418,10 @@ mod tests {
         let gauges = vec![Arc::new(AtomicU64::new(1)), Arc::new(AtomicU64::new(0))];
         let deadline = Duration::from_millis(120);
         let started = Instant::now();
-        assert!(wait_inflight(&gauges, deadline), "stuck gauge = force-abort");
+        assert!(
+            block_on(wait_inflight(&gauges, deadline)),
+            "stuck gauge = force-abort"
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed >= deadline && elapsed < deadline + Duration::from_millis(300),
@@ -391,7 +444,7 @@ mod tests {
             clear1.store(0, Ordering::Relaxed);
         });
         let started = Instant::now();
-        assert!(!wait_inflight(&gauges, Duration::from_secs(30)));
+        assert!(!block_on(wait_inflight(&gauges, Duration::from_secs(30))));
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "drained mid-wait returns early: {:?}",

@@ -596,6 +596,34 @@ property: with two dozen silent sockets burying the accept loop at a
 socket is cut by the budget, not left hanging), and wakeups stay
 handshake-paced, not idle-paced.
 
+**Post-M5 review fix 3 — the shutdown drain is cooperative (H2).** The
+review's second high finding: `run_drain` BLOCKED the serving ring —
+`wait_inflight` in a `std::thread::sleep` loop, the flush acks in
+blocking `recv_timeout`s — but an in-flight DDL completes only when the
+ring polls `writer_loop`, so a DDL caught by SIGTERM could never
+finish: the gauge never dropped, the WHOLE `drain_deadline` burned
+(force-abort on a healthy system), the acks inherited a zero budget,
+and the clean marker was refused — every shutdown with work in flight
+became a crash recovery. The drain is now `async` on the serving ring:
+`wait_inflight` and the ack waits (`recv_acked`, a `try_recv` loop
+mirroring `recv_timeout`'s three outcomes) sleep on glommio's timer,
+yielding between polls, so the bounce completes MID-DRAIN and the
+marker stamps. The one-budget ack rule, the identity-keyed home ack,
+and the trace's phase vector are all unchanged. The discriminator
+(`tests/shutdown.rs::ddl_in_flight_at_shutdown_drains_cleanly`) parks
+the writer deterministically with a NEW testutil hold
+(`hold_writer_before_apply` — one relaxed load per DDL in production;
+the env-gated WAL crash barriers were unusable here because they sit
+in the ordinary INSERT path and would park every later INSERT in the
+binary): hold BEFORE the DDL is sent, prove it in-flight via the
+statements counter, shut down, release after a 100 ms grace (the
+grace is load-bearing — an early release lets the still-running accept
+loop complete the bounce and gut the discrimination), and assert the
+FULL clean phase vector + the client's ack + the marker on disk.
+Verified to fail against the pre-fix drain (DDL abandoned at the
+burned deadline). `Runtime` being `!Send` shaped the test: shutdown
+runs inline, the release on a helper thread.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:
