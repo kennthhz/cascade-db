@@ -102,7 +102,7 @@ work is centralized on the *serving* housekeeper: `Orchestrator`
 (`src/orchestrator.rs`) owns a fixed-grid tick schedule
 (`deadline + n·interval`), and the router loop interleaves it with accept
 via `SO_RCVTIMEO` — `accept` sleeps up to the next tick deadline
-(`until_next`), and every timeout return fires `poll_due` (at most ONE
+(`until_next`), and EVERY loop pass fires `poll_due` at its top (at most ONE
 tick per call; a buried grid re-arms one interval from *now*, skip-late —
 no burst catch-up, no compounding drift, and no re-entrancy: jobs run
 sequentially on the one thread). Jobs implement `TickJob` and are
@@ -578,6 +578,23 @@ deadline while every per-read gap sits inside `SO_RCVTIMEO`; and the
 end-to-end discriminator boots a real runtime (budget 300 ms) where
 one stalled handshake cannot stop another client's INSERT, and the
 stalled connection is cut, not held.
+
+**Post-M5 review fix 2 — ticks poll on every pass, not on timeout
+(M1).** The same review caught the tick poll living ONLY in the
+accept-timeout arm while the quantum comment above it claimed "on
+every return": under sustained connection churn — a backlog that
+never drains — no pass ever times out, and every tick job suspends
+precisely while the server is busiest. `orchestrator.poll_due()` now
+runs at the top of every serving pass, before `until_next` reads the
+park (due jobs fire first, so the park never waits on a passed
+deadline); the redundant call in the timeout arm is gone, and the
+Interrupted/ConnectionAborted arms — which also skipped the poll —
+are covered by the same move. `tests/tick.rs` pins the system
+property: with two dozen silent sockets burying the accept loop at a
+200 ms handshake budget, ticks still advance (≥ 4 in 1.5 s at a
+50 ms interval), the churn is provably engaged (the first stall
+socket is cut by the budget, not left hanging), and wakeups stay
+handshake-paced, not idle-paced.
 
 ## Open Design Questions
 

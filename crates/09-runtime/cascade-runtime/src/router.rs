@@ -401,6 +401,15 @@ impl Router {
                 // idle-rate observable for FR-5/T4.1: an idle server wakes
                 // ~once per tick — a `loop {}` would show millions.
                 wakeups.fetch_add(1, Ordering::Relaxed);
+                // Ticks poll at the TOP of every pass, not inside the
+                // accept-timeout arm below (the M1 review find): with a
+                // backlog that never drains — sustained connection churn —
+                // no pass ever times out, and a poll parked in that arm
+                // suspends every tick job precisely while the server is
+                // busiest. Polling first also keeps `until_next` honest
+                // for the pass's park: due jobs fire before their deadline
+                // is read, so the park never waits on a passed deadline.
+                orchestrator.poll_due();
                 // The serving quantum: every cross-ring stage of the DDL
                 // bounce (the write forwarder, the writer's budgeted
                 // fan-out wait, the ack) resumes only when an accept
@@ -409,8 +418,9 @@ impl Router {
                 // interval — measured at ~6 s per CREATE ROLE under the
                 // 1 s default tick, which quietly broke R11's bounded
                 // ack. The quantum bounds it at a few tens of ms instead;
-                // ticks still fire exactly, via `poll_due` on every
-                // return — only the idle WAKEUP RATE rises to the quantum
+                // ticks still fire exactly, via the poll at the top of
+                // every pass — only the idle WAKEUP RATE rises to the
+                // quantum
                 // when `tick_ms` exceeds it (fixtures ticking at or below
                 // 50 ms — where the FR-5 wakeups ≈ ticks assertions live —
                 // are unaffected: their `until_next` is already the
@@ -422,12 +432,12 @@ impl Router {
                     .expect("SO_RCVTIMEO set");
                 let mut stream = match listener.accept() {
                     Ok((s, _)) => s,
-                    // Timed out or raced the timeout: the tick window is up.
+                    // Timed out or raced the timeout: the pass's tick poll
+                    // already ran at the top.
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        orchestrator.poll_due();
                         if shutdown_flagged(shutdown.as_ref().map(|s| &s.flag)) {
                             break;
                         }

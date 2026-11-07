@@ -10,6 +10,8 @@
 //! four orders of magnitude.
 
 use std::{
+    io::Read,
+    net::TcpStream,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -299,6 +301,76 @@ fn ticks_continue_under_client_load() {
         wal_ids.len(),
         acked.len()
     );
+}
+
+/// M1 (post-M5 review): sustained connection churn — an accept backlog
+/// that never drains — must not suspend the tick loop. Pre-fix,
+/// `poll_due` ran ONLY in the accept-timeout arm, and churn means no
+/// pass ever times out: ticks froze precisely while the server was
+/// busiest (the fix moves the poll to the top of every pass).
+///
+/// The churn's pacing knob is H1's handshake budget: each accepted
+/// stall socket parks the handshake for exactly this long, which is
+/// what spaces the passes the tick poll now rides — at the 60 s
+/// default one stalled socket would bury the loop past the whole
+/// window, ticks or no ticks.
+#[test]
+fn ticks_survive_connection_churn() {
+    let _serial = serial();
+    let dir = temp_wal_dir();
+    let (topo, mut cfg) = config(Some(&dir), 50);
+    cfg.handshake_timeout_ms = 200;
+    let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
+    let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
+        .expect("boot routed");
+    let stats = rt.orchestrator().expect("tick stats").clone();
+
+    // Pre-arm the backlog and HOLD it: a connected-but-silent socket
+    // only stalls the handshake while the client keeps its fd open (a
+    // dropped fd is a FIN, and the handshake would end at once). Each
+    // socket buys one ~200 ms pass; 24 of them bury the accept loop
+    // for ~4.8 s — comfortably past the 2.5 s window.
+    let mut first_stall = TcpStream::connect(format!("127.0.0.1:{port}")).expect("stall socket");
+    // `_stalls`: held until scope end — that hold is the churn.
+    let _stalls: Vec<TcpStream> = (0..23)
+        .map(|_| TcpStream::connect(format!("127.0.0.1:{port}")).expect("stall socket"))
+        .collect();
+
+    let (t0, w0) = (stats.ticks(), stats.wakeups());
+    const CHURN_MS: u64 = 2500;
+    std::thread::sleep(Duration::from_millis(CHURN_MS));
+
+    // The churn was real, not vacuous: the first stall socket was
+    // accepted, parked for its budget, and CUT — the loop genuinely
+    // never idled into a timeout return during the window, which is
+    // exactly the condition that used to starve the ticks.
+    first_stall
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut eof = [0u8; 1];
+    assert!(
+        matches!(first_stall.read(&mut eof), Ok(0) | Err(_)),
+        "the server never processed the stall socket — churn not engaged"
+    );
+
+    let ticks = stats.ticks() - t0;
+    let wakeups = stats.wakeups() - w0;
+    // Passes under churn are handshake-paced (~one per 200 ms stalled
+    // socket — wakeups ≈ CHURN_MS/200), and at most one tick fires per
+    // pass, so 4 ticks demands ≥ 4 passes: 2.5 s buys ~12 nominal,
+    // still ≥ 4 at 2× CI slop.
+    assert!(
+        ticks >= 4,
+        "{CHURN_MS}ms of churn at a 50ms interval fired only {ticks} ticks — \
+         the tick poll is not on every pass"
+    );
+    assert!(
+        wakeups >= ticks,
+        "{wakeups} wakeups cannot have discovered {ticks} ticks"
+    );
+    // The stall sockets live until scope end — that hold is the churn.
 }
 
 /// Compute-only boot (no listener): nothing serves, nothing ticks (D9) —
