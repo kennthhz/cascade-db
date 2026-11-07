@@ -102,3 +102,36 @@ fn refuses_worker_numa_unknown_to_the_topology() {
         "the refusal names the label: {err}"
     );
 }
+
+/// L2: the same refusal for a CONFIGURED `nic_numa` no node carries —
+/// the composite's proximity tie-breaker can never fire for such a
+/// value, so the config presents location the machine does not have.
+/// Pre-fix, the out-of-range label silently degraded to that constant,
+/// inert term and boot succeeded. (The DISCOVERED NIC node is
+/// deliberately outside this check — sysfs is the machine's fact.)
+#[test]
+fn refuses_configured_nic_numa_unknown_to_the_topology() {
+    // All three cores on node 0; workers honestly on node 0; the NIC
+    // claimed on a node that does not exist. No pin is attempted.
+    let topo = SyntheticTopology::new([0, 1, 2]);
+    let cfg = RuntimeConfig {
+        housekeeper_cores: vec![0],
+        worker_cores: vec![NumaWorkers {
+            numa: 0,
+            cores: vec![1, 2],
+        }],
+        numa_pools: vec![NumaPool {
+            numa: 0,
+            size_mb: 1,
+        }],
+        nic_numa: Some(9),
+        ..RuntimeConfig::default()
+    };
+    cascade_runtime::testutil::arm_suite_watchdog();
+    let err = Runtime::boot_routed(&cfg, &topo, None, AuthConfig::default(), None)
+        .expect_err("an unknown nic_numa refuses the boot");
+    assert!(
+        matches!(err, BootError::NumaLabelUnknown { numa: 9 }),
+        "the refusal names the label: {err}"
+    );
+}

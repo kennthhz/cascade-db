@@ -540,7 +540,8 @@ housekeeper** — a self-observation is synchronous with its sample, so
 the review bullet's stale-samples-in-transit shape has no code to
 fail; the router only ever Relaxed-loads the latest milli-value (same
 as the connection gauge it already read). NIC proximity anchors on
-`nic_numa` (config override; else sysfs
+`nic_numa` (config override — a value no node carries refuses boot
+like a worker label (fix 7); else sysfs
 `/sys/class/net/<if>/device/numa_node`, first sorted interface with a
 real node ≥ 0, `-1` = unknown → skipped; loopback-only rigs discover
 nothing). `pick()` is extracted pure (Candidate view of Route) so the
@@ -698,6 +699,51 @@ pools.rs review's landed decision). Discriminator:
 The affected test fixtures now label their topologies to match their
 configs (`loadview`, `affinity`, `auth`, `walhome` — a two-node
 config needs a two-node topology).
+
+**Post-M5 review fix 7 — the lows batch: lexical fidelity, honest
+counters, and the doc-vs-code gaps.** The splitter
+(`sql::split_statements`) is now lexically aware — dollar quotes
+(`$$…$$`, `$tag$…$tag$`, `$1` positional refs are not openers),
+`E''` backslash escapes, quoted identifiers, `--` line comments,
+nested `/* … */` — and drops empty fragments, which makes `;;`
+PG-faithful: an all-empty batch answers exactly ONE
+EmptyQueryResponse and `stmt;;` answers nothing for its tail (the
+old quote-toggle shape shredded legal scripts at any of the covered
+forms and answered per empty fragment). `U&'…'` strings are the
+documented gap. Config validation gained two rules: a CONFIGURED
+`nic_numa` no node carries refuses boot under the M5 variant
+(generalized: the discovered sysfs value is exempt — the machine's
+fact, not the config's claim), and `drain_deadline_s` caps at 3600
+like the handshake budget — `u64::MAX` used to pass `> 0` and panic
+the drain waiter's `Instant + Duration`. `wal_homes.toml` writes
+temp+fsync+rename(+dir fsync) — the old in-place write could tear,
+and a torn catalog reads as empty and silently re-derives (A14's
+migration hazard). `reclaimed_bytes` now counts bytes physically
+reclaimed (zero until the segmented WAL — the decision's prefix was
+re-added every pass); an unprimed `CpuSampler` (construction
+getrusage refused) baselines at its first real reading instead of
+spanning from 0 (which seeded the EWMA saturated). Three doc-vs-code
+gaps corrected: the `apply` binding stays the static least-loaded
+proxy (the live load view sharpens routing, never the row), EOF
+mid-startup maps to `Closed` (true since the H1 rewrite — the
+loosened auth tests now pin exactly `Closed`), and an
+idle-in-transaction session at shutdown dies with the process's bare
+close, not 57P01 — the drain reaches a session only at its next
+statement; data-safe because a transaction commits only through its
+own COMMIT being processed. Discriminators (all FAILED pre-fix):
+`tests/query.rs::consecutive_semicolons_answer_at_most_one_empty_query_response`,
+`tests/query.rs::a_dollar_quoted_semicolon_inserts_whole`,
+`tests/boot_failure.rs::refuses_configured_nic_numa_unknown_to_the_topology`,
+one-line reverts of the cpuload baseline and the recycler counter.
+The two load-bound flakes found during the 4–6 gates ride along:
+loadview's exact-zero EWMA asserts now WAIT for the integer EWMA's
+re-zero ((0+1)/2 = 0 within an interval) instead of demanding it
+instantly, and the idle-drain unit bound is 2 s against the 30 s
+deadline (executor spin-up under gate load measured ~80 ms).
+Consciously deferred, per the review's own ranking: low #7 (the
+hot-loop EOF/unreachable arm), #11 and #14 (acknowledged debt /
+documented best-effort), #15 (the fail-safe pin cap); #1 was already
+fixed by the M3 batch.
 
 ## Open Design Questions
 

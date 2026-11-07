@@ -15,6 +15,15 @@
 //!                           The wait counts *in-flight statements*, not
 //!                           connections — an idle client blocks nothing,
 //!                           exactly like an idle txn-free backend in PG.
+//!                           (The refusal reaches a session only at its
+//!                           next statement: a connection parked entirely
+//!                           idle — in a transaction or not — never sees
+//!                           the flag and is closed by process exit, a
+//!                           bare EOF rather than 57P01. Data-safe: a
+//!                           transaction commits only through its own
+//!                           COMMIT being processed, so an idle
+//!                           transaction has nothing unflushed — post-M5
+//!                           review low #13.)
 //!                           The wait is COOPERATIVE (the H2 review fix):
 //!                           it sleeps on glommio's timer, yielding the
 //!                           ring, so an in-flight DDL's writer keeps
@@ -403,9 +412,14 @@ mod tests {
         let gauges = vec![Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
         let started = Instant::now();
         assert!(!block_on(wait_inflight(&gauges, Duration::from_secs(30))));
+        // The bound is generous on purpose (post-M5 review flake fix): the
+        // claim is against the 30 s deadline, and block_on spins up a whole
+        // executor whose first poll under parallel gate load has been
+        // observed at ~80 ms — far under a bound that still pins "the
+        // idle fleet returned at once, not at the deadline".
         assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "an idle fleet must not wait the deadline: {:?}",
+            started.elapsed() < Duration::from_secs(2),
+            "an idle fleet must not approach the deadline: {:?}",
             started.elapsed()
         );
     }
@@ -423,8 +437,12 @@ mod tests {
             "stuck gauge = force-abort"
         );
         let elapsed = started.elapsed();
+        // Lower bound exact (the waiter may not return early on a stuck
+        // gauge), upper slack generous — a loaded executor's timer can
+        // overshoot the 1 ms poll far past the old 300 ms; the claim is
+        // "at the deadline, not a hang", and 2 s keeps it honest.
         assert!(
-            elapsed >= deadline && elapsed < deadline + Duration::from_millis(300),
+            elapsed >= deadline && elapsed < deadline + Duration::from_secs(2),
             "bounded at the deadline, not a hang: {elapsed:?}"
         );
     }

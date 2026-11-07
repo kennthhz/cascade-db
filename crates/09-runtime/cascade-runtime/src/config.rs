@@ -151,7 +151,9 @@ pub struct RuntimeConfig {
     pub yield_deadline_us: u64,
     /// Vectorized batch size (spec §7.1; default 1 024 rows).
     pub batch_rows: u32,
-    /// Shutdown drain budget (spec §10.2; default 30 s).
+    /// Shutdown drain budget (spec §10.2; default 30 s, capped at one
+    /// hour — the same ceiling that keeps the handshake budget's `Instant`
+    /// arithmetic overflow-free).
     pub drain_deadline_s: u64,
     /// Per-worker availability cap (spec §5.2, plan A7; default 200).
     pub max_conns_per_worker: u32,
@@ -308,6 +310,8 @@ pub enum ConfigError {
     ZeroDrainDeadline,
     #[error("runtime.handshake_timeout_ms must be 0 (disabled) or at most 3 600 000")]
     HandshakeTimeoutTooLarge,
+    #[error("runtime.drain_deadline_s must be at most 3 600 (one hour)")]
+    DrainDeadlineTooLarge,
     #[error("runtime.max_conns_per_worker must be > 0")]
     ZeroMaxConns,
     #[error("runtime.tierc_fanout_wait_ms must be > 0")]
@@ -376,6 +380,15 @@ impl RuntimeConfig {
         }
         if self.drain_deadline_s == 0 {
             return Err(ConfigError::ZeroDrainDeadline);
+        }
+        // The same overflow discipline the handshake budget's cap applies
+        // (sibling check below): the drain waiter computes
+        // `Instant::now() + Duration::from_secs(drain_deadline_s)` — under
+        // the old `> 0`-only rule, `u64::MAX` passed validation and
+        // panicked at shutdown (post-M5 review low #12). One hour is the
+        // codebase's budget ceiling.
+        if self.drain_deadline_s > 3_600 {
+            return Err(ConfigError::DrainDeadlineTooLarge);
         }
         // The cap keeps `Instant + Duration` in `pg::handshake`
         // overflow-free (a drain_deadline-style panic is exactly the
@@ -677,6 +690,26 @@ size_mb = 1
             ));
             assert_err(&cfg, expected);
         }
+    }
+
+    /// Post-M5 review low #12: the drain budget is capped like the
+    /// handshake budget — `u64::MAX` used to pass the `> 0`-only rule and
+    /// panic the drain waiter's `Instant + Duration` at shutdown.
+    #[test]
+    fn absurd_drain_deadline_rejected_and_the_cap_is_legal() {
+        assert_err(
+            &with_workers(
+                "drain_deadline_s = 4294967296\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n",
+            ),
+            &ConfigError::DrainDeadlineTooLarge,
+        );
+        assert!(
+            RuntimeConfig::from_toml_str(&with_workers(
+                "drain_deadline_s = 3600\n[[runtime.worker_cores]]\nnuma = 0\ncores = [2]\n"
+            ))
+            .is_ok(),
+            "the cap itself is a legal budget"
+        );
     }
 
     #[test]

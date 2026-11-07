@@ -355,6 +355,16 @@ pub struct Tierc {
 /// gauge the drain waits on: an idle connection holds it at zero, so
 /// idle clients never block a drain — only a statement actually being
 /// processed does.
+///
+/// The honest flip side (post-M5 review low #13): the refusal reaches a
+/// session only when its NEXT statement arrives. A connection parked
+/// entirely idle — in a transaction or not — never observes the flag and
+/// dies with the process's final close: a bare EOF on the wire, not PG's
+/// 57P01 termination. Data-safe (a transaction commits only through its
+/// own COMMIT statement being processed, so an idle transaction has
+/// nothing unflushed), but the §10.2 2c guarantee is about what the
+/// drain waits on — an idle backend waits for nothing — not about every
+/// backend receiving an error message.
 #[derive(Clone)]
 pub struct SessionEnv {
     pub draining: Arc<AtomicBool>,
@@ -646,10 +656,13 @@ async fn execute<W: AsyncWrite + Unpin>(
     // The hot-path shape (FR-20/FR-21): context and span borrowed, per
     // statement, nothing global.
     crate::tenant::debug_hot_path(ctx, span, tenants);
-    // FR-33: attempted statements (parse errors never got here).
-    // Empty statements (";;") are protocol no-ops — an
-    // EmptyQueryResponse and nothing else — and real PostgreSQL counts
-    // neither a command nor a transaction for them.
+    // FR-33: attempted statements (parse errors never got here). Empty
+    // statements are protocol no-ops real PostgreSQL counts as neither a
+    // command nor a transaction — and since the splitter drops empty
+    // fragments (post-M5 review low #5), none arrive from a batch at all:
+    // an all-empty batch answered exactly one EmptyQueryResponse in the
+    // loop above. This arm remains the safety net for a directly-parsed
+    // blank text.
     if !matches!(stmt, Stmt::Empty) {
         stats.statements.fetch_add(1, Ordering::Relaxed);
     }

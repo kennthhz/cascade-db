@@ -70,7 +70,13 @@ fn thread_cpu_us() -> Option<u64> {
 /// a thin `getrusage` + `Instant` wrapper over it.
 pub struct CpuSampler {
     last_wall: Instant,
-    last_cpu_us: u64,
+    /// The previous window's cumulative CPU reading, or `None` when the
+    /// constructor's own reading was refused (getrusage failed) — the
+    /// sampler is then UNPRIMED: the first real reading establishes the
+    /// baseline instead of spanning from 0, which would publish a
+    /// saturated first sample and seed the EWMA at the clamp (post-M5
+    /// review low #10; the run loop already skipped refused reads).
+    last_cpu_us: Option<u64>,
     ewma_milli: u64,
     first: bool,
     out: Arc<WorkerCounters>,
@@ -80,7 +86,7 @@ impl CpuSampler {
     pub fn new(out: Arc<WorkerCounters>) -> Self {
         CpuSampler {
             last_wall: Instant::now(),
-            last_cpu_us: thread_cpu_us().unwrap_or(0),
+            last_cpu_us: thread_cpu_us(),
             ewma_milli: 0,
             first: true,
             out,
@@ -92,9 +98,12 @@ impl CpuSampler {
     /// average; every later one is α = 0.5.
     pub fn step(&mut self, now: Instant, cpu_us: u64) -> u64 {
         let wall = now.duration_since(self.last_wall).as_micros() as u64;
-        let cpu = cpu_us.saturating_sub(self.last_cpu_us);
+        // An unprimed sampler baselines at THIS reading: a zero delta over
+        // the real wall publishes 0 — honest "unknown yet", never the
+        // delta-from-zero that reads as saturated.
+        let cpu = cpu_us.saturating_sub(self.last_cpu_us.unwrap_or(cpu_us));
         self.last_wall = now;
-        self.last_cpu_us = cpu_us;
+        self.last_cpu_us = Some(cpu_us);
         let sample = utilization_milli(cpu, wall);
         self.ewma_milli = if self.first {
             self.first = false;
@@ -169,7 +178,7 @@ mod tests {
         let base_cpu = 1_000_000; // arbitrary cumulative micros
         let mut s = CpuSampler {
             last_wall: t0,
-            last_cpu_us: base_cpu,
+            last_cpu_us: Some(base_cpu),
             ewma_milli: 0,
             first: true,
             out: Arc::clone(&out),
@@ -193,5 +202,36 @@ mod tests {
         let t5 = t3 + Duration::from_millis(2000);
         assert_eq!(s.step(t5, base_cpu + 500_000), 100);
         assert_eq!(out.cpu_ewma_milli.load(Ordering::Relaxed), 100);
+    }
+
+    /// Low #10 (post-M5 review): a refused CONSTRUCTION reading leaves the
+    /// sampler unprimed — the first real reading baselines at itself
+    /// (zero-width window → 0 milli), never at zero, whose delta-from-
+    /// nothing would read as saturated and seed the EWMA at the clamp.
+    #[test]
+    fn an_unprimed_sampler_seeds_zero_not_saturated() {
+        let out = Arc::new(WorkerCounters::new());
+        let t0 = Instant::now();
+        let mut s = CpuSampler {
+            last_wall: t0,
+            last_cpu_us: None,
+            ewma_milli: 0,
+            first: true,
+            out: Arc::clone(&out),
+        };
+        // First reading: 2 s of cumulative CPU over 1 s of wall. The
+        // baseline establishes HERE — 0, not (2 s / 1 s → 1000).
+        let t1 = t0 + Duration::from_millis(1000);
+        assert_eq!(
+            s.step(t1, 2_000_000),
+            0,
+            "unprimed: the first reading sets the baseline"
+        );
+        assert_eq!(out.cpu_ewma_milli.load(Ordering::Relaxed), 0);
+        // The next window is real: 100 ms CPU / 1 s wall → seeded at 0,
+        // then (0 + 100) / 2 = 50.
+        let t2 = t1 + Duration::from_millis(1000);
+        assert_eq!(s.step(t2, 2_100_000), 50);
+        assert_eq!(out.cpu_ewma_milli.load(Ordering::Relaxed), 50);
     }
 }

@@ -405,6 +405,65 @@ fn empty_query_gets_empty_query_response_and_violation_closes() {
     assert_eq!(got, 0, "session closes after a framing violation");
 }
 
+/// Low #5 (post-M5 review), on the wire: `;;` is PG-faithful — empty
+/// statements never answer their own EmptyQueryResponse. An all-empty
+/// batch answers exactly ONE `I` + RFB (the old splitter emitted an empty
+/// fragment per `;` and answered per fragment — two `I`s where PostgreSQL
+/// answers one); a real statement followed by `;;` runs and answers
+/// nothing for the tail — RFB follows the CommandComplete directly.
+fn query_batch(sock: &mut TcpStream, sql: &str) {
+    let mut msg = vec![b'Q'];
+    msg.extend_from_slice(&((sql.len() + 1 + 4) as u32).to_be_bytes());
+    msg.extend_from_slice(sql.as_bytes());
+    msg.push(0);
+    sock.write_all(&msg).unwrap();
+}
+
+#[test]
+fn consecutive_semicolons_answer_at_most_one_empty_query_response() {
+    let fx = boot(1024);
+    let mut sock = TcpStream::connect(&fx.addr).expect("connect");
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    raw_startup_trust(&mut sock);
+
+    // All-empty batch: one 'I', then RFB.
+    query_batch(&mut sock, ";;");
+    assert_eq!(
+        read_msg(&mut sock).0,
+        b'I',
+        "exactly one EmptyQueryResponse for the empty batch"
+    );
+    assert_eq!(read_msg(&mut sock).0, b'Z', "RFB closes the batch");
+
+    // A real statement with an empty tail: statement answers, tail
+    // answers nothing. Pre-fix, an `I` sat between the CommandComplete
+    // and the RFB.
+    query_batch(&mut sock, "SELECT debug_worker();;");
+    assert_eq!(read_msg(&mut sock).0, b'T', "RowDescription");
+    assert_eq!(read_msg(&mut sock).0, b'D', "DataRow");
+    assert_eq!(read_msg(&mut sock).0, b'C', "CommandComplete");
+    let (t, body) = read_msg(&mut sock);
+    assert_eq!(t, b'Z', "RFB directly after the statement — no `I` for the `;;`");
+    assert_eq!(body, b"I", "the session is idle again");
+}
+
+/// Low #4's wire face: a legal statement whose dollar-quoted literal
+/// contains a `;` must insert whole. The old quote-toggle splitter
+/// shredded it at the semicolon, and the first fragment — an unterminated
+/// `$$` — came back a syntax error.
+#[test]
+fn a_dollar_quoted_semicolon_inserts_whole() {
+    let fx = boot(1024);
+    let mut c = client(&fx);
+    c.simple_query("INSERT INTO debug_table VALUES (7, $$rec;ycle$$)")
+        .expect("the semicolon inside $$ is data, not a terminator");
+    let rows = rows_of(
+        &c.simple_query("SELECT val FROM debug_table WHERE id = 7")
+            .expect("select"),
+    );
+    assert_eq!(rows, vec![vec![Some("rec;ycle".into())]]);
+}
+
 /// A hostile 4 GB length header must get an ErrorResponse and a close —
 /// never a worker-side 4 GB allocation (regression: read_message used to
 /// allocate before validating).

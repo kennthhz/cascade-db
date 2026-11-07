@@ -277,9 +277,13 @@ fn mid_handshake_disconnect_closes_cleanly() {
     let (url, done) = serve_one(scram_policy()).unwrap();
     let sock = TcpStream::connect(&url).unwrap();
     drop(sock); // vanish before sending anything
+    // Exactly `Closed` (post-M5 review low #6): every EOF mid-exchange
+    // maps through `io_closed` — the pre-H1 body read fell through to the
+    // `#[from] io::Error` arm and surfaced as `Io`, which is why this arm
+    // used to accept either.
     match done.recv_timeout(Duration::from_secs(5)) {
-        Ok(Err(HandshakeError::Closed)) | Ok(Err(HandshakeError::Io(_))) => {}
-        other => panic!("expected Closed/Io on vanish, got {other:?}"),
+        Ok(Err(HandshakeError::Closed)) => {}
+        other => panic!("expected Closed on vanish, got {other:?}"),
     }
 }
 
@@ -293,9 +297,11 @@ fn truncated_startup_packet_does_not_hang() {
     sock.write_all(&200i32.to_be_bytes()).unwrap();
     sock.write_all(&196_608i32.to_be_bytes()).unwrap();
     drop(sock);
+    // Truncation EOF maps through `io_closed` too — `Closed`, the module
+    // doc's claim, not the `Io` the pre-H1 bare `?` produced.
     match done.recv_timeout(Duration::from_secs(5)) {
-        Ok(Err(HandshakeError::Closed)) | Ok(Err(HandshakeError::Io(_))) => {}
-        other => panic!("expected Closed/Io on truncation, got {other:?}"),
+        Ok(Err(HandshakeError::Closed)) => {}
+        other => panic!("expected Closed on truncation, got {other:?}"),
     }
 }
 

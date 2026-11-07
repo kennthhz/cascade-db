@@ -259,15 +259,20 @@ pub enum BootError {
         #[source]
         source: io::Error,
     },
-    /// A configured WORKER numa label names a node the topology never
-    /// places a core on (M5, post-M5 review): a typo, a stale config, or
-    /// a machine that changed under the config. Placement built on such
-    /// a label would first-touch somewhere else entirely — refused, not
-    /// guessed. Pool labels are outside this check (T2.3's best-effort
-    /// pool placement contract). Checked only when the provider exposes
-    /// NUMA facts at all; an affinity-only provider (containers)
+    /// A configured NUMA label names a node the topology never places a
+    /// core on (M5 + L2, post-M5 review): a typo, a stale config, or a
+    /// machine that changed under the config. A worker label poisons
+    /// placement itself (it would first-touch somewhere else entirely); a
+    /// configured `nic_numa` poisons the proximity claim (its tie-breaker
+    /// term can never fire — a constant, inert contribution the config
+    /// presents as location). Refused, not guessed. Deliberately OUTSIDE
+    /// the check: pool labels (T2.3's best-effort pool placement
+    /// contract) and the DISCOVERED NIC node — sysfs is the machine's own
+    /// fact, not the config's claim, and a NIC on a memory-only node
+    /// legitimately yields an inert term. Checked only when the provider
+    /// exposes NUMA facts at all; an affinity-only provider (containers)
     /// degrades to unverifiable.
-    #[error("worker NUMA group {numa} is unknown to the topology: no online core sits on it")]
+    #[error("NUMA label {numa} is unknown to the topology: no online core sits on it")]
     NumaLabelUnknown { numa: u32 },
 }
 
@@ -346,6 +351,18 @@ impl Runtime {
             for workers in &cfg.worker_cores {
                 if !known_numas.contains(&workers.numa) {
                     return Err(BootError::NumaLabelUnknown { numa: workers.numa });
+                }
+            }
+            // L2 (post-M5 review): the CONFIGURED NIC label is on the same
+            // footing as a worker label — a value no node carries is a
+            // lying proximity claim whose tie-breaker term can never fire
+            // (out-of-range values used to silently degrade to exactly
+            // that inert term). The DISCOVERED value never runs this
+            // check: it is read later, from sysfs, and is the machine's
+            // fact rather than the config's claim.
+            if let Some(nic) = cfg.nic_numa {
+                if !known_numas.contains(&nic) {
+                    return Err(BootError::NumaLabelUnknown { numa: nic });
                 }
             }
         }

@@ -306,7 +306,13 @@ pub fn read_homes(wal_dir: &Path) -> HashMap<u32, u32> {
 
 /// Persists the home choices (A14: chosen at creation, re-read at boot).
 /// Every decided row is written — existing rows are preserved so future
-/// databases' homes are never dropped by a reboot. Failure warns only:
+/// databases' homes are never dropped by a reboot. The write is ATOMIC
+/// (post-M5 review low #8): serialize to a sibling temp file, fsync it,
+/// rename over the catalog, and fsync the directory so the rename itself
+/// survives power loss. The old in-place `fs::write` could be torn by a
+/// crash mid-write, and a torn catalog reads as empty — boot would
+/// silently re-derive and potentially MIGRATE a home across a layout
+/// change, the exact thing A14 exists to prevent. Failure warns only:
 /// the next boot re-derives rather than refusing to start.
 pub fn write_homes(wal_dir: &Path, homes: &HashMap<u32, u32>) {
     let doc = HomesDoc {
@@ -320,24 +326,38 @@ pub fn write_homes(wal_dir: &Path, homes: &HashMap<u32, u32>) {
         },
     };
     let path = homes_path(wal_dir);
-    match toml::to_string(&doc) {
-        Ok(text) => {
-            if let Err(e) = std::fs::write(&path, text) {
-                cascade_telemetry::log(
-                    cascade_telemetry::Level::Warn,
-                    "wal_homes_catalog_unwritable",
-                    &[("path", path.to_string_lossy().as_ref()), ("reason", e.to_string().as_str())],
-                );
-            }
-        }
-        Err(e) => {
-            cascade_telemetry::log(
-                cascade_telemetry::Level::Warn,
-                "wal_homes_catalog_unwritable",
-                &[("path", path.to_string_lossy().as_ref()), ("reason", e.to_string().as_str())],
-            );
-        }
+    let result = toml::to_string(&doc)
+        .map_err(std::io::Error::other)
+        .and_then(|text| write_atomically(&path, &text));
+    if let Err(e) = result {
+        cascade_telemetry::log(
+            cascade_telemetry::Level::Warn,
+            "wal_homes_catalog_unwritable",
+            &[("path", path.to_string_lossy().as_ref()), ("reason", e.to_string().as_str())],
+        );
     }
+}
+
+/// temp file + fsync + rename, in the catalog's own directory (a same-
+/// directory rename is atomic on POSIX). Any error propagates — `fdatasync`
+/// on the WAL commit path has the same discipline, and the caller warns.
+fn write_atomically(path: &Path, text: &str) -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+    let tmp = path.with_extension("toml.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Pin the rename: without a directory fsync, a power cut can leave the
+    // old catalog (or none) visible after the crash that the rename
+    // already reported surviving.
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -372,6 +392,36 @@ mod tests {
         write_homes(&dir, &homes);
         assert_eq!(read_homes(&dir), homes, "boot re-reads what boot wrote");
         assert!(homes_path(&dir).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Low #8 (post-M5 review): the write is temp+fsync+rename, so a
+    /// completed write replaces the previous catalog wholesale and leaves
+    /// no temp sibling behind — the litter is the observable that the
+    /// atomic path ran (the crash-mid-write half of atomicity is not unit
+    /// testable; the mechanism is the temp+rename, not a test double).
+    #[test]
+    fn homes_write_replaces_atomically_and_leaves_no_temp_litter() {
+        let dir = temp_dir("atomic");
+        let mut homes = HashMap::new();
+        homes.insert(0u32, 1u32);
+        write_homes(&dir, &homes);
+        // Overwrite in place — the rename path replaces an existing
+        // catalog, and the extra row survives as a whole.
+        homes.insert(3u32, 2u32);
+        write_homes(&dir, &homes);
+        assert_eq!(read_homes(&dir), homes, "the second write replaced the first");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .expect("catalog dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["wal_homes.toml".to_owned()],
+            "no temp sibling survives a completed write"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

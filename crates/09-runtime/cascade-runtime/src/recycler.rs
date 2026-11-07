@@ -110,6 +110,9 @@ impl TickJob for WalRecycler {
 /// zero in production).
 pub struct RecycleSite {
     passes: Arc<AtomicU64>,
+    /// Bytes physically reclaimed, ever. Zero until the segmented WAL
+    /// exists — the decision's reclaimable prefix is deliberately not
+    /// counted (post-M5 review low #9: it was re-added every pass).
     reclaimed_bytes: Arc<AtomicU64>,
 }
 
@@ -126,11 +129,18 @@ impl RecycleSite {
     /// count is the observable; per-DB isolation is enforced upstream by
     /// the targeting (only the home reactor's channel ever receives
     /// signals for its own DB).
+    ///
+    /// `reclaimed_bytes` counts bytes ACTUALLY reclaimed — and until the
+    /// segmented WAL the physical act reclaims nothing (the debug engine's
+    /// log is live from byte 0), so it never moves however large the
+    /// decision's reclaimable prefix is. The old line added that prefix on
+    /// every pass: once any caller's frontier left 0, the same unreclaimed
+    /// bytes would re-add per tick, forever — a counter lying upward
+    /// (post-M5 review low #9). The segmented WAL adds the real increments
+    /// where the truncation actually runs.
     pub fn run_recycle(&self, _db: DatabaseId, below: Lsn) -> cascade_wal::RecycleDecision {
         let decision = cascade_wal::recycle_decision(below, cascade_wal::RECYCLE_SEGMENT_BYTES);
         self.passes.fetch_add(1, Ordering::Relaxed);
-        self.reclaimed_bytes
-            .fetch_add(decision.reclaimable_bytes, Ordering::Relaxed);
         decision
     }
 }
@@ -239,6 +249,31 @@ mod tests {
             .expect("rx thread spawns")
     }
 
+    /// Low #9 (post-M5 review): the counter says what was PHYSICALLY
+    /// reclaimed — nothing, until the segmented WAL. At a frontier far
+    /// above zero the decision's reclaimable prefix is large; the old code
+    /// added it every pass, so the same unreclaimed bytes accumulated per
+    /// tick. The decision itself still reports the prefix honestly — only
+    /// the counter kept still.
+    #[test]
+    fn reclaimed_bytes_stays_zero_while_the_act_reclaims_nothing() {
+        let passes = Arc::new(AtomicU64::new(0));
+        let reclaimed = Arc::new(AtomicU64::new(0));
+        let site = RecycleSite::new(Arc::clone(&passes), Arc::clone(&reclaimed));
+        let decision = site.run_recycle(DatabaseId(0), Lsn(1 << 30));
+        assert_eq!(
+            decision.reclaimable_bytes,
+            1 << 30,
+            "the DECISION still reports the full reclaimable prefix"
+        );
+        assert_eq!(passes.load(Ordering::Relaxed), 1, "the pass ran");
+        assert_eq!(
+            reclaimed.load(Ordering::Relaxed),
+            0,
+            "nothing was physically reclaimed, so the counter never moved"
+        );
+    }
+
     /// FR-32's targeting, pinned: only the WAL-home reactor's channel
     /// ever sees recycle signals — the other NUMA's designated reactor
     /// receives nothing (cross-DB/cross-NUMA touch is structural, not a
@@ -294,12 +329,17 @@ mod tests {
         );
     }
 
-    /// The worker-side loop under real traffic: each signal's own `below`
-    /// feeds its own decision — db 2's zero frontier adds nothing to db
-    /// 1's reclaim (per-DB isolation: the decision follows the signal,
-    /// never a shared cell).
+    /// The worker-side loop under real traffic: each signal runs its own
+    /// pass, and the counter stays honest — db 1's `below` (2×SEG) yields
+    /// a decision whose reclaimable prefix is 2×SEG, db 2's zero frontier
+    /// yields zero, and NEITHER lands in `reclaimed_bytes` because the
+    /// physical act reclaims nothing until the segmented WAL (low #9; the
+    /// old assertion here pinned the re-add — "db 1 reclaimed its full
+    /// windows" — which was the defect). The decision math itself is
+    /// pinned in cascade-wal's recycle tests; the honesty unit test above
+    /// pins the counter.
     #[test]
-    fn recycle_loop_sums_each_signals_own_decision() {
+    fn recycle_loop_runs_each_signal_and_reclaimed_bytes_stay_honest() {
         let (tx, rx) = glommio::channels::shared_channel::new_bounded::<RecycleSignal>(8);
         let passes = Arc::new(AtomicU64::new(0));
         let reclaimed = Arc::new(AtomicU64::new(0));
@@ -345,9 +385,9 @@ mod tests {
         sender_thread.join().expect("sender thread joins");
         assert_eq!(recycles, 2);
         assert_eq!(
-            reclaimed_bytes,
-            2 * cascade_wal::RECYCLE_SEGMENT_BYTES,
-            "db 1 reclaimed its full windows; db 2's zero frontier added nothing"
+            reclaimed_bytes, 0,
+            "nothing physically reclaimed: db 1's 2×SEG reclaimable prefix \
+             must never enter the counter, whatever its frontier is"
         );
     }
 

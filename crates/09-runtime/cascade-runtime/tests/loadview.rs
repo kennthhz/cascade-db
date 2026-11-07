@@ -139,16 +139,29 @@ fn nic_proximity_decides_an_exact_tie() {
     );
 
     // The tie, exactly: no connections anywhere, and every sampler reads
-    // the same value (idle workers publish 0 — parked executors burn
-    // ~nothing; the assert demands equality, not smallness).
+    // the same value — zero. Waited for, not assumed (the post-M5 flake
+    // fix): under parallel gate load an idle thread can publish a stray
+    // 1-milli window, but the integer EWMA halves back to 0 within an
+    // interval (α = 0.5, (0+1)/2 = 0), so the all-zero state recurs
+    // quickly on any host not saturated edge-to-edge. The exactness is
+    // load-bearing — a CPU gap at this instant would let CPU decide
+    // instead of the NIC — so it is waited for rather than approximated.
     assert!(
         rt.workers().iter().all(|w| w.active_connections() == 0),
         "fresh boot: all gauges at zero"
     );
+    wait_until(
+        || {
+            rt.workers()
+                .iter()
+                .all(|w| w.cpu_ewma_milli() == 0)
+        },
+        "the idle EWMAs settle at exactly 0 for the tie claim",
+    );
     let ewmas: Vec<u64> = rt.workers().iter().map(|w| w.cpu_ewma_milli()).collect();
     assert!(
-        ewmas.windows(2).all(|pair| pair[0] == pair[1]),
-        "the tie is exact: all EWMAs equal, got {ewmas:?}"
+        ewmas.iter().all(|&e| e == 0),
+        "the tie is exact: all EWMAs zero, got {ewmas:?}"
     );
 
     let mut c1 = client(&fx, "u1");
@@ -246,8 +259,16 @@ fn hammered_cpu_is_rejected_at_a_count_tie() {
             rt.workers()[0].cpu_ewma_milli()
         );
     }
-    // The others are idle and publish exactly 0 (asserted, not assumed —
-    // their connections are parked, their executors burn ~nothing).
+    // The others are idle and publish exactly 0 at the decision instant —
+    // waited for like the nic test's tie: a stray 1-milli window re-zeros
+    // within an interval, and the (count, cpu) tie the NIC must decide
+    // needs both at 0, exactly. (The router's own read microseconds later
+    // could still catch a fresh tick — the same best-effort window the
+    // count settling already tolerates.)
+    wait_until(
+        || rt.workers()[1].cpu_ewma_milli() == 0 && rt.workers()[2].cpu_ewma_milli() == 0,
+        "the idle routes' EWMAs settle back to 0 for the tie claim",
+    );
     assert_eq!(rt.workers()[1].cpu_ewma_milli(), 0, "route 1 idle-exact");
     assert_eq!(rt.workers()[2].cpu_ewma_milli(), 0, "route 2 idle-exact");
 

@@ -393,7 +393,10 @@ impl ClusterState {
     /// state is EXACTLY as it was (every variant validates before its
     /// first mutation, so a refusal can never leave a half-applied
     /// change behind). `single` binds per A13, the same least-loaded
-    /// proxy boot uses; T5.6's live load view replaces the proxy.
+    /// proxy boot uses — the STATIC pick, deliberately: T5.6's live load
+    /// view sharpens the ROUTER's ordering, never this binding (a row
+    /// whose numa column moved with live load would be meaningless;
+    /// post-M5 review low #3, the old comment claimed the replacement).
     fn apply(&mut self, change: &TierCChange) -> Result<(), ApplyError> {
         match change {
             TierCChange::SetDatabaseAffinity { name, affinity } => {

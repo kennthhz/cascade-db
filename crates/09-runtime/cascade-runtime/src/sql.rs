@@ -119,26 +119,193 @@ pub enum Stmt {
     Empty,
 }
 
-/// Split a simple-query batch into statements on `;` (outside quotes).
-/// Wire-level text handling, upstream of the parser (libpg_query sees one
-/// statement at a time, exactly like a prepared statement would).
+/// Split a simple-query batch into statements on `;`. Wire-level text
+/// handling, upstream of the parser (libpg_query sees one statement at a
+/// time, exactly like a prepared statement would).
+///
+/// A terminator is only a terminator outside every lexical form that can
+/// legally contain a semicolon: single-quoted strings (`''` doubling),
+/// escape strings (`E'…'` — the backslash escapes the next character),
+/// double-quoted identifiers (`""` doubling), dollar-quoted strings
+/// (`$$…$$`, `$tag$…$tag$` — only the tag's own closer ends it, and
+/// `$1`-style positional references are not openers), `--` line comments,
+/// and nested `/* … */` block comments. The old quote-toggle-only shape
+/// shredded a legal script containing any of the others (post-M5 review
+/// low #4).
+///
+/// A fragment is emitted only when it carries real content — whitespace or
+/// comments alone produce nothing. That is what makes `;;` behave like
+/// PostgreSQL: PG's parser drops empty statements, so an all-empty batch
+/// answers exactly one EmptyQueryResponse and a real statement followed by
+/// `;;` answers nothing for its tail (low #5).
+///
+/// Honest gap: `U&'…'` Unicode-escape strings are not covered (the slice
+/// has no such literals); a `;` inside one would still split.
 pub fn split_statements(sql: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quote = false;
-    for c in sql.chars() {
-        match c {
-            '\'' => {
-                in_quote = !in_quote;
-                cur.push(c);
-            }
-            ';' if !in_quote => {
-                out.push(std::mem::take(&mut cur));
-            }
-            _ => cur.push(c),
+    #[derive(PartialEq)]
+    enum St {
+        Normal,
+        /// Inside `'…'`; `escapes` = opened by an `E` marker, so `\`
+        /// escapes the next character.
+        Single,
+        /// Inside `"…"` (a quoted identifier).
+        Double,
+        /// Inside a dollar quote; `tag` is the full opener (`$tag$`), the
+        /// only sequence that closes it.
+        Dollar,
+        /// Inside `-- …` until end of line.
+        Line,
+        /// Inside `/* … */`, nesting-aware.
+        Block,
+    }
+
+    // Is the accumulated text ending in a standalone `E`/`e` (the escape
+    // string marker)? A quote directly after one opens a backslash-
+    // sensitive string; after `SEA` or a space it opens a plain one.
+    fn ends_with_escape_marker(cur: &str) -> bool {
+        let mut chars = cur.chars().rev();
+        match chars.next() {
+            Some('E') | Some('e') => match chars.next() {
+                None => true,
+                Some(prev) => !(prev.is_alphanumeric() || prev == '_' || prev == '$'),
+            },
+            _ => false,
         }
     }
-    if !cur.trim().is_empty() {
+
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    // True once this fragment has held a non-whitespace, non-comment
+    // character — the only fragments worth a parse round-trip.
+    let mut has_stmt = false;
+    let mut st = St::Normal;
+    let mut escapes = false;
+    let mut dollar_tag = String::new();
+    let mut depth = 0usize;
+    let mut it = sql.chars().peekable();
+    while let Some(c) = it.next() {
+        match st {
+            St::Normal => match c {
+                '\'' => {
+                    escapes = ends_with_escape_marker(&cur);
+                    cur.push(c);
+                    has_stmt = true;
+                    st = St::Single;
+                }
+                '"' => {
+                    cur.push(c);
+                    has_stmt = true;
+                    st = St::Double;
+                }
+                '-' if it.peek() == Some(&'-') => {
+                    it.next();
+                    cur.push_str("--");
+                    st = St::Line;
+                }
+                '/' if it.peek() == Some(&'*') => {
+                    it.next();
+                    cur.push_str("/*");
+                    depth = 1;
+                    st = St::Block;
+                }
+                ';' => {
+                    // The terminator ends the fragment — pushed only when
+                    // it carried content (PG drops empty statements).
+                    if has_stmt {
+                        out.push(std::mem::take(&mut cur));
+                    } else {
+                        cur.clear();
+                    }
+                    has_stmt = false;
+                }
+                '$' => {
+                    // Dollar-quote opener probe: `$$` or `$tag$` with an
+                    // identifier tag. `$1…` is a positional reference, not
+                    // an opener.
+                    let mut tag = String::from("$");
+                    let mut opener = false;
+                    loop {
+                        match it.peek().copied() {
+                            Some('$') => {
+                                it.next();
+                                tag.push('$');
+                                opener = true;
+                                break;
+                            }
+                            Some(ch) if ch.is_alphanumeric() || ch == '_' => {
+                                if tag.len() == 1 && !ch.is_alphabetic() && ch != '_' {
+                                    break;
+                                }
+                                it.next();
+                                tag.push(ch);
+                            }
+                            _ => break,
+                        }
+                    }
+                    cur.push_str(&tag);
+                    if opener {
+                        has_stmt = true;
+                        dollar_tag = tag;
+                        st = St::Dollar;
+                    } else if tag.len() > 1 {
+                        has_stmt = true;
+                    }
+                }
+                c if c.is_whitespace() => cur.push(c),
+                c => {
+                    cur.push(c);
+                    has_stmt = true;
+                }
+            },
+            St::Single => {
+                cur.push(c);
+                if escapes && c == '\\' {
+                    // The escaped character is data even when it is a
+                    // quote or another backslash.
+                    if let Some(next) = it.next() {
+                        cur.push(next);
+                    }
+                } else if c == '\'' {
+                    st = St::Normal;
+                }
+            }
+            St::Double => {
+                cur.push(c);
+                if c == '"' {
+                    st = St::Normal;
+                }
+            }
+            St::Dollar => {
+                cur.push(c);
+                if cur.ends_with(&dollar_tag) {
+                    st = St::Normal;
+                }
+            }
+            St::Line => {
+                cur.push(c);
+                if c == '\n' {
+                    st = St::Normal;
+                }
+            }
+            St::Block => {
+                if c == '*' && it.peek() == Some(&'/') {
+                    it.next();
+                    cur.push_str("*/");
+                    depth -= 1;
+                    if depth == 0 {
+                        st = St::Normal;
+                    }
+                } else if c == '/' && it.peek() == Some(&'*') {
+                    it.next();
+                    cur.push_str("/*");
+                    depth += 1;
+                } else {
+                    cur.push(c);
+                }
+            }
+        }
+    }
+    if has_stmt {
         out.push(cur);
     }
     out
@@ -525,5 +692,71 @@ mod tests {
             err.to_string().contains("syntax error at or near"),
             "PG's own wording: {err}"
         );
+    }
+
+    /// Low #4/#5 (post-M5 review): the splitter is lexically faithful — a
+    /// `;` inside any form that can legally hold one stays data — and it
+    /// drops empty fragments, so `;;` never produces statements of its own
+    /// (the session answers one EmptyQueryResponse for the empty batch,
+    /// PG's shape).
+    #[test]
+    fn splitter_is_lexically_faithful_and_drops_empty_fragments() {
+        // Plain strings survive (the pre-existing case, restated).
+        assert_eq!(
+            split_statements("SELECT 1; INSERT INTO debug_table VALUES (1, 'a;b')"),
+            vec![
+                "SELECT 1".to_owned(),
+                " INSERT INTO debug_table VALUES (1, 'a;b')".to_owned()
+            ]
+        );
+        // Dollar quotes: the semicolon inside is data, and only the tag's
+        // own closer ends the literal ($tag$…$$… stays inside).
+        assert_eq!(
+            split_statements("INSERT INTO debug_table VALUES (1, $$a;b$$); SELECT 2"),
+            vec![
+                "INSERT INTO debug_table VALUES (1, $$a;b$$)".to_owned(),
+                " SELECT 2".to_owned()
+            ]
+        );
+        assert_eq!(
+            split_statements("INSERT INTO debug_table VALUES (1, $t$;$$;$t$)"),
+            vec!["INSERT INTO debug_table VALUES (1, $t$;$$;$t$)".to_owned()]
+        );
+        // E-strings: \' does not close, so the ; after it is data.
+        assert_eq!(
+            split_statements(r"INSERT INTO debug_table VALUES (2, E'a\';b')"),
+            vec![r"INSERT INTO debug_table VALUES (2, E'a\';b')".to_owned()]
+        );
+        // `$1` is a positional reference, never an opener.
+        assert_eq!(
+            split_statements("SELECT $1; SELECT 2"),
+            vec!["SELECT $1".to_owned(), " SELECT 2".to_owned()]
+        );
+        // Line comments: a ; inside is data; the comment text rides along.
+        assert_eq!(
+            split_statements("SELECT 1;\n-- a ; b\nSELECT 2"),
+            vec!["SELECT 1".to_owned(), "\n-- a ; b\nSELECT 2".to_owned()]
+        );
+        // Block comments nest.
+        assert_eq!(
+            split_statements("/* ; /* inner ; */ still ; */SELECT 1"),
+            vec!["/* ; /* inner ; */ still ; */SELECT 1".to_owned()]
+        );
+        // Double-quoted identifiers hold semicolons.
+        assert_eq!(
+            split_statements("SELECT \"weird;ident\"; SELECT 2"),
+            vec![
+                "SELECT \"weird;ident\"".to_owned(),
+                " SELECT 2".to_owned()
+            ]
+        );
+        // Empty fragments: `;;` yields nothing (the session answers one
+        // EmptyQueryResponse for the whole batch), a real statement's tail
+        // empties yield nothing either, and a comment-only batch is empty.
+        assert_eq!(split_statements(";;"), Vec::<String>::new());
+        assert_eq!(split_statements("SELECT 1;;"), vec!["SELECT 1".to_owned()]);
+        assert_eq!(split_statements(";  ; -- only"), Vec::<String>::new());
+        assert_eq!(split_statements("   "), Vec::<String>::new());
+        assert_eq!(split_statements("-- hi"), Vec::<String>::new());
     }
 }
