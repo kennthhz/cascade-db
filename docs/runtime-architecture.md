@@ -570,7 +570,7 @@ for reactor in &all_reactors {
 - Writers don't block readers.
 - Memory reclamation is automatic via `Arc`'s refcount.
 
-**Bounded fan-out wait (implementation-plan ruling R11):** the writer waits at most `tierc_fanout_wait_ms` (default 1 000 ms) for all reactors to store; the ack to the requesting session reports *applied everywhere* or *pending N*. Laggard reactors adopt the new snapshot lazily on their next pointer load, so pending never means lost. The *issuing* reactor stores first, so the session that requested the change always sees its own change.
+**Bounded fan-out wait (implementation-plan ruling R11):** the writer waits at most `tierc_fanout_wait_ms` (default 1 000 ms) for all reactors to store; the ack to the requesting session reports *applied everywhere*, *pending N*, or *publication-lost N*. Laggard reactors adopt the new snapshot lazily on their next pointer load, so pending never means lost — the budget bounds only the writer's wait, never delivery. Publication-lost is the honest third outcome: a store that was REFUSED (queue full) or LOST (reactor gone) can never run, so those reactors may never adopt the change; the session surfaces it as an error rather than acking success (post-M5 review, M3). The *issuing* reactor stores first, so the session that requested the change always sees its own change.
 
 ---
 

@@ -89,45 +89,61 @@ impl WalHomeTable {
 /// same home on any boot with the same layout; persistence (A14) is what
 /// keeps it stable across *changed* layouts. `None` for an empty registry
 /// (validated configs never produce one).
+///
+/// Caveat (M4, post-M5 review): the registry holds every configured
+/// pool, including worker-less ones — a pick can name a numa with no
+/// reactor. Boot derives over the DESIGNATED set instead
+/// ([`derive_wal_home_from_numas`]); this form stays for registry-side
+/// callers that already know their numas are reactor-backed.
 pub fn derive_wal_home(db: DatabaseId, pools: &PoolRegistry) -> Option<u32> {
     derive_wal_home_from_numas(db, &pools.iter().map(|p| p.numa()).collect::<Vec<_>>())
 }
 
 /// The registry-free form of [`derive_wal_home`]: same hash, same order,
-/// over bare pool NUMA numbers. Boot needs this BEFORE the pool registry
+/// over bare NUMA numbers. Boot needs this BEFORE the pool registry
 /// exists — the T4.3 recycler's target (`db` → home NUMA) must be
 /// resolved before the housekeepers spawn, because resolution reads the
 /// persisted-homes file and the housekeeper must never touch I/O at tick
 /// time (the syscall-layer no-I/O tests would catch it).
-pub fn derive_wal_home_from_numas(db: DatabaseId, pool_numas: &[u32]) -> Option<u32> {
-    if pool_numas.is_empty() {
+///
+/// The list must be the DESIGNATED numas — one entry per numa that has a
+/// worker (and so a reactor that can flush the tail and stamp the clean
+/// marker), not every pool numa (M4, post-M5 review): a home derived
+/// onto a worker-less pool numa has no designated reactor, the drain
+/// finds no flagged sender, and the marker is refused every shutdown —
+/// every restart would replay as a crash. Boot passes the designated
+/// set; the registry form above cannot know it, so it documents the
+/// burden.
+pub fn derive_wal_home_from_numas(db: DatabaseId, designated_numas: &[u32]) -> Option<u32> {
+    if designated_numas.is_empty() {
         return None;
     }
-    let idx = (db_hash(db) % pool_numas.len() as u64) as usize;
-    pool_numas.get(idx).copied()
+    let idx = (db_hash(db) % designated_numas.len() as u64) as usize;
+    designated_numas.get(idx).copied()
 }
 
 /// The per-DB WAL home decision (T2.6, A14) in ONE place: `single`
 /// follows the Tier C bound NUMA; `cross` honors the persisted choice
-/// when it is still a pooled NUMA (else warns and re-derives), falling
-/// back to derivation on first boot. Boot resolves each DB's home once,
-/// early — the recycler's target and the writer construction both
-/// consume the same value, so the two can never drift.
+/// when it is still a DESIGNATED numa — one a reactor lives on, the only
+/// place the tail can flush and the marker can stamp (else warns and
+/// re-derives) — falling back to derivation on first boot. Boot resolves
+/// each DB's home once, early — the recycler's target and the writer
+/// construction both consume the same value, so the two can never drift.
 pub fn resolve_wal_home(
     db: DatabaseId,
     placement: &crate::tierc::Placement,
     persisted: &HashMap<u32, u32>,
-    pool_numas: &[u32],
+    designated_numas: &[u32],
 ) -> u32 {
-    let derived = derive_wal_home_from_numas(db, pool_numas)
-        .expect("validated config gives every worker numa a pool");
+    let derived = derive_wal_home_from_numas(db, designated_numas)
+        .expect("a routed boot always has designated reactors (worker_cores is validated non-empty)");
     match (placement.affinity, placement.bound_numa) {
         (crate::config::NumaAffinity::Single, Some(numa)) => numa,
         // `single` with no bound NUMA means no workers (config validation
         // forbids it) — fall back to derivation rather than panic.
         (crate::config::NumaAffinity::Single, None) => derived,
         (crate::config::NumaAffinity::Cross, _) => match persisted.get(&db.0).copied() {
-            Some(numa) if pool_numas.contains(&numa) => numa,
+            Some(numa) if designated_numas.contains(&numa) => numa,
             Some(numa) => {
                 cascade_telemetry::log(
                     cascade_telemetry::Level::Warn,
@@ -135,7 +151,7 @@ pub fn resolve_wal_home(
                     &[
                         ("db", db.0.to_string().as_str()),
                         ("numa", numa.to_string().as_str()),
-                        ("policy", "re-deriving (NUMA no longer pooled)"),
+                        ("policy", "re-deriving (NUMA no longer designated)"),
                     ],
                 );
                 derived

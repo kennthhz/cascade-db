@@ -624,6 +624,81 @@ Verified to fail against the pre-fix drain (DDL abandoned at the
 burned deadline). `Runtime` being `!Send` shaped the test: shutdown
 runs inline, the release on a helper thread.
 
+**Post-M5 review fix 4 — the Tier C acks are honest about stores that
+can never land (M3).** The review's finding: `budgeted`'s `.ok()`
+merged THREE causes into one "unconfirmed" — a blown budget (the job
+was ADMITTED, lands lazily) and `Saturated`/`Lost` (the store never
+entered a queue and never will). Both read to the session as
+`Pending`, and pending acks as success — a client told "CREATE ROLE"
+succeeded while a reactor may never adopt the change (a retry would
+then answer 42710 duplicate). `budgeted` now returns
+`Option<Result<R, SubmitError>>` (confirmed / refused / budget-died),
+`fan_out` counts the refusals separately, and a new
+`TierCAck::PublicationLost(n)` names the stores that can never run.
+Both DDL arms map it to an honest `58000`: the change DID apply at the
+writer, the publications may never land, retrying reports a
+duplicate. The boot publication's dropped ack in `writer_loop` is now
+a loud `tierc_boot_publication_lost` warn (a Lost store there means a
+reactor's FR-6 gate never opens — 57P03 for the process's whole
+life). Discriminator:
+`tierc::tests::fan_out_reports_never_landing_stores_as_publication_lost`
+builds both shapes — a receiver dropped unconnected (Lost; the
+producer's connect resolves on the disconnect) and a cap-full queue
+nobody drains (Saturated) — and fails when the merge is reverted.
+
+**Post-M5 review fix 5 — WAL homes derive over DESIGNATED numas only
+(M4).** The review's finding: boot passed EVERY pool numa to
+`resolve_wal_home`, so a pool on a worker-less numa could receive the
+derived dev-DB home — where no designated reactor exists to flush the
+tail or stamp the clean marker, `home_present` was false every
+shutdown, and every restart replayed as a crash. Boot now derives
+over the `designated` set (first worker per distinct worker-core
+numa — exactly the numas the drain flags), `resolve_wal_home`'s
+persisted check is designated-checked (a persisted home whose numa
+lost its workers warns `wal_home_persisted_invalid` and re-derives —
+the honest boundary: the marker can only stamp where a reactor runs),
+and pool order is deliberately derivation-irrelevant. Discriminator:
+`tests/walhome.rs::workerless_pool_numa_never_homes_the_writer`
+(workers on NUMA 0 only, pools `[0, 7]`, `db_hash(0)` odd → pre-fix
+derivation picked 7, marker refused; post-fix home 0, marker stamps).
+The other walhome tests were re-cut to the new derivation set: the
+cross-persistence chain now derives over designated `[0, 1]`
+(worker config order), and the file's module doc states the new
+layout discriminator.
+
+**Post-M5 review fix 6 — failed boots tear down what they spawned,
+and NUMA labels must match the topology (M2 + M5).** Two findings in
+one batch. M2: every boot error past `spawn_housekeepers` (`?` on
+pools build, `DemoTooLarge`, `spawn_workers`) leaked the spawned
+threads DETACHED — the serving housekeeper still held the listener,
+so the port stayed bound for the process's life, and
+`spawn_housekeepers`' own error paths dropped the partial vec the
+same way. `abort_housekeepers` now contains it: set the shutdown
+flag, UNPARK (the parked loops need the wake), drop the boot-owned
+receiver halves first so the serving housekeeper's channel `connect()`s
+resolve on the disconnect (glommio's shared channels unblock a
+connect when the peer drops), then join on a helper thread under a
+5 s watchdog — a join it outlives is reported honestly
+(`boot_teardown_incomplete`) rather than hung on, because a wedged
+connect whose peer never spawned cannot resolve. The shutdown-wake
+fd dup is closed on every error path too. Discriminator:
+`tests/boot_failure.rs::failed_boot_reclaims_the_serving_port` (a
+`DemoTooLarge` boot, then the port must rebind — pre-fix it stayed
+held through the whole retry budget). M5: boot never cross-checked
+the configured WORKER numa labels against the topology — a label no
+online core carries drove the designated grouping, the WAL home, and
+the drain flags while `construct_writer_on` silently fell back
+across the whole online set. `BootError::NumaLabelUnknown` refuses
+such configs (checked only when the provider exposes NUMA facts at
+all; affinity-only containers degrade to unverifiable). Pool labels
+are deliberately OUTSIDE the check — a pool on an unknown node keeps
+T2.3's best-effort contract (honest warn, `node_bound()` false; the
+pools.rs review's landed decision). Discriminator:
+`tests/boot_failure.rs::refuses_worker_numa_unknown_to_the_topology`.
+The affected test fixtures now label their topologies to match their
+configs (`loadview`, `affinity`, `auth`, `walhome` — a two-node
+config needs a two-node topology).
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

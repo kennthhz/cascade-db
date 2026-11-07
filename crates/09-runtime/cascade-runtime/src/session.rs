@@ -879,6 +879,20 @@ async fn execute<W: AsyncWrite + Unpin>(
                 Ok(Ok(TierCAck::Applied)) | Ok(Ok(TierCAck::Pending(_))) => {
                     send_tag(out, "CREATE ROLE").await
                 }
+                // Some stores can NEVER land (refused or lost — M3): the
+                // change DID apply at the writer, but the client must not
+                // hear unqualified success — a reactor may never adopt
+                // it, and a retry would answer 42710 duplicate. The error
+                // says both halves of that truth.
+                Ok(Ok(TierCAck::PublicationLost(n))) => Err(PgError::new(
+                    "58000",
+                    format!(
+                        "the change applied at the Tier C writer, but {n} publication(s) \
+                         can never reach their reactors (refused or lost); this system \
+                         may serve stale roles until restart, and retrying reports a \
+                         duplicate"
+                    ),
+                )),
                 // The writer refused the change (e.g. duplicate role,
                 // 42710): its snapshot is unchanged, nothing fanned out,
                 // and the client gets the writer's own SQLSTATE.
@@ -979,6 +993,19 @@ async fn execute<W: AsyncWrite + Unpin>(
                 Ok(Ok(TierCAck::Applied)) | Ok(Ok(TierCAck::Pending(_))) => {
                     send_tag(out, "CREATE DATABASE").await
                 }
+                // Same honesty as CREATE ROLE's arm (M3): the writer
+                // applied the change, but a store that can never land
+                // must not read as success — routing may never adopt it
+                // (stale bound NUMA).
+                Ok(Ok(TierCAck::PublicationLost(n))) => Err(PgError::new(
+                    "58000",
+                    format!(
+                        "the change applied at the Tier C writer, but {n} publication(s) \
+                         can never reach their reactors (refused or lost); routing may \
+                         serve stale placement until restart, and retrying reports a \
+                         duplicate"
+                    ),
+                )),
                 Ok(Ok(TierCAck::Failed(e))) => {
                     let (code, message) = e.pg();
                     Err(PgError::new(code, message))

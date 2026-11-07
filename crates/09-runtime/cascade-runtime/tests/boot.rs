@@ -160,15 +160,19 @@ fn refuses_core_in_both_roles_at_boot() {
 
 /// T2.1: workers across multiple NUMA groups boot, each verified on its own
 /// core, with each group carrying its NUMA label (the shape T2.3's per-NUMA
-/// pools and T2.4's affinity routing build on). The synthetic topology is
-/// flat; the grouping here is purely config-level.
+/// pools and T2.4's affinity routing build on). The topology labels must
+/// agree with the config's grouping (M5: a worker label no core carries
+/// refuses boot), so the synthetic topology names the same two nodes.
 #[test]
 fn boots_workers_across_numa_groups() {
     let mut allowed = pin::current_affinity();
     assert!(allowed.len() >= 3, "boot test needs at least 3 CPUs");
     allowed.truncate(3);
 
-    let topo = SyntheticTopology::new(allowed.iter().copied());
+    let topo = SyntheticTopology::new(allowed.iter().copied())
+        .with_numa(allowed[0], 0)
+        .with_numa(allowed[1], 0)
+        .with_numa(allowed[2], 1);
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![allowed[0]],
         worker_cores: vec![

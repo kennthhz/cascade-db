@@ -259,6 +259,16 @@ pub enum BootError {
         #[source]
         source: io::Error,
     },
+    /// A configured WORKER numa label names a node the topology never
+    /// places a core on (M5, post-M5 review): a typo, a stale config, or
+    /// a machine that changed under the config. Placement built on such
+    /// a label would first-touch somewhere else entirely — refused, not
+    /// guessed. Pool labels are outside this check (T2.3's best-effort
+    /// pool placement contract). Checked only when the provider exposes
+    /// NUMA facts at all; an affinity-only provider (containers)
+    /// degrades to unverifiable.
+    #[error("worker NUMA group {numa} is unknown to the topology: no online core sits on it")]
+    NumaLabelUnknown { numa: u32 },
 }
 
 impl Runtime {
@@ -313,6 +323,29 @@ impl Runtime {
             for core in &workers.cores {
                 if !online.contains(core) {
                     return Err(BootError::CoreOffline { core: *core });
+                }
+            }
+        }
+
+        // M5 (post-M5 review): every configured WORKER numa label must
+        // name a node the topology actually places a core on — the label
+        // drives the designated grouping, the WAL home, and the drain
+        // flags, all of which poison placement when it lies
+        // (`construct_writer_on` falls back across the whole online set,
+        // silently first-touching wherever the fallback lands). Refused
+        // before anything spawns. POOL labels are deliberately outside
+        // this check: a pool on an unknown node is memory-only and keeps
+        // T2.3's best-effort contract (honest warn + `node_bound()` =
+        // false, the pools.rs review's landed decision). The check needs
+        // NUMA facts to check against: a provider that exposes none
+        // (affinity-only containers, `AllowedCpuTopology`) degrades to
+        // unverifiable rather than refusing every boot.
+        let known_numas: HashSet<u32> =
+            online.iter().filter_map(|&c| topology.numa_node(c)).collect();
+        if !known_numas.is_empty() {
+            for workers in &cfg.worker_cores {
+                if !known_numas.contains(&workers.numa) {
+                    return Err(BootError::NumaLabelUnknown { numa: workers.numa });
                 }
             }
         }
@@ -491,16 +524,22 @@ impl Runtime {
         // and the housekeeper must never touch I/O (the syscall-layer
         // tests would catch it). The writer-construction step below
         // reuses the same decision, so the two can never drift.
+        // Derivation runs over the DESIGNATED numas, not every pool
+        // numa (M4, post-M5 review): a home on a worker-less pool numa
+        // has no designated reactor to flush its tail or stamp its
+        // marker, so the honest candidate set is exactly the numas the
+        // drain flags — `designated`, built above.
         let (persisted_homes, dev_home) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
                 let persisted = walhome::read_homes(dir);
-                let pool_numas: Vec<u32> = cfg.numa_pools.iter().map(|p| p.numa).collect();
+                let designated_numas: Vec<u32> =
+                    designated.iter().map(|(numa, _)| *numa).collect();
                 let home = walhome::resolve_wal_home(
                     dev,
                     &initial.resolve(Some("dev")),
                     &persisted,
-                    &pool_numas,
+                    &designated_numas,
                 );
                 (persisted, Some(home))
             }
@@ -628,11 +667,12 @@ impl Runtime {
         // The drain channels (T4.4): one SPSC channel per designated
         // reactor — the third signal family (control: T4.2, recycle:
         // T4.3), so §10.2's one-shot final flushes never queue behind tick
-        // traffic and vice versa. The HOME IDENTITY rides the tuple — if
-        // the resolved WAL home names a pooled NUMA with no workers, no
-        // sender is flagged, and the drain (not ack slot position) knows
-        // no one can flush the tail: the marker is refused, honestly.
-        // Empty on a listenerless boot.
+        // traffic and vice versa. The HOME IDENTITY rides the tuple —
+        // the home is derived over the designated set (M4), so a flagged
+        // sender always exists; the flag check remains the honest
+        // backstop (a persisted home naming a since-undesignated numa
+        // re-derives above, but the drain never assumes). Empty on a
+        // listenerless boot.
         let (drain_tx, drain_rx_by_numa) = if listener.is_some() {
             let mut txs = Vec::new();
             let mut rxs = Vec::new();
@@ -716,7 +756,30 @@ impl Runtime {
         // §10.1 step 5 (T2.3): one BPM pool per configured NUMA, sized per
         // config, its memory bound to its node — after topology is resolved
         // and placement validated, before any worker exists to fault it.
-        let mut pools = PoolRegistry::build(cfg)?;
+        let mut pools = match PoolRegistry::build(cfg) {
+            Ok(pools) => pools,
+            Err(e) => {
+                // M2: the housekeepers exist and the workers never will —
+                // drop the channel halves their connect()s await (a
+                // connect resolves when its peer disconnects), release
+                // the shutdown-wake fd dup, then join under the watchdog
+                // before refusing. The alternative was detached threads
+                // holding the listener forever.
+                drop(receivers);
+                drop(control_rx);
+                drop(recycle_rx);
+                drop(drain_rx_by_numa);
+                drop(reap_receivers);
+                drop(tierc_write_inits);
+                drop(tierc_publish_receivers);
+                drop(tierc_publish_stats);
+                if let Some(fd) = listen_dup {
+                    unsafe { libc::close(fd) };
+                }
+                abort_housekeepers(housekeepers, &shutdown_flag);
+                return Err(e);
+            }
+        };
         // T2.6 (A14, §8.2): the per-DB writer, homed per affinity —
         // `single` follows the Tier C bound NUMA (the writers sit with the
         // only workers allowed to serve the DB, I13); `cross` gets a
@@ -737,10 +800,27 @@ impl Runtime {
                 match crate::demoheap::DemoHeap::populate(rows, db, &mut pools) {
                     Ok(heap) => Some(std::sync::Arc::new(heap)),
                     Err(frame_budget) => {
+                        // M2: same teardown as the pools failure —
+                        // nothing has moved into the workers yet, and
+                        // DemoHeap::populate reading the budget is
+                        // exactly the kind of config arithmetic a bad
+                        // demo_rows trips.
+                        drop(receivers);
+                        drop(control_rx);
+                        drop(recycle_rx);
+                        drop(drain_rx_by_numa);
+                        drop(reap_receivers);
+                        drop(tierc_write_inits);
+                        drop(tierc_publish_receivers);
+                        drop(tierc_publish_stats);
+                        if let Some(fd) = listen_dup {
+                            unsafe { libc::close(fd) };
+                        }
+                        abort_housekeepers(housekeepers, &shutdown_flag);
                         return Err(BootError::DemoTooLarge {
                             rows,
                             frame_budget,
-                        })
+                        });
                     }
                 }
             }
@@ -778,7 +858,7 @@ impl Runtime {
                 }
             })
             .collect();
-        let workers = spawn_workers(
+        let workers = match spawn_workers(
             cfg,
             receivers,
             control_rx,
@@ -805,7 +885,20 @@ impl Runtime {
             demo_heap.clone(),
             recovery.map(|p| p.seed_rows.as_slice()).unwrap_or(&[]),
             &mut verified,
-        )?;
+        ) {
+            Ok(workers) => workers,
+            Err(e) => {
+                // M2: spawn_workers' own unwind already dropped every
+                // receiver half it consumed (the connects resolve on the
+                // disconnect); close the wake dup and join the
+                // housekeepers under the watchdog before refusing.
+                if let Some(fd) = listen_dup {
+                    unsafe { libc::close(fd) };
+                }
+                abort_housekeepers(housekeepers, &shutdown_flag);
+                return Err(e);
+            }
+        };
 
         Ok(Runtime {
             housekeepers,
@@ -1045,6 +1138,71 @@ pub fn check_smt_mode(
     Ok(())
 }
 
+/// Bounded teardown of already-spawned housekeepers after a boot failure
+/// (M2, post-M5 review): a `?` past `spawn_housekeepers` used to leak
+/// every spawned thread DETACHED — the serving housekeeper still holds
+/// the listener, so the port stays bound for the life of the process.
+/// Sets the shutdown flag and unparks (the parked loops need the wake —
+/// the store alone never reaches them), then joins on a helper thread
+/// under a watchdog. The watchdog exists because a serving housekeeper
+/// can be wedged in a channel `connect()` whose peer never spawns
+/// (workers spawn last); callers drop the boot-owned receiver halves
+/// first so those connects resolve on the disconnect, and a join the
+/// watchdog outlives is reported honestly rather than hung on.
+const BOOT_TEARDOWN_WATCHDOG: Duration = Duration::from_secs(5);
+
+fn abort_housekeepers(housekeepers: Vec<Housekeeper>, flag: &AtomicBool) {
+    if housekeepers.is_empty() {
+        return;
+    }
+    flag.store(true, Ordering::Relaxed);
+    let count = housekeepers.len();
+    let (done_tx, done_rx) = mpsc::channel();
+    let reaper = std::thread::Builder::new()
+        .name("cascade-boot-teardown".into())
+        .spawn(move || {
+            for h in &housekeepers {
+                h.thread.unpark();
+            }
+            for h in housekeepers {
+                let _ = h.join.join();
+            }
+            let _ = done_tx.send(());
+        });
+    match reaper {
+        Ok(reaper) => {
+            if done_rx.recv_timeout(BOOT_TEARDOWN_WATCHDOG).is_err() {
+                cascade_telemetry::log(
+                    cascade_telemetry::Level::Warn,
+                    "boot_teardown_incomplete",
+                    &[
+                        ("housekeepers", count.to_string().as_str()),
+                        (
+                            "reason",
+                            "join watchdog elapsed; a serving thread's channel connect has no peer to resolve it",
+                        ),
+                    ],
+                );
+                // The reaper keeps joining on its own time; dropping the
+                // handle detaches it (usual std semantics) and this
+                // thread proceeds to report the boot error.
+            } else {
+                // Everything joined inside the watchdog — reap the
+                // reaper (it has already sent on the channel).
+                let _ = reaper.join();
+            }
+        }
+        Err(e) => cascade_telemetry::log(
+            cascade_telemetry::Level::Warn,
+            "boot_teardown_incomplete",
+            &[
+                ("housekeepers", count.to_string().as_str()),
+                ("reason", e.to_string().as_str()),
+            ],
+        ),
+    }
+}
+
 /// Spawn one `std::thread` per housekeeper core (R5); each pins itself and
 /// reports its *verified* affinity. Boot fails unless every report arrives
 /// within the deadline and matches its core. When a listener is given, the
@@ -1147,24 +1305,43 @@ fn spawn_housekeepers(
                 })
             }
         };
-        let join = std::thread::Builder::new()
+        let join = match std::thread::Builder::new()
             .name(format!("cascade-hk-{core}"))
             .spawn(body)
-            .map_err(|e| BootError::HousekeeperSpawn {
-                core,
-                message: e.to_string(),
-            })?;
+        {
+            Ok(join) => join,
+            Err(e) => {
+                // M2: the threads already spawned are detached unless
+                // torn down here — bounded, since the serving
+                // housekeeper can be wedged in a channel connect whose
+                // peer never spawns.
+                abort_housekeepers(out, &shutdown_flag);
+                return Err(BootError::HousekeeperSpawn {
+                    core,
+                    message: e.to_string(),
+                });
+            }
+        };
         let thread = join.thread().clone();
         out.push(Housekeeper { core, thread, join });
     }
     drop(tx); // so a dead thread's disconnect is observable
-    let (verified, _arenas) =
-        confirm_pins(rx, &cfg.housekeeper_cores, verified_all, |cores, deadline_secs| {
-            BootError::HousekeeperUnconfirmed {
-                cores,
-                deadline_secs,
-            }
-        })?;
+    let (verified, _arenas) = match confirm_pins(
+        rx,
+        &cfg.housekeeper_cores,
+        verified_all,
+        |cores, deadline_secs| BootError::HousekeeperUnconfirmed {
+            cores,
+            deadline_secs,
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(e) => {
+            // M2: same containment as the spawn failure above.
+            abort_housekeepers(out, &shutdown_flag);
+            return Err(e);
+        }
+    };
     // Expose what the kernel verified, not what the config asked for.
     for h in &mut out {
         h.core = verified[&h.core];

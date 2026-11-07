@@ -383,7 +383,12 @@ fn a_stalled_handshake_does_not_stop_the_serving_loop() {
     allowed.truncate(3);
     let (hk, w0, w1) = (allowed[0], allowed[1], allowed[2]);
 
-    let topo = SyntheticTopology::new([hk, w0, w1]);
+    // Labels match the config's numa claim (M5): a two-node config needs
+    // a two-node topology, or boot refuses the unknown label.
+    let topo = SyntheticTopology::new([hk, w0, w1])
+        .with_numa(hk, 0)
+        .with_numa(w0, 0)
+        .with_numa(w1, 1);
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![hk],
         worker_cores: vec![

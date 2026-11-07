@@ -356,10 +356,17 @@ impl ApplyError {
 /// drain (lazy adoption on the next pointer load) — the budget bounds
 /// only the WRITER's wait, never the delivery. `Failed` is the refused
 /// apply: the snapshot is unchanged and no fan-out ran.
+/// `PublicationLost(n)` is the one genuinely bad delivery: `n` stores
+/// were REFUSED (queue full) or LOST (reactor gone) — they never entered
+/// a queue and never will run, so those reactors may never adopt the
+/// change even though the writer's state DID apply it. Never reported
+/// as pending: an ack the caller treats as success must not rest on a
+/// store that cannot land.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TierCAck {
     Applied,
     Pending(u32),
+    PublicationLost(u32),
     Failed(ApplyError),
 }
 
@@ -606,7 +613,26 @@ async fn writer_loop(
     // gated on it — [`gate_handoff`].
     let initial_snapshot = state.publish();
     catalog.store(Arc::clone(&initial_snapshot));
-    fan_out(&handles, None, &initial_snapshot, budget).await;
+    // The boot publication's ack is not droppable silence: a Lost store
+    // here means a reactor's gate (FR-6) never opens — it refuses every
+    // handoff with 57P03 for the process's whole life. Loud, not fatal:
+    // the other reactors serve, and the operator restarts (M3).
+    if let TierCAck::PublicationLost(lost) =
+        fan_out(&handles, None, &initial_snapshot, budget).await
+    {
+        cascade_telemetry::log(
+            cascade_telemetry::Level::Warn,
+            "tierc_boot_publication_lost",
+            &[
+                ("lost", lost.to_string().as_str()),
+                ("reactors", handles.len().to_string().as_str()),
+                (
+                    "effect",
+                    "the affected reactors refuse handoffs (57P03) until restart",
+                ),
+            ],
+        );
+    }
     let _ = published.send(());
 
     while let Some(cmd) = cmds.recv().await {
@@ -644,37 +670,48 @@ async fn writer_loop(
 /// sharing one budget. `issuer: None` is the boot publication (§10.1
 /// step 7, natural order). Returns [`TierCAck::Applied`] when every
 /// store confirmed within the budget, [`TierCAck::Pending(n)`] with the
-/// laggard count otherwise.
+/// laggard count when every store at least ADMITTED, and
+/// [`TierCAck::PublicationLost(n)`] when any store was refused outright
+/// (M3, post-M5 review).
 ///
 /// Pending never means lost: a store job whose `Submit` we stop waiting
 /// on was already admitted to its publication channel (`submit_to`
 /// admits eagerly), so it lands when that ring drains — the dropped
-/// `Submit` future only abandons the ack, not the job. The one true
-/// loss is a `Saturated` admission (channel full — >64 un-drained
-/// fan-outs against one reactor, unreachable in practice and surfaced
-/// as pending here; real backpressure is deferred with
-/// [`TIERC_WRITE_CAP`]).
+/// `Submit` future only abandons the ack, not the job. The genuine
+/// losses are the eager admission's own refusals: `Saturated` (channel
+/// full — >64 un-drained fan-outs against one reactor, unreachable in
+/// practice; real backpressure is deferred with [`TIERC_WRITE_CAP`])
+/// and `Lost` (the reactor's publication channel torn down). Either
+/// means that store can never run, so those reactors may never adopt
+/// the change — surfaced honestly as `PublicationLost`, never folded
+/// into pending.
 /// Waits for one fan-out store job, at most `budget`. The hand-rolled
 /// stand-in for `timer::timeout`: glommio's version only fits futures
 /// resolving to ITS `Result` type (`GlommioError<()>`), and [`Submit`]
 /// resolves with [`SubmitError`] — so this races the two futures with
 /// the caller's waker (either waking re-polls both, and the submit is
 /// checked first, so a confirm and a deadline in the same wake counts
-/// as confirmed). `None` = unconfirmed: the budget died first, or the
-/// submit resolved with an error (reactor gone). Dropping the submit at
-/// the deadline only abandons the ack — the job was already admitted to
-/// its publication queue (see [`fan_out`]).
-async fn budgeted<R: Send + 'static>(budget: Duration, fut: submit::Submit<R>) -> Option<R> {
+/// as confirmed). The three outcomes are distinct (M3, post-M5
+/// review): `Some(Ok)` = confirmed in time; `Some(Err)` = the submit
+/// resolved with a REFUSAL — `Saturated` (queue full) or `Lost`
+/// (reactor gone) — a store that can never land; `None` = the budget
+/// died first, the job was already admitted to its publication queue
+/// and lands lazily (dropping the submit only abandons the ack, never
+/// the job — see [`fan_out`]).
+async fn budgeted<R: Send + 'static>(
+    budget: Duration,
+    fut: submit::Submit<R>,
+) -> Option<Result<R, SubmitError>> {
     struct Race<R> {
         fut: submit::Submit<R>,
         timer: glommio::timer::Timer,
     }
     impl<R: Send + 'static> Future for Race<R> {
-        type Output = Option<R>;
+        type Output = Option<Result<R, SubmitError>>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             let this = self.get_mut();
             if let Poll::Ready(value) = Pin::new(&mut this.fut).poll(cx) {
-                return Poll::Ready(value.ok());
+                return Poll::Ready(Some(value));
             }
             if Pin::new(&mut this.timer).poll(cx).is_ready() {
                 return Poll::Ready(None);
@@ -717,20 +754,26 @@ async fn fan_out(
             }
         }));
     }
-    // Await in submission order under one shared deadline.
+    // Await in submission order under one shared deadline. The two
+    // failure shapes are distinct: a budget death leaves the job
+    // queued for lazy adoption (pending), a refusal leaves nothing
+    // queued at all (publication lost — M3).
     let mut unconfirmed = 0u32;
+    let mut lost = 0u32;
     for fut in pending {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match budgeted(remaining, fut).await {
-            Some(()) => {}
-            // Budget blown (jobs stay queued for lazy adoption) and
-            // Lost/Saturated (reactor gone — shutdown): both count as
-            // unconfirmed; the ack is honest about what answered in
-            // time.
+            Some(Ok(())) => {}
+            // Saturated/Lost: the store never entered a queue and
+            // never will — counted honestly, not as unconfirmed.
+            Some(Err(_)) => lost += 1,
+            // Budget blown: the job stays queued and lands lazily.
             None => unconfirmed += 1,
         }
     }
-    if unconfirmed == 0 {
+    if lost > 0 {
+        TierCAck::PublicationLost(lost)
+    } else if unconfirmed == 0 {
         TierCAck::Applied
     } else {
         TierCAck::Pending(unconfirmed)
@@ -1650,6 +1693,93 @@ mod tests {
         // in for session::run and closes it).
         drop(unsafe { TcpStream::from_raw_fd(passed.fd) });
         drop(client);
+    }
+
+    /// M3 (post-M5 review): a store that can NEVER land — `Lost`
+    /// (publication channel torn down) or `Saturated` (queue full) —
+    /// must surface as [`TierCAck::PublicationLost`], not `Pending`:
+    /// pending means "admitted, lands lazily", and an ack the caller
+    /// treats as success must not rest on a store that cannot run. The
+    /// pre-fix code merged both shapes into pending via `budgeted`'s
+    /// `.ok()`; each shape here fails that ack.
+    #[test]
+    fn fan_out_reports_never_landing_stores_as_publication_lost() {
+        // Shape 1 — Lost: the reactor's publication receiver drops
+        // before the writer ever connects. Dropping the receiver
+        // unconnected resolves the producer's connect with the channel
+        // torn down (the submit module's symmetric-disconnect rule), so
+        // the store's `submit_to` resolves `Lost` inside the budget.
+        let (init, rx) = submit::channel(TIERC_PUBLISH_CAP);
+        drop(rx);
+        let ack = LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("tierc-fanout-lost")
+            .make()
+            .expect("executor")
+            .run(async move {
+                let handle = init.connect().await;
+                fan_out(
+                    &[(0u32, handle, Arc::new(Catalog::empty()))],
+                    None,
+                    &Arc::new(snap(None)),
+                    Duration::from_secs(2),
+                )
+                .await
+            });
+        assert!(
+            matches!(ack, TierCAck::PublicationLost(1)),
+            "a Lost store is PublicationLost(1), got {ack:?}"
+        );
+
+        // Shape 2 — Saturated: the receiver stays connected but nothing
+        // drains it, and the queue is filled to its cap first. Eager
+        // admission is the contract, so the dummy jobs occupy the
+        // buffer and the fan-out's own store is refused outright.
+        let (init, rx) = submit::channel(TIERC_PUBLISH_CAP);
+        let peer = std::thread::Builder::new()
+            .name("tierc-fanout-sat-peer".into())
+            .spawn(move || {
+                let ex = LocalExecutorBuilder::new(glommio::Placement::Unbound)
+                    .name("tierc-fanout-sat-ring")
+                    .make()
+                    .expect("executor");
+                ex.run(async move {
+                    let receiver = rx.connect().await;
+                    // Hold the connected end until the refusal has been
+                    // observed; dropping earlier would tear the channel
+                    // down and turn the shape into a Lost.
+                    glommio::timer::sleep(Duration::from_secs(2)).await;
+                    drop(receiver);
+                });
+            })
+            .expect("peer thread spawns");
+        let ack = LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("tierc-fanout-sat")
+            .make()
+            .expect("executor")
+            .run(async move {
+                let handle = init.connect().await;
+                for _ in 0..TIERC_PUBLISH_CAP {
+                    // A named binding dropped unawaited, not `let _`:
+                    // admission is eager (the try_send happened at
+                    // submit_to), so dropping the Submit future only
+                    // abandons the ack — the job stays queued and the
+                    // buffer stays full.
+                    let queued = handle.submit_to(|| async {});
+                    drop(queued);
+                }
+                fan_out(
+                    &[(0u32, handle, Arc::new(Catalog::empty()))],
+                    None,
+                    &Arc::new(snap(None)),
+                    Duration::from_secs(2),
+                )
+                .await
+            });
+        peer.join().expect("peer joins");
+        assert!(
+            matches!(ack, TierCAck::PublicationLost(1)),
+            "a Saturated store is PublicationLost(1), got {ack:?}"
+        );
     }
 }
 

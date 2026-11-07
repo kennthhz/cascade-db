@@ -28,7 +28,13 @@ fn boot(default: NumaAffinity) -> Fixture {
     allowed.truncate(4);
     let (hk, w0a, w0b, w1) = (allowed[0], allowed[1], allowed[2], allowed[3]);
 
-    let topo = SyntheticTopology::new([hk, w0a, w0b, w1]);
+    // Labels match the config's numa claim (M5): a two-node config needs
+    // a two-node topology, or boot refuses the unknown label.
+    let topo = SyntheticTopology::new([hk, w0a, w0b, w1])
+        .with_numa(hk, 0)
+        .with_numa(w0a, 0)
+        .with_numa(w0b, 0)
+        .with_numa(w1, 1);
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![hk],
         worker_cores: vec![
