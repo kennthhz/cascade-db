@@ -8,11 +8,20 @@
 //! All reads are length-checked against the declared packet length before
 //! `read_exact`, and every truncation/EOF mid-exchange maps to
 //! [`HandshakeError::Closed`] — the peer vanished; close quietly.
+//!
+//! The handshake is also bounded in TIME (`handshake_timeout_ms`, PG's
+//! `authentication_timeout` analog): a budget, when given, is enforced
+//! as `SO_RCVTIMEO` on the socket (any single blocked read) plus a total
+//! deadline checked at every read boundary (a byte-trickling peer).
+//! Expiry maps to [`HandshakeError::TimedOut`] and the connection drops
+//! with nothing sent — writing to a peer stalled this hard could itself
+//! block the ring.
 
 use std::{
     collections::HashMap,
     io::{Read, Write},
     net::TcpStream,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -108,6 +117,10 @@ pub enum HandshakeError {
     /// Peer hung up or the socket died mid-exchange; nothing to report.
     #[error("connection closed mid-handshake")]
     Closed,
+    /// The handshake budget ran out — a silent or byte-trickling peer.
+    /// Nothing is sent; the client sees the connection drop.
+    #[error("handshake deadline exceeded")]
+    TimedOut,
     /// A real protocol/auth failure — reported to the client with its
     /// SQLSTATE code before closing.
     #[error("PG error {code}: {message}")]
@@ -117,7 +130,7 @@ pub enum HandshakeError {
 }
 
 /// Read one backend-protocol message: type byte + length + payload.
-fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+fn read_message<S: Read>(stream: &mut S) -> std::io::Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 5];
     stream.read_exact(&mut header)?;
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -132,7 +145,7 @@ fn read_message(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((header[0], payload))
 }
 
-fn write_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
+fn write_message<W: Write>(stream: &mut W, msg_type: u8, payload: &[u8]) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(5 + payload.len());
     buf.push(msg_type);
     buf.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
@@ -140,7 +153,7 @@ fn write_message(stream: &mut TcpStream, msg_type: u8, payload: &[u8]) -> std::i
     stream.write_all(&buf)
 }
 
-fn reject(stream: &mut TcpStream, code: &'static str, message: &str) -> HandshakeError {
+fn reject<W: Write>(stream: &mut W, code: &'static str, message: &str) -> HandshakeError {
     let _ = send_fatal(stream, code, message);
     HandshakeError::Rejected {
         code,
@@ -153,8 +166,8 @@ fn reject(stream: &mut TcpStream, code: &'static str, message: &str) -> Handshak
 /// rejections and the router's post-handshake refusals (FR-12): by then
 /// the client is in the query protocol, and FATAL-then-close is how
 /// PostgreSQL reports a connection-ending error there too.
-pub(crate) fn send_fatal(
-    stream: &mut TcpStream,
+pub(crate) fn send_fatal<W: Write>(
+    stream: &mut W,
     code: &'static str,
     message: &str,
 ) -> std::io::Result<()> {
@@ -173,10 +186,77 @@ pub(crate) fn send_fatal(
     write_message(stream, b'E', &payload)
 }
 
+/// The handshake's time bound: `read` checks the TOTAL deadline before
+/// each read — a byte-trickling peer cannot extend the exchange past it —
+/// while the socket's `SO_RCVTIMEO` (set by [`handshake`]) bounds any
+/// single blocked read, which the deadline check cannot see into. Writes
+/// delegate untouched: rejection replies still reach a live peer.
+struct Deadline<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(d) = self.deadline {
+            if Instant::now() >= d {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "handshake deadline exceeded",
+                ));
+            }
+        }
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Deadline<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 /// Read the startup packet (handling SSLRequest by declining), parse params,
 /// and run authentication. On success the session is authenticated and the
 /// stream is left after ReadyForQuery, ready for the query loop (T1.7).
-pub fn handshake(stream: &mut TcpStream, policy: &AuthPolicy) -> Result<Session, HandshakeError> {
+///
+/// `budget` bounds the whole exchange (see the module doc). The bound is
+/// self-contained HERE on purpose: the socket-level timeout is set before
+/// and cleared after the exchange, so no caller can forget the clear and
+/// let the deadline leak into an idle session's reads.
+pub fn handshake(
+    stream: &mut TcpStream,
+    policy: &AuthPolicy,
+    budget: Option<Duration>,
+) -> Result<Session, HandshakeError> {
+    if let Some(b) = budget {
+        // Unreachable-failure on a live socket (the serving loop already
+        // .expects the listener's identical call); ignoring keeps this
+        // path total-failure-shaped either way. The budget's upper bound
+        // is config validation (one hour), so the addition below cannot
+        // overflow `Instant`.
+        let _ = crate::accept::set_stream_recv_timeout(stream, Some(b));
+    }
+    let result = {
+        let mut wire = Deadline {
+            stream,
+            deadline: budget.map(|b| Instant::now() + b),
+        };
+        do_handshake(&mut wire, policy)
+    };
+    if result.is_ok() && budget.is_some() {
+        let _ = crate::accept::set_stream_recv_timeout(stream, None);
+    }
+    result
+}
+
+fn do_handshake<S: Read + Write>(
+    stream: &mut S,
+    policy: &AuthPolicy,
+) -> Result<Session, HandshakeError> {
     let startup = read_startup(stream)?;
     let session = authenticate(stream, policy, &startup)?;
     finish_session(stream, &session)?;
@@ -185,7 +265,7 @@ pub fn handshake(stream: &mut TcpStream, policy: &AuthPolicy) -> Result<Session,
 
 /// Read the startup-length packet. Returns `None` if the peer sent
 /// CancelRequest (the caller closes without an error reply).
-fn read_startup(stream: &mut TcpStream) -> Result<Startup, HandshakeError> {
+fn read_startup<S: Read + Write>(stream: &mut S) -> Result<Startup, HandshakeError> {
     // A hostile peer can ping-pong SSLRequest forever, pinning this thread;
     // a real client negotiates at most once. Two probes, then refuse.
     let mut ssl_probes = 0u32;
@@ -199,7 +279,8 @@ fn read_startup(stream: &mut TcpStream) -> Result<Startup, HandshakeError> {
             {
                 return Err(HandshakeError::Closed)
             }
-            Err(e) => return Err(e.into()),
+            // WouldBlock/TimedOut = the handshake budget, via io_closed.
+            Err(e) => return Err(io_closed(e)),
         }
         let len = u32::from_be_bytes(len_buf);
         if !(8..=MAX_STARTUP_LEN).contains(&len) {
@@ -210,7 +291,7 @@ fn read_startup(stream: &mut TcpStream) -> Result<Startup, HandshakeError> {
             ));
         }
         let mut body = vec![0u8; len as usize - 4];
-        stream.read_exact(&mut body)?;
+        stream.read_exact(&mut body).map_err(io_closed)?;
 
         let code = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
         match code {
@@ -272,8 +353,8 @@ fn parse_params(mut body: &[u8]) -> Option<HashMap<String, String>> {
     }
 }
 
-fn authenticate(
-    stream: &mut TcpStream,
+fn authenticate<S: Read + Write>(
+    stream: &mut S,
     policy: &AuthPolicy,
     startup: &Startup,
 ) -> Result<Session, HandshakeError> {
@@ -319,7 +400,7 @@ fn rand_backend_secret() -> i32 {
 /// SCRAM-SHA-256 exchange (RFC 5802 server side, PG framing):
 /// AuthenticationSASL → client SASLInitialResponse → AuthenticationSASLContinue
 /// (server-first) → client SASLResponse → verify → AuthenticationSASLFinal.
-fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), HandshakeError> {
+fn scram_exchange<S: Read + Write>(stream: &mut S, user: &AuthedUser) -> Result<(), HandshakeError> {
     // Advertise the one mechanism we implement.
     let mut mech = Vec::new();
     mech.extend_from_slice(b"SCRAM-SHA-256\0");
@@ -488,9 +569,9 @@ fn scram_exchange(stream: &mut TcpStream, user: &AuthedUser) -> Result<(), Hands
 /// A gs2 header of "n,," (no channel binding) or "y,," (client thinks the
 /// server may not support it). 'p' (binding required) is refused — we do not
 /// advertise SCRAM-SHA-256-PLUS.
-fn split_gs2_header<'a>(
+fn split_gs2_header<'a, W: Write>(
     client_first: &'a str,
-    stream: &mut TcpStream,
+    stream: &mut W,
 ) -> Result<(&'a str, &'a str), HandshakeError> {
     for allowed in ["n,,", "y,,"] {
         if let Some(rest) = client_first.strip_prefix(allowed) {
@@ -506,7 +587,10 @@ fn split_gs2_header<'a>(
 
 /// SASLInitialResponse's initial response may be absent (length -1). Then a
 /// bare SASLResponse with the client-first follows.
-fn read_optional_payload(stream: &mut TcpStream, rest: &[u8]) -> Result<Vec<u8>, HandshakeError> {
+fn read_optional_payload<S: Read + Write>(
+    stream: &mut S,
+    rest: &[u8],
+) -> Result<Vec<u8>, HandshakeError> {
     if rest.len() < 4 {
         return Err(reject(
             stream,
@@ -554,6 +638,10 @@ fn io_closed(e: std::io::Error) -> HandshakeError {
         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset => {
             HandshakeError::Closed
         }
+        // Our clock, not the peer's: `SO_RCVTIMEO` expiry (WouldBlock on
+        // Linux) and the total deadline (TimedOut) both mean the budget
+        // ran out — never a peer-initiated condition.
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => HandshakeError::TimedOut,
         _ => HandshakeError::Io(e),
     }
 }
@@ -565,13 +653,13 @@ fn prefix(code: i32, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn auth_ok(stream: &mut TcpStream) -> Result<(), HandshakeError> {
+fn auth_ok<W: Write>(stream: &mut W) -> Result<(), HandshakeError> {
     Ok(write_message(stream, b'R', &prefix(0, &[]))?)
 }
 
 /// Post-auth, pre-query messages every client expects: parameter statuses,
 /// backend key data, ready-for-query.
-fn finish_session(stream: &mut TcpStream, session: &Session) -> Result<(), HandshakeError> {
+fn finish_session<W: Write>(stream: &mut W, session: &Session) -> Result<(), HandshakeError> {
     for (name, value) in [
         ("server_version", "16.0"),
         ("server_encoding", "UTF8"),

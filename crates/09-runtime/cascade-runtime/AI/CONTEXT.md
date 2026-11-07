@@ -553,6 +553,32 @@ reads), count still outranks proximity, and a hammered worker is
 rejected at a count tie (its EWMA strictly-greater-with-margin —
 deliberately NOT a tie — while the idle workers publish exact 0).
 
+**Post-M5 review fix 1 — the handshake is bounded in time (H1).** The
+holistic adversary review found the accepted handshake had NO time
+bound anywhere: the listener's `SO_RCVTIMEO` does not propagate to
+accepted sockets (Linux), so one silent client parked `pg::handshake`
+— and with it the whole serving housekeeper (accepts, `poll_due`
+ticks, the Tier C writer, the shutdown flag check) — indefinitely.
+Fix: `handshake_timeout_ms` (default 60 000, PG's
+`authentication_timeout` analog; validation caps at one hour so the
+`Instant` arithmetic cannot overflow; 0 = documented off switch),
+enforced self-containedly INSIDE `handshake` — `SO_RCVTIMEO` on the
+accepted socket bounds any single blocked read, a total deadline
+(`Deadline` read-wrapper, checked before every read) bounds a
+byte-trickling peer. The socket timeout is CLEARED on success: an
+idle session is legal (idle policy belongs to the reaper), the
+deadline was the handshake's, not the connection's. Expiry maps to
+`HandshakeError::TimedOut` via `io_closed` (WouldBlock|TimedOut =
+our clock, never the peer's) and nothing is sent — writing to a peer
+stalled this hard could itself block. The internal pg fns went
+generic over Read/Write so the wrapper threads through unchanged.
+Tests (tests/auth.rs): silent client times out bounded; a dribbled
+valid startup (9 bytes × 50 ms vs a 300 ms budget) hits the TOTAL
+deadline while every per-read gap sits inside `SO_RCVTIMEO`; and the
+end-to-end discriminator boots a real runtime (budget 300 ms) where
+one stalled handshake cannot stop another client's INSERT, and the
+stalled connection is cut, not held.
+
 ## Open Design Questions
 
 See the spec's §11. Highlights:

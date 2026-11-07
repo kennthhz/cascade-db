@@ -213,6 +213,19 @@ pub struct RuntimeConfig {
     /// synthetic topologies and single-NUMA rigs where discovery would
     /// find nothing.
     pub nic_numa: Option<u32>,
+    /// The handshake's time budget in milliseconds — PG's
+    /// `authentication_timeout` analog. The listener's `SO_RCVTIMEO`
+    /// does not propagate to accepted sockets (Linux), so without this
+    /// one silent client parks the handshake read — and with it the
+    /// whole serving housekeeper — indefinitely. Two mechanisms enforce
+    /// the budget: `SO_RCVTIMEO` on the accepted socket bounds any
+    /// single blocked read, and a total deadline checked at every read
+    /// boundary bounds a byte-trickling peer. Default 60 000
+    /// (PostgreSQL's own `authentication_timeout`); the cap at one hour
+    /// keeps the `Instant` arithmetic overflow-free. `0` disables the
+    /// bound entirely — the pre-mitigation behavior, a DoS surface, and
+    /// nobody's production setting.
+    pub handshake_timeout_ms: u64,
     pub stall: StallConfig,
     pub auth: AuthConfig,
 }
@@ -238,6 +251,7 @@ impl Default for RuntimeConfig {
             stall_reap_ms: 30_000,
             load_sample_ms: 1_000,
             nic_numa: None,
+            handshake_timeout_ms: 60_000,
             stall: StallConfig::default(),
             auth: AuthConfig::default(),
         }
@@ -292,6 +306,8 @@ pub enum ConfigError {
     ZeroBatchRows,
     #[error("runtime.drain_deadline_s must be > 0")]
     ZeroDrainDeadline,
+    #[error("runtime.handshake_timeout_ms must be 0 (disabled) or at most 3 600 000")]
+    HandshakeTimeoutTooLarge,
     #[error("runtime.max_conns_per_worker must be > 0")]
     ZeroMaxConns,
     #[error("runtime.tierc_fanout_wait_ms must be > 0")]
@@ -360,6 +376,14 @@ impl RuntimeConfig {
         }
         if self.drain_deadline_s == 0 {
             return Err(ConfigError::ZeroDrainDeadline);
+        }
+        // The cap keeps `Instant + Duration` in `pg::handshake`
+        // overflow-free (a drain_deadline-style panic is exactly the
+        // class of bug this validation exists to refuse) and a
+        // handshake longer than an hour meaningless. `0` is the
+        // documented off switch.
+        if self.handshake_timeout_ms > 3_600_000 {
+            return Err(ConfigError::HandshakeTimeoutTooLarge);
         }
         if self.max_conns_per_worker == 0 {
             return Err(ConfigError::ZeroMaxConns);

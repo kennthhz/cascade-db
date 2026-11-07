@@ -252,6 +252,7 @@ impl Router {
         initial: ClusterSnapshot,
         max_conns_per_worker: u32,
         nic_numa: Option<u32>,
+        handshake_timeout_ms: u64,
         tick_init: crate::orchestrator::OrchestratorInit,
         designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
         checkpoint: crate::checkpointer::CheckpointStats,
@@ -280,6 +281,15 @@ impl Router {
                 max_conns_per_worker,
                 tierc: Arc::clone(&tierc_plane.catalog),
                 nic_numa,
+            };
+            // The handshake's time budget (H1, `handshake_timeout_ms`): a
+            // silent or trickling client must not park THIS loop — with
+            // it gone, every tick, the Tier C writer, and shutdown all
+            // went with it. `None` = the config disabled the bound.
+            let handshake_budget = if handshake_timeout_ms > 0 {
+                Some(Duration::from_millis(handshake_timeout_ms))
+            } else {
+                None
             };
 
             // The orchestrator is serving-thread-local (its jobs may hold
@@ -469,7 +479,7 @@ impl Router {
                 // too.
                 let _ = stream.set_nodelay(true);
                 stats.accepted.fetch_add(1, Ordering::Relaxed);
-                if let Ok(session) = handshake(&mut stream, &router.policy) {
+                if let Ok(session) = handshake(&mut stream, &router.policy, handshake_budget) {
                     router.route(stream, &session);
                 }
                 // else: a rejection was already sent (or the peer vanished);

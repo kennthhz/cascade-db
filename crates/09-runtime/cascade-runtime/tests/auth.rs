@@ -7,25 +7,43 @@
 use std::{
     io::{self, Read, Write},
     net::TcpStream,
-    sync::mpsc,
+    sync::{mpsc, Mutex},
     thread,
     time::Duration,
 };
 
 use cascade_runtime::{
     accept::AcceptLoop,
-    config::{AuthConfig, AuthMode, AuthUser},
+    config::{AuthConfig, AuthMode, AuthUser, NumaPool, NumaWorkers},
     pg::{sqlstate, AuthPolicy, HandshakeError},
+    pin,
+    Runtime, RuntimeConfig, SyntheticTopology,
     scram::ScramVerifier,
 };
 
 const ALICE: &str = "alice";
 const SECRET: &str = "correct horse battery staple";
 
+/// Pin-heavy boots must not overlap (deployment.rs discipline).
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// One-shot server: accept exactly one connection, run the handshake, and
 /// hand the result back for assertions.
 fn serve_one(
     policy: AuthPolicy,
+) -> io::Result<(String, mpsc::Receiver<Result<(), HandshakeError>>)> {
+    serve_one_bounded(policy, None)
+}
+
+/// The same, with an explicit handshake budget — the H1 mitigation's
+/// unit-testable form.
+fn serve_one_bounded(
+    policy: AuthPolicy,
+    budget: Option<Duration>,
 ) -> io::Result<(String, mpsc::Receiver<Result<(), HandshakeError>>)> {
     let listener = AcceptLoop::bind("127.0.0.1", 0)?;
     let port = listener.local_addr()?.port();
@@ -37,11 +55,12 @@ fn serve_one(
             .recv_timeout(Duration::from_secs(10))
             .expect("client connects");
         let mut stream = conn.stream;
-        let result = cascade_runtime::pg::handshake(&mut stream, &policy).map(|_| ())
+        let result = cascade_runtime::pg::handshake(&mut stream, &policy, budget).map(|_| ())
             as Result<(), HandshakeError>;
-        // Hold the socket open a moment so the client finishes reading its
-        // handshake replies before the fd closes.
         let _ = done_tx.send(result);
+        // The socket drops when this thread ends; a moment of grace lets a
+        // rejected client finish reading its FATAL before the fd closes.
+        thread::sleep(Duration::from_millis(50));
     });
     Ok((format!("127.0.0.1:{port}"), done_rx))
 }
@@ -297,4 +316,118 @@ fn cancel_request_closes_without_error() {
         Ok(n) => panic!("expected clean close, got {n} bytes"),
         Err(e) => panic!("expected clean close, got {e}"),
     }
+}
+
+/// H1: a client that connects and sends NOTHING must not pin the handshake
+/// forever. Pre-mitigation this test hangs: the accepted socket inherited
+/// no `SO_RCVTIMEO` (Linux does not propagate the listener's) and no total
+/// deadline existed — one silent peer froze the whole serving loop, ticks
+/// and shutdown with it.
+#[test]
+fn a_silent_client_times_out_bounded() {
+    let (url, done) =
+        serve_one_bounded(AuthPolicy::Trust, Some(Duration::from_millis(150))).unwrap();
+    thread::spawn(move || {
+        let _c = TcpStream::connect(&url).unwrap(); // connects, sends nothing
+        // Hold the socket open regardless; the SERVER must cut the
+        // exchange, not wait it out.
+        thread::sleep(Duration::from_secs(2));
+    });
+    let result = done
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the handshake resolves, bounded");
+    assert!(
+        matches!(result, Err(HandshakeError::TimedOut)),
+        "a silent client must surface TimedOut, got {result:?}"
+    );
+}
+
+/// H1's other half: a byte-TRICKLING peer defeats any per-read bound
+/// alone — every individual read succeeds well inside `SO_RCVTIMEO`,
+/// while the TOTAL crosses the budget. A valid minimal startup (length
+/// 9: protocol-3.0 code + the empty-params terminator) arrives one byte
+/// per 50 ms — 450 ms total against a 300 ms budget — so the deadline
+/// check that precedes each read fires while bytes are still owed: the
+/// deadline is the handshake's, not one read's.
+#[test]
+fn a_byte_trickling_client_hits_the_total_deadline() {
+    let (url, done) =
+        serve_one_bounded(AuthPolicy::Trust, Some(Duration::from_millis(300))).unwrap();
+    thread::spawn(move || {
+        let mut c = TcpStream::connect(&url).unwrap();
+        for b in [0u8, 0, 0, 9, 0, 3, 0, 0, 0] {
+            c.write_all(std::slice::from_ref(&b)).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(Duration::from_millis(400));
+    });
+    let result = done
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the handshake resolves, bounded");
+    assert!(
+        matches!(result, Err(HandshakeError::TimedOut)),
+        "a trickling client must surface TimedOut, got {result:?}"
+    );
+}
+
+/// The end-to-end discriminator: with one handshake stalled, the serving
+/// loop must still serve everyone else. Pre-mitigation the second client
+/// hangs forever behind the first (the watchdog aborts the suite); with
+/// the budget, the stall is cut at 300 ms and the real client's session
+/// runs — then the stalled connection is closed by the server, not held.
+#[test]
+fn a_stalled_handshake_does_not_stop_the_serving_loop() {
+    let _serial = serial();
+    let mut allowed = pin::current_affinity();
+    assert!(allowed.len() >= 3, "this test needs at least 3 CPUs");
+    allowed.truncate(3);
+    let (hk, w0, w1) = (allowed[0], allowed[1], allowed[2]);
+
+    let topo = SyntheticTopology::new([hk, w0, w1]);
+    let cfg = RuntimeConfig {
+        housekeeper_cores: vec![hk],
+        worker_cores: vec![
+            NumaWorkers {
+                numa: 0,
+                cores: vec![w0],
+            },
+            NumaWorkers {
+                numa: 1,
+                cores: vec![w1],
+            },
+        ],
+        numa_pools: vec![
+            NumaPool { numa: 0, size_mb: 1 },
+            NumaPool { numa: 1, size_mb: 1 },
+        ],
+        handshake_timeout_ms: 300,
+        ..RuntimeConfig::default()
+    };
+    let listener = AcceptLoop::bind("127.0.0.1", 0).expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    cascade_runtime::testutil::arm_suite_watchdog();
+    let _rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
+        .expect("boot routed");
+
+    // A: the stalled peer — connects, sends nothing.
+    let mut stalled = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+
+    // B: a real client, served WHILE A still holds its handshake open.
+    let mut b = postgres::Client::connect(
+        &format!("postgres://u:pw@127.0.0.1:{port}/dev"),
+        postgres::NoTls,
+    )
+    .expect("a real client is served while another handshake stalls");
+    b.simple_query("INSERT INTO debug_table VALUES (1, 'alive')")
+        .expect("the serving loop is alive");
+
+    // The stalled connection is CUT at the budget — not held forever.
+    stalled
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut eof = [0u8; 1];
+    assert!(
+        matches!(stalled.read(&mut eof), Ok(0) | Err(_)),
+        "the server closes the stalled connection at the budget"
+    );
 }

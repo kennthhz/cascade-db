@@ -333,7 +333,7 @@ The invariant: **for `single`-affinity DBs, every Tier B touch on the hot path i
 The listening socket is bound on a housekeeper core. The housekeeper:
 
 1. Accepts the TCP connection.
-2. Performs the PG startup handshake (auth, `DatabaseId` resolution against the Tier C catalog snapshot).
+2. Performs the PG startup handshake (auth, `DatabaseId` resolution against the Tier C catalog snapshot). The handshake is bounded in time — the `authentication_timeout` analog (`handshake_timeout_ms`, default 60 s): a total deadline checked at every read boundary plus `SO_RCVTIMEO` on the accepted socket, since the listener's does not propagate. A silent or byte-trickling client is cut; it can never park the serving housekeeper, whose loop also drives ticks, the Tier C writer, and shutdown.
 3. Decides which worker reactor the connection will live on (§5.2).
 4. Hands off the connection to the chosen reactor. Glommio's cross-executor channel requires `T: Send + Copy`, so what crosses is the **raw descriptor** (`RawFd` is `Copy`); the chosen reactor constructs the connection object from it on its own ring. The vendored Glommio version must support adopting an existing fd — an explicit version-pinning requirement (§11).
 

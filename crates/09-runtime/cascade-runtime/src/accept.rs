@@ -55,6 +55,41 @@ pub(crate) fn set_recv_timeout(listener: &TcpListener, d: std::time::Duration) -
     Ok(())
 }
 
+/// `SO_RCVTIMEO` on an ACCEPTED socket. The listener's timeout does not
+/// propagate to accepted connections (Linux) — which is exactly how one
+/// silent client could block a handshake read forever. The serving path
+/// sets this around `pg::handshake` only: an idle query loop is legal
+/// (idle policy belongs to the reaper), so the deadline must not outlive
+/// the handshake. `None` clears (a zero timeval = no timeout).
+pub(crate) fn set_stream_recv_timeout(
+    stream: &std::net::TcpStream,
+    d: Option<std::time::Duration>,
+) -> io::Result<()> {
+    let tv = match d {
+        Some(d) => libc::timeval {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_usec: d.subsec_micros() as libc::suseconds_t,
+        },
+        None => libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    unsafe {
+        let got = libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        if got != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Wakeup statistics: one increment per `accept(2)` return. With no clients
 /// this stays flat — the observable form of "sleeps between events" (FR-5).
 #[derive(Debug, Default)]

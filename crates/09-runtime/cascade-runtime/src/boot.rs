@@ -1074,6 +1074,7 @@ fn spawn_housekeepers(
     let (tx, rx) = mpsc::channel();
     let mut out = Vec::new();
     let max_conns = cfg.max_conns_per_worker;
+    let handshake_timeout_ms = cfg.handshake_timeout_ms;
     // The §5.2 composite's NIC anchor (T5.6): config overrides discovery;
     // nothing discovered leaves the tie-breaker inert (loopback-only
     // rigs, single-NUMA hosts). Discovered once — the NIC does not move.
@@ -1124,7 +1125,8 @@ fn spawn_housekeepers(
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
                     loop_, auth, senders, numas, counters, tierc_plane, initial, max_conns,
-                    nic_numa, tick_init, designated, stats, recycle, shutdown, drain, reap,
+                    nic_numa, handshake_timeout_ms, tick_init, designated, stats, recycle,
+                    shutdown, drain, reap,
                 );
             }),
             None => {
