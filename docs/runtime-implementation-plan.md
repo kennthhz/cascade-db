@@ -1,7 +1,9 @@
 # Cascade DB Runtime — Implementation Design & Task Plan
 
 Status: Accepted v2 · 2026-10-24 (v2 = adversarial review pass: closed spec-mismatch
-findings FR-catalog gaps; split per-task reviews into code + test review)
+findings FR-catalog gaps; split per-task reviews into code + test review);
+amended 2026-11-08 — M6 (the real-engine vertical slice, FR-39–FR-51) added
+post-M5, A17 resolved by ADR-0003
 Source of truth: [runtime-architecture.md](runtime-architecture.md) (the spec).
 This doc turns the spec into build order. It adds nothing to the design; where the
 spec is silent or ambiguous, the gap is recorded in §8 and ruled by a decision.
@@ -50,7 +52,7 @@ Commit protocol (per task):
    `Task: <id> · FRs: <ids> · Code review: clean | <findings> · Test review: clean | <findings>`
 5. Direct commit to `main` (repo convention). One commit per task; split only if genuinely two changes.
 
-## 3. Functional requirements (FR-1 … FR-38)
+## 3. Functional requirements (FR-1 … FR-51)
 
 One sentence each, plain language, spec anchor attached. "In" = invariant I1–I13.
 
@@ -107,6 +109,21 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - **FR-36** — `submit_to` is used only for rare coordination — Tier C writes, background work, cross-core observability queries — never on the OLTP query hot path. (§6.1, I12)
 - **FR-37** — Per-reactor working memory is allocated from a NUMA-local arena (allocator mechanism is the runtime ADR, spec names mimalloc-style thread-local heaps as the example); verified on bare metal. (§2.3, I4a)
 - **FR-38** — The affinity DDL surface exists and is honest: `CREATE DATABASE … WITH (numa_affinity = …)` records `datnumaffinity` (binding chosen at first activation for `single`); `ALTER DATABASE … SET numa_affinity` parses and validates but returns `unsupported_feature` until the Phase 7+ migration runner. (§2.5.1, §2.5.4, §11)
+
+### Real engine (M6; added 2026-11-08, post-M5)
+- **FR-39** — Heap tuples live in 8 KiB pages defined by `cascade-page`: a fixed little-endian header (format version, page kind, slot count, free-space offset, page LSN) followed by a u16 slot array and row cells carrying `xmin`/`xmax`/undo-ref headers; the outer 4-byte CRC over the page image is `cascade-storage`'s, recomputed on write and validated on read. (§4, cascade-page AI/CONTEXT)
+- **FR-40** — One BPM per NUMA shared by that node's cores: the BPM is `Send + Sync`, owns no file handle, and every miss is read through the calling reactor's own `PageStore` handle on its own ring — "no BPM object carries a file handle across reactors" is structural. (§8.1, I2)
+- **FR-41** — Frame access is safe under sharing: readers copy out under the frame mutex (`PageGuard` owns its snapshot), writers mutate only inside the sync closure under an exclusive pin (write-flag protocol), and no lock is ever held across an await point. (§8.1, I11)
+- **FR-42** — BPM frames are allocated from a NUMA-bound mapping built per pool (mbind, warn-and-degrade like pool placement), never from the `PoolRegistry` memory the demo heap occupies. (§2.3, I4a)
+- **FR-43** — The frozen FNV-1a placement hash `hash(PageId) mod num_numas` lives in `cascade-bpm` (`home_numa`); the runtime's `pool_for_page` becomes a delegating wrapper over it. (§8.1, §2.5.1, I3)
+- **FR-44** — A full pool evicts in-pool: a pinned-free clean frame first, else one pinned-free dirty page through the WAL gate, else `PoolFull`; WAL-before-data holds on every writeback including eviction; CLOCK-sweep (reference bit) is deferred until measured. (§8.1, I7)
+- **FR-45** — The WAL carries heap mutations as full row images: a `HeapInsert` record holds the segment id plus the cell bytes exactly as the page lays them down; the legacy debug `Insert` type stays decodable, but the runtime stops emitting it. (README §6.3, I8)
+- **FR-46** — The heap access method places rows by sequential fill routed through `home_numa`, stamps `page_lsn` with the commit's end LSN via `write_logged`, scans by page iteration with no visibility logic (committed pages plus the session's own pending rows), and returns `Tid` without persisting it — live layout may differ from replay layout, accepted while Tids never escape to disk. (§4, cascade-heap AI/CONTEXT)
+- **FR-47** — The wire path is behavior-identical through the real engine: same statement set, same error codes, uncommitted rows never visible to another session. (§4, I5)
+- **FR-48** — The checkpointer advances the per-DB truncatable LSN only after a fully drained pass — zero refused pages, post-flush dirty set empty, no in-flight applies — to the minimum resident page LSN; every page writeback is `fdatasync`ed before it reports success. (§9, I7)
+- **FR-49** — Every committing session registers an in-flight-apply slot before its first WAL reservation and clears it only after page apply; the frontier can never outrun an applied commit. (§9)
+- **FR-50** — Recovery is frontier-aware: `prepare` replays the WAL in commit order and returns the post-frontier redo list (legacy type-4 records mapped to equivalent cells); boot applies redo after the pools exist and before workers spawn; the clean marker seeds the frontier. (§10.1, §10.3, FR-7)
+- **FR-51** — The crash matrix gains page-survival rows: commit + checkpoint → restart serves from pages with no redo; commit only → full redo; kill mid-flush-pass → frontier unmoved, full redo; torn-tail semantics unchanged. (§10.3)
 
 ## 4. Milestones & tasks
 
@@ -397,12 +414,82 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - Test review: every `#[ignore]` reason string verified still-accurate; flaky candidates from CI history re-run N times.
 - **DEFERRED (2026-11-01):** no bare-metal multi-NUMA host is available; the gate runs unchanged when one is. T5.1–T5.6 are committed and green, and nothing else in the plan depends on this task — M5 is otherwise closed. The three `#[ignore]` tests (`pools_are_node_local_on_bare_metal`, `provisioned_host_boots_without_warnings`, `boots_bare_metal`) are the entry points; their reason strings name what each needs.
 
+### M6 — Real engine vertical slice (the cascade-heap slice; added 2026-11-08, post-M5)
+
+The M0–M5 runtime drives a debug stand-in: rows live only in the WAL, the frontier
+is pinned at 0, no worker BPM exists. M6 swaps the substrate — real heap tuples on
+real 8 KiB pages through the per-NUMA BPM — so the machinery M3–M5 built (the
+writeback gate, `flush_pass`, the recycle decision) finally does physical work.
+Scope guards (§7 stands): no MVCC visibility logic (`xmin` stamped, `xmax`/undo-ref
+reserved — the slice stays single-writer-per-row), no btree/index (scan + id filter),
+no planner/extended protocol, no segmented-WAL physical recycle, single dev DB,
+single-DB replay (A8). `demoheap`, `debug_roles`/`debug_databases`, and Tier C are
+untouched. The concurrent-BPM decisions are ADR-0003 (A17 closes there).
+
+**T6.0 Plan + ADR: define M6.**
+- Goal: the plan says what M6 is before code depends on it; A17 closes.
+- Do: this section; FR-39–FR-51 above; §7 heap bullet amended; §6 matrix extended; ADR-0003 authored (sharded page table · store-agnostic BPM · copy-out frame access · mbind frames · `home_numa` relocation · minimal eviction).
+- Tests: docs-only commit, recorded as such (T0.1 precedent).
+- Code review: the ADR's alternatives carry one-line rejection reasons; the I11 lock table is complete.
+- Test review: n/a (docs).
+
+**T6.1 `cascade-page`: the 8 KiB heap page format.**
+- Goal: the page-format authority stops being a stub.
+- FRs: FR-39.
+- Tests: golden byte-layout literals (LE frozen); encode/decode roundtrip; page-full boundary math; malformed-image rejection (slot past free offset, cell length overflow).
+- Code review: the header's own `crc32` field is DELETED (storage owns the outer CRC — the division documented in both crates); no external pointers into the page; endianness fixed.
+- Test review: do the golden literals pin the whole layout, or just spot bytes?
+
+**T6.2 `cascade-bpm`: the cross-core pool.**
+- Goal: one `Send + Sync` BPM per NUMA (§8.1), owning no file handle.
+- FRs: FR-40, FR-41, FR-42, FR-43, FR-44.
+- Tests: two+ executor threads sharing one `Arc<Bpm>`, each with its own `CoreStorage` on one data dir — concurrent miss on the same page installs exactly once; exclusive-pin mutual exclusion with writer retry; write-vs-flush race stress where every read-back is CRC-valid (torn-image detector); gate wait under concurrency; eviction reuses frames and preserves WAL-before-data; bare-metal `#[ignore]` NUMA-binding check (numa_maps); FNV parity with the runtime wrapper.
+- Code review: any path touching frame bytes outside the mutex; a lock held across an await (unrepresentable by API shape — verify); `Arc<dyn PageStore>` appearing anywhere (AFIT trait is not dyn-compatible); frames aliasing `PoolRegistry` memory.
+- Test review: does the torn-image test actually race (yield points), or run and hope?
+
+**T6.3 `cascade-wal`: the HeapInsert record.**
+- Goal: the WAL carries the physical row image.
+- FRs: FR-45.
+- Tests: encode/decode roundtrip; golden record bytes; type byte extends without layout change (version stays 1); torn-record CRC behavior unchanged.
+- Code review: payload is the cell bytes verbatim (no second serialization of the row); type 4 documented legacy-retained.
+- Test review: n/a beyond roundtrip exactness.
+
+**T6.4 `cascade-heap`: the access method.**
+- Goal: rows on pages through the BPM.
+- FRs: FR-46.
+- Tests: sequential fill across a page boundary; scan completeness and order; append-during-scan makes progress (exclusive-pin retry is not starvation); id filter stays session-side.
+- Code review: no visibility logic sneaking in; `Tid` returned but never persisted; the replay-layout-differs note present.
+- Test review: is the page-boundary fill exact (64-row page) or approximate?
+
+**T6.5 Runtime wiring + live checkpoint + the frontier rule.**
+- Goal: the wire path goes through pages; the frontier leaves 0 without lying.
+- FRs: FR-47, FR-48, FR-49.
+- Do: boot builds per-NUMA BPMs + `Arc<[Arc<Bpm>]>` + heap view into the session env (§10.1 step 6c, the shape `Worker.pool_index` anticipates); per-worker `CoreStorage`; commit = register in-flight → reserve/fill HeapInsert (barrier phases `reserved`/`midfill`/`synced` preserved) → heap apply `write_logged(commit_end)` → clear in-flight; `flush_pass(bpm, own_store, db, trunc, inflight)` on each NUMA's designated worker under the drained-pass rule; `CoreStorage::write_page` gains `fdatasync`; shutdown's final flush runs per NUMA (FR-8).
+- Tests: **the existing query/commit/txn wire suites pass unchanged** (the discriminator); the frontier-stays-at-0 test rewritten — real INSERTs + a pass → frontier > 0, monotone; a `SyncCountingStore` proves sync precedes advance; in-flight-blocks-advance unit test; second-connection-never-sees-uncommitted-rows wire test (pinned); recycle tests rewritten — decision computed from the real frontier, physical reclaimed bytes still 0; housekeeper-no-I/O instrumentation untouched.
+- Code review: the drained-pass rule replaces the min-over-dirty-at-start floor (whose own comment documents the hole it closes); sync never on the session apply path; the pending/in-flight ordering register-before-reserve.
+- Test review: does the frontier test prove monotonicity across multiple passes, or read once?
+
+**T6.6 Recovery + crash matrix.**
+- Goal: restart serves pages; redo only past the frontier.
+- FRs: FR-50, FR-51.
+- Tests: `prepare` returns the post-frontier redo list in commit order (legacy type-4 mapped); boot applies redo post-pool-construction pre-worker-spawn on a throwaway executor; boot-order assertion extended (redo done before the first session); matrix rows: checkpointed-clean restart (no redo, pages serve) · commit-then-crash (full redo) · kill mid-flush-pass (frontier unmoved → full redo) · torn tail unchanged; fixtures' log builders rewritten to HeapInsert; exact row sets asserted, page layout explicitly NOT asserted.
+- Code review: clean marker seeds the frontier; redo stamps carry commit-end LSNs so later flush gates behave; no replay path bypassing the gate.
+- Test review: does the mid-flush-pass kill land in a *controlled* barrier, not a sleep guess?
+
+**T6.7 Observables + doc sync + full gate.**
+- Goal: the milestone ends documented and green.
+- Do: `AI/CONTEXT.md` for cascade-page/bpm/heap/wal/runtime (spec↔crate-doc sync sweep across all crates); §6 matrix completion; full-workspace gate + clippy zero.
+- Tests: full workspace suite; the M6 demo: INSERT/SELECT through real pages, checkpoint, restart serving from pages.
+- Code review: full-milestone diff re-reviewed against §5 end to end.
+- Test review: every `#[ignore]` reason string still accurate; flaky candidates re-run N times.
+
 ### Milestone gates
 
 Each milestone ends when: every task committed with both review lines clean ·
 full test suite green · the milestone demo runs (M1: connect/query/commit/crash-replay;
 M2: affinity routing on synthetic+real topology; M3: crash matrix; M4: clean drain;
-M5: DDL visible everywhere + bare-metal gate).
+M5: DDL visible everywhere + bare-metal gate; M6: INSERT/SELECT through real pages +
+checkpoint + restart serving from pages).
 
 ## 5. Standing adversary code-review checklist (R8, per commit)
 
@@ -480,11 +567,24 @@ Run on the new/changed tests; findings block the commit.
 | FR-36 | T5.4 (probe), all (review) | zero-`submit_to` probe over an OLTP workload; §5 checklist item 12 at every review |
 | FR-37 | T2.3, T5.7 | bare-metal numa_maps locality check |
 | FR-38 | T5.5 | `unsupported_feature` code test; `datnumaffinity` recorded |
+| FR-39 | T6.1 | golden page-layout literals; roundtrip; malformed-image rejection |
+| FR-40 | T6.2 | two-executor shared-`Arc<Bpm>`; install exactly-once; no store ownership (type-level) |
+| FR-41 | T6.2 | write-vs-flush race stress, CRC-valid read-back; exclusive-pin retry |
+| FR-42 | T6.2 (+ T5.7 entry point) | NUMA-binding `#[ignore]` numa_maps check |
+| FR-43 | T6.2 | FNV golden literals moved into cascade-bpm; runtime parity test |
+| FR-44 | T6.2 | eviction reuses frames; dirty eviction gated; full-pool behavior |
+| FR-45 | T6.3 | encode/decode roundtrip; golden bytes |
+| FR-46 | T6.4 | page-boundary fill; scan completeness; append-during-scan progress |
+| FR-47 | T6.5 | existing wire suites pass unchanged; uncommitted-invisibility pinned |
+| FR-48 | T6.5 | SyncCountingStore sync-precedes-advance; frontier monotone; drained-pass units |
+| FR-49 | T6.5 | in-flight-blocks-advance unit test |
+| FR-50 | T6.6 | redo-from-frontier boot test; boot-order assertion |
+| FR-51 | T6.6 | crash-matrix page-survival rows ×4 |
 
 ## 7. Deferred — deliberate non-goals of *this plan* (not gaps)
 
 - **Transaction layer**: XID allocators (§8.3), MVCC visibility, undo — Tier B rows in spec §4; lands with `cascade-mvcc`/`cascade-undo` milestones. The slice's debug engine is single-writer-per-row.
-- **Full access methods**: heap/B+tree/columnar (§4) — `cascade-heap`/`cascade-btree` milestones; the slice has a fixed-row debug table.
+- **Full access methods**: heap/B+tree/columnar (§4) — `cascade-heap`/`cascade-btree` milestones; the slice has a fixed-row debug table. **Amended (M6, 2026-11-08):** the *heap* slice lands as M6 — one fixed table, no visibility logic, no indexes, scan + id filter only; B+tree, columnar, MVCC visibility, undo, and the catalog-driven surface remain deferred below.
 - **Real SQL surface**: planner/extended protocol/prepared statements/cursors (§3.3 Tier A rows) — post-slice; parser decision made and landed (A1).
 - **NUMA-affinity migration runner** (§2.5.4): Phase 7+; v1 ships the DDL surface returning `unsupported_feature` (FR-38) — exactly as the spec prescribes.
 - **Parallel query**: absent from the spec by design; the escape-hatch shape (coordinator + per-shard scans + Tier B queues) is sketched in conversation only, not planned here.
@@ -510,5 +610,5 @@ Run on the new/changed tests; findings block the commit.
 | A14 | **`cross` WAL home column** (§11: "exact column TBD"). Slice: catalog debug table, column named in the BPM/WAL ADR. | Open — catalog ADR |
 | A15 | **Stall plumbing** — housekeeper polling vs in-band self-report (§11). Slice: per-reactor counters, housekeeper polls (matches §9's assumed row). | Backfill T0.1 |
 | A16 | **`submit_to` API visibility** — public to higher crates or restricted (§11). Slice: crate-public; ADR when the first external caller appears. | Open — runtime ADR |
-| A17 | **BPM page-table impl** — flurry vs scc vs hand-rolled (§11). BPM crate ADR; slice uses whichever lands first. | Open — BPM ADR |
+| A17 | **BPM page-table impl** — flurry vs scc vs hand-rolled (§11). BPM crate ADR; slice uses whichever lands first. | **Resolved (T6.0, 2026-11-08)** — ADR-0003: hand-rolled sharded `RwLock<HashMap>` array (`next_pow2(2 × cores_on_numa)` shards, `get_or_insert` under one shard lock — double-install containment by construction); escalate to flurry only on measured contention. The ADR also settles the cross-core generalization it drags in: store-agnostic BPM, copy-out frame access with a write-flag pin protocol, mbind frame memory, `home_numa` relocation, minimal greedy eviction (CLOCK-sweep deferred). |
 | A18 | **More NUMA nodes than worker cores** (§11). Slice: validated at boot; pool with no workers is legal (serves `cross` placement only). | Default set; backfill T0.1 |

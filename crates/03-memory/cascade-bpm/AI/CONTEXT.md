@@ -55,5 +55,5 @@ T3.2 landed the writeback gate (invariant 1, enforced): logged writes stamp the 
 ## Open Design Questions
 
 - Eviction algorithm within each NUMA pool: LRU-K vs CLOCK-sweep. Lean LRU-K for OLTP; CLOCK lower overhead.
-- Concrete concurrent hash map: `flurry` vs `scc` vs hand-rolled sharded array. ADR when the pool goes cross-core (M3) — the M1 slice uses `RefCell` per reactor.
+- Concrete concurrent hash map: → **Resolved 2026-11-08, ADR-0003** — hand-rolled sharded `RwLock<HashMap>` array (`next_pow2(2 × cores_on_numa)` shards, `get_or_insert` under one shard lock); escalate to `flurry` only on measured contention. The ADR also settles the cross-core generalization: store-agnostic BPM (generic per-call `&impl PageStore` — the AFIT trait is not dyn-compatible), copy-out `PageGuard` over a per-frame `Mutex` with a write-flag pin protocol, mbind frame memory (an in-crate mapping, never `PoolRegistry` memory — the demo heap aliases it), `home_numa` relocated into this crate, and minimal greedy eviction (CLOCK-sweep deferred). Lands as plan T6.2; until then the M1 `RefCell` slice above still describes `src/lib.rs`.
 - How the columnar engine (§3.7) plugs in — same per-NUMA BPM with a separate page-kind tag, or its own pool layer.
