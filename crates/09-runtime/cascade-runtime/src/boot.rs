@@ -1605,7 +1605,15 @@ fn spawn_workers(
                     // handoff's ownership ends right here.
                     let handoff = match crate::tierc::gate_handoff(handoff, &task_catalog) {
                         Ok(handoff) => handoff,
-                        Err(()) => continue,
+                        Err(()) => {
+                            // The router counted this admission; the
+                            // handoff dies here (57P03, the boot window
+                            // before this reactor's catalog lands), so
+                            // the gauge must let it go — the session-end
+                            // decrement will never run for it.
+                            task_counter.connections.fetch_sub(1, Ordering::Relaxed);
+                            continue;
+                        }
                     };
                     let counter = task_counter.clone();
                     let tenants = task_tenants.clone();

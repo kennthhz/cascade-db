@@ -414,7 +414,10 @@ pub async fn run(
     env: SessionEnv,
     reap: Option<Rc<crate::reaper::ReapRegistry>>,
 ) {
-    stats.connections.fetch_add(1, Ordering::Relaxed);
+    // `stats.connections` is incremented at ADMISSION (router.rs `route`,
+    // before the handoff lands) — not here; the session end below is the
+    // only decreter. Counting here instead would leave the handoff window
+    // uncounted and route new accepts onto a descheduled worker.
     // The idle reaper (T4.5, FR-34): one registry entry per connection,
     // armed before the first read and unregistered by an RAII guard on
     // every exit — a panic must not leave a zombie entry for every later

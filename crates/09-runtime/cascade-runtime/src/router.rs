@@ -206,7 +206,22 @@ impl Router {
             database: session.startup.database().map(str::to_owned),
         };
         match self.routes[idx].sender.try_send(handoff) {
-            Ok(()) => Some(peer),
+            Ok(()) => {
+                // The gauge counts ADMITTED connections from the instant
+                // of admission, not from when the worker gets around to
+                // `session::run` — otherwise a worker descheduled between
+                // handoff and count reads as idle and every accept in the
+                // window piles onto it (observed: two sequential test
+                // clients both routed to one worker under full-suite
+                // load). The session end is the only decreter; the
+                // boot-window gate refusal (boot.rs `gate_handoff`)
+                // decrements its own admission.
+                self.routes[idx]
+                    .counter
+                    .connections
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(peer)
+            }
             Err(dead) => {
                 // Channel full or worker gone: the fd must not leak. Recover
                 // it from the error and close.
