@@ -417,17 +417,18 @@ mod tests {
     /// real serving housekeeper thread.
     #[test]
     fn fanout_ticks_issue_no_storage_io_on_the_caller() {
-        // Capacity ≥ tick count: this test pins the *no-I/O* property, not
-        // the back-pressure refusal path — 16 sends into an 8-slot channel
-        // with a not-yet-draining receiver would drop 8 by design (the
-        // housekeeper never blocks on a worker), nondeterministically.
-        let (tx, rx) = glommio::channels::shared_channel::new_bounded::<ControlMsg>(32);
+        // Capacity ≥ tick count (a warm-up run plus the measured run): this
+        // test pins the *no-I/O* property, not the back-pressure refusal
+        // path — sends into a full channel with a not-yet-draining receiver
+        // would drop by design (the housekeeper never blocks on a worker),
+        // nondeterministically.
+        let (tx, rx) = glommio::channels::shared_channel::new_bounded::<ControlMsg>(64);
         let stats = CheckpointStats {
             requested: Arc::new(AtomicU64::new(0)),
             refused: Arc::new(AtomicU64::new(0)),
             passes: Arc::new(AtomicU64::new(0)),
         };
-        let rx_thread = spawn_rx(rx, 16);
+        let rx_thread = spawn_rx(rx, 32);
         // A dedicated runner thread, not the test runner's main thread:
         // the harness prints results from the main thread, and its
         // block-buffered stdout flushes (4 KiB pages) land in the
@@ -442,13 +443,23 @@ mod tests {
             .name("fanout-io-probe".into())
             .spawn(move || {
                 let tid = tid_named("fanout-io-probe").expect("runner finds its own tid");
-                let before = task_io_bytes(tid).expect("task io readable");
                 let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
                     .name("fanout-io-test")
                     .make()
                     .expect("executor builds");
-                let requested = ex.run(async move {
+                let measured = ex.run(async move {
                     let mut job = CheckpointFanout::new(vec![(0, tx.connect().await)], stats);
+                    // Warm-up: the full 16-tick sequence runs once
+                    // unsampled, so every code page the measured window
+                    // will touch is resident before the `before` sample.
+                    // A page evicted from the cache under full-suite
+                    // memory pressure faults in as a block-layer read on
+                    // THIS thread — observed once as 188_416 phantom
+                    // "storage reads" of warm-up code, nothing to do with
+                    // ticks. Sampling after the warm-up keeps the counter
+                    // delta meaning "the fanout did I/O", not "the kernel
+                    // refilled the cache"; the measured window shrinks to
+                    // the tick loop itself.
                     for _ in 0..16 {
                         crate::orchestrator::TickJob::tick(
                             &mut job,
@@ -458,18 +469,31 @@ mod tests {
                             },
                         );
                     }
+                    let warm_requested = job.stats.requested();
+                    let before = task_io_bytes(tid).expect("task io readable");
+                    for _ in 0..16 {
+                        crate::orchestrator::TickJob::tick(
+                            &mut job,
+                            &crate::orchestrator::Tick {
+                                ordinal: 1,
+                                late: std::time::Duration::ZERO,
+                            },
+                        );
+                    }
+                    let after = task_io_bytes(tid).expect("task io readable");
+                    assert_eq!(after.read_bytes, before.read_bytes, "no storage reads");
+                    assert_eq!(after.write_bytes, before.write_bytes, "no storage writes");
+                    let requested = job.stats.requested() - warm_requested;
+                    assert_eq!(requested, 16, "the measured run issued every signal");
                     assert_eq!(job.stats.refused(), 0, "the buffer held every signal");
-                    job.stats.requested()
+                    requested
                 });
-                let after = task_io_bytes(tid).expect("task io readable");
-                assert_eq!(after.read_bytes, before.read_bytes, "no storage reads");
-                assert_eq!(after.write_bytes, before.write_bytes, "no storage writes");
-                requested
+                measured
             })
             .expect("runner thread spawns");
         let requested = runner.join().expect("runner joins");
         assert_eq!(requested, 16);
-        assert_eq!(rx_thread.join().expect("rx thread joins"), 16);
+        assert_eq!(rx_thread.join().expect("rx thread joins"), 32);
     }
 
     #[test]
