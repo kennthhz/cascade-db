@@ -264,9 +264,8 @@ dependencies = [
 name = "cascade-page"
 version = "0.1.0"
 dependencies = [
- "cascade-error",
  "cascade-types",
- "crc32fast",
+ "thiserror",
 ]
 
 [[package]]

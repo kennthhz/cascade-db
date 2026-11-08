@@ -10,5 +10,5 @@ description = "8 KB page layout: headers, slot arrays, checksums, PageLSN. Forma
 
 [dependencies]
 cascade-types     = { workspace = true }
-cascade-error     = { workspace = true }
-crc32fast         = { workspace = true }
+thiserror         = { workspace = true }
+

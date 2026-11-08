@@ -1,21 +1,497 @@
-//! 8 KB page layout for Cascade DB.
+//! 8 KiB page layout for Cascade DB — the format authority every access
+//! method shares (T6.1, FR-39).
 //!
-//! See `README.md` and `AI/CONTEXT.md`. Format is locked in Phase 3.
+//! The on-disk unit is `PAGE_SIZE` raw bytes; the layout below is defined by
+//! byte offsets in **little-endian**, fixed at this version. There is no
+//! `#[repr(C)]` header struct on purpose: the bytes are the format, and the
+//! accessors below are its only legal readers/writers.
+//!
+//! ```text
+//! offset   0: format_version  u16   (1)
+//! offset   2: page_kind       u16   (1 = heap; btree/undo/columnar land later)
+//! offset   4: slot_count      u16
+//! offset   6: free_offset     u16   cells occupy [free_offset, PAGE_SIZE)
+//! offset   8: page_lsn        u64   high-water WAL boundary of the page's
+//!                                   content (invariant 2). ZERO in M6: the
+//!                                   BPM frame stamp is the authoritative
+//!                                   writeback boundary while no recovery
+//!                                   reads page images yet; the field is
+//!                                   format-complete so replay-from-pages
+//!                                   needs no format change.
+//! offset  16: reserved 16 bytes (zero)
+//! offset  32: slot array — `slot_count` × u16 LE cell offsets, growing up
+//!             from [`SLOTS_BASE`].
+//! tail:     cells growing DOWN from `PAGE_SIZE`.
+//! ```
+//!
+//! A cell is `[len u16][xmin u64][xmax u64][undo_ref u64][payload..]` where
+//! `len` counts the whole cell (`CELL_FIXED + payload.len()`), `xmin` is the
+//! inserting XID, and `xmax`/`undo_ref` are reserved zero until the MVCC/undo
+//! milestones land (§3.3's reservation: the row header lives on the page).
+//! The payload is opaque here — heap row encoding is `cascade-heap`'s (out of
+//! scope, per the crate's AI/CONTEXT).
+//!
+//! Checksum division (invariant 1): the OUTER integrity CRC lives in
+//! `cascade-storage` — every stored page image is
+//! `[u32 LE CRC32 of the rest][payload]`, recomputed on write and validated
+//! on read. This crate deliberately carries no checksum field of its own;
+//! nesting two CRCs over the same bytes would double the validation cost and
+//! blur which layer answers for integrity.
 
-#![allow(dead_code)]
+use thiserror::Error;
 
-use cascade_types::{Lsn, PAGE_SIZE};
+use cascade_types::PAGE_SIZE;
 
-/// Fixed page-header bytes. Exact layout settled in Phase 3.
-#[repr(C)]
-pub struct PageHeader {
-    pub format_version: u16,
-    pub page_kind: u16, // heap, btree-leaf, btree-internal, undo, columnar-seg, ...
-    pub free_space_offset: u16,
-    pub special_offset: u16,
-    pub page_lsn: Lsn,
-    pub crc32: u32,
-    // ... TBD
+/// Format version this crate reads and writes.
+pub const FORMAT_VERSION: u16 = 1;
+
+/// `page_kind` for heap pages.
+pub const PAGE_KIND_HEAP: u16 = 1;
+
+/// Fixed header size; the slot array begins here.
+pub const HEADER_LEN: usize = 32;
+
+/// First slot's byte offset (`slot i` lives at `SLOTS_BASE + 2*i`).
+pub const SLOTS_BASE: usize = HEADER_LEN;
+
+/// The fixed part of a cell: `[len u16][xmin u64][xmax u64][undo_ref u64]`.
+pub const CELL_FIXED: usize = 2 + 8 + 8 + 8;
+
+/// Compile-time format locks: the header fits, and the page size is the
+/// workspace's 8 KiB (a change here is a new format version, not an edit).
+const _: () = assert!(HEADER_LEN == 32);
+const _: () = assert!(PAGE_SIZE == 8192);
+const _: () = assert!(CELL_FIXED == 26);
+
+/// Hard slot-array bound for validation: the most u16 slots that could fit
+/// between [`SLOTS_BASE`] and the page tail.
+const MAX_SLOTS: usize = (PAGE_SIZE - SLOTS_BASE) / 2;
+
+/// Everything [`parse`] can refuse. `Malformed` carries the reason — a
+/// corrupt page image must never reach an access method as data.
+#[derive(Debug, Error)]
+pub enum PageError {
+    #[error("page is not initialized (all-zero header: a never-written page)")]
+    Uninitialized,
+    #[error("unsupported page format version {0} (this build reads {FORMAT_VERSION})")]
+    WrongVersion(u16),
+    #[error("unsupported page kind {0} for this layout (heap is {PAGE_KIND_HEAP})")]
+    WrongKind(u16),
+    #[error("cell would exceed the u16 length field")]
+    CellTooLarge,
+    #[error("page full: no room for another cell between the slot array and the cell region")]
+    Full,
+    #[error("malformed page image: {0}")]
+    Malformed(&'static str),
 }
 
-const _: () = assert!(PAGE_SIZE == 8192);
+/// A page is initialized iff its version bytes are nonzero — the cheap test
+/// callers use before paying [`parse`] (a never-written page reads back as
+/// zeroes and is treated as empty by the access method, not as corruption).
+pub fn is_initialized(buf: &[u8; PAGE_SIZE]) -> bool {
+    buf[0] != 0 || buf[1] != 0
+}
+
+fn rd_u16(buf: &[u8; PAGE_SIZE], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+fn rd_u64(buf: &[u8; PAGE_SIZE], off: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[off..off + 8]);
+    u64::from_le_bytes(b)
+}
+
+/// One decoded cell: the reserved row-header fields plus the opaque payload.
+/// The `payload` borrows the page image; nothing points into the page from
+/// outside it (invariant 4 — a row is addressed by `(PageId, SlotId)`).
+#[derive(Debug)]
+pub struct CellRef<'a> {
+    pub xmin: u64,
+    pub xmax: u64,
+    pub undo_ref: u64,
+    pub payload: &'a [u8],
+}
+
+/// A validated, read-only page image.
+#[derive(Debug)]
+pub struct PageView<'a> {
+    buf: &'a [u8; PAGE_SIZE],
+}
+
+impl<'a> PageView<'a> {
+    /// Validates the whole image — header bounds AND every cell — so a
+    /// corrupt page is refused once, at the boundary, never mid-scan.
+    /// `Uninitialized` is a normal outcome for a never-written page; the
+    /// access methods check [`is_initialized`] first when an empty page is
+    /// expected and skip straight to `parse` when it is not.
+    pub fn parse(buf: &'a [u8; PAGE_SIZE]) -> Result<PageView<'a>, PageError> {
+        if !is_initialized(buf) {
+            return Err(PageError::Uninitialized);
+        }
+        let version = rd_u16(buf, 0);
+        if version != FORMAT_VERSION {
+            return Err(PageError::WrongVersion(version));
+        }
+        let kind = rd_u16(buf, 2);
+        if kind != PAGE_KIND_HEAP {
+            return Err(PageError::WrongKind(kind));
+        }
+        let slot_count = rd_u16(buf, 4) as usize;
+        let free_offset = rd_u16(buf, 6) as usize;
+        if slot_count > MAX_SLOTS {
+            return Err(PageError::Malformed("slot count overflows the slot area"));
+        }
+        if free_offset > PAGE_SIZE || free_offset < SLOTS_BASE + 2 * slot_count {
+            return Err(PageError::Malformed(
+                "free offset overlaps or precedes the slot array",
+            ));
+        }
+        for i in 0..slot_count {
+            let off = rd_u16(buf, SLOTS_BASE + 2 * i) as usize;
+            if !(free_offset..PAGE_SIZE).contains(&off) {
+                return Err(PageError::Malformed("slot points outside the cell region"));
+            }
+            let len = rd_u16(buf, off) as usize;
+            if len < CELL_FIXED {
+                return Err(PageError::Malformed("cell shorter than its fixed part"));
+            }
+            if off + len > PAGE_SIZE {
+                return Err(PageError::Malformed("cell runs past the page tail"));
+            }
+        }
+        Ok(PageView { buf })
+    }
+
+    pub fn slot_count(&self) -> usize {
+        rd_u16(self.buf, 4) as usize
+    }
+
+    pub fn page_lsn(&self) -> u64 {
+        rd_u64(self.buf, 8)
+    }
+
+    /// The gap between the slot array's end and the cell region's start —
+    /// exactly the bytes the next cell may consume.
+    pub fn free_bytes(&self) -> usize {
+        rd_u16(self.buf, 6) as usize - (SLOTS_BASE + 2 * self.slot_count())
+    }
+
+    /// Cell `slot`, bounds-checked (post-[`parse`] this cannot fail, but the
+    /// accessor stays total for API honesty).
+    pub fn cell(&self, slot: usize) -> Result<CellRef<'a>, PageError> {
+        if slot >= self.slot_count() {
+            return Err(PageError::Malformed("slot index out of range"));
+        }
+        let off = rd_u16(self.buf, SLOTS_BASE + 2 * slot) as usize;
+        let len = rd_u16(self.buf, off) as usize;
+        Ok(CellRef {
+            xmin: rd_u64(self.buf, off + 2),
+            xmax: rd_u64(self.buf, off + 10),
+            undo_ref: rd_u64(self.buf, off + 18),
+            payload: &self.buf[off + CELL_FIXED..off + len],
+        })
+    }
+
+    /// Cells in slot order (insertion order — cells grow downward, slots up).
+    pub fn iter(&self) -> impl Iterator<Item = CellRef<'a>> + '_ {
+        (0..self.slot_count()).map(move |i| {
+            // Parse validated every cell; the unwrap documents that
+            // invariant rather than re-deriving it.
+            self.cell(i).expect("parse validated every slot")
+        })
+    }
+}
+
+/// A writable page image. `init` produces the fresh-page header; `wrap`
+/// admits an existing image through the same validation as [`PageView`].
+#[derive(Debug)]
+pub struct PageMut<'a> {
+    buf: &'a mut [u8; PAGE_SIZE],
+}
+
+fn wr_u16(buf: &mut [u8; PAGE_SIZE], off: usize, v: u16) {
+    buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+}
+
+fn wr_u64(buf: &mut [u8; PAGE_SIZE], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
+
+impl<'a> PageMut<'a> {
+    /// Writes the fresh-page header: zero slots, the cell region open to the
+    /// full tail, page_lsn zero. Every reserved byte is zeroed.
+    pub fn init(buf: &'a mut [u8; PAGE_SIZE]) -> PageMut<'a> {
+        for b in buf[..HEADER_LEN].iter_mut() {
+            *b = 0;
+        }
+        wr_u16(buf, 0, FORMAT_VERSION);
+        wr_u16(buf, 2, PAGE_KIND_HEAP);
+        wr_u16(buf, 4, 0); // slot_count
+        wr_u16(buf, 6, PAGE_SIZE as u16); // free_offset: no cells yet
+        // page_lsn (offset 8) and the reserved tail of the header stay zero.
+        PageMut { buf }
+    }
+
+    /// Admits an existing image for mutation after full validation.
+    pub fn wrap(buf: &'a mut [u8; PAGE_SIZE]) -> Result<PageMut<'a>, PageError> {
+        // Validate through the read path (one implementation of the rules).
+        let snapshot = &*buf;
+        PageView::parse(snapshot)?;
+        Ok(PageMut { buf })
+    }
+
+    fn slot_count(&self) -> usize {
+        rd_u16(self.buf, 4) as usize
+    }
+
+    fn free_offset(&self) -> usize {
+        rd_u16(self.buf, 6) as usize
+    }
+
+    /// Appends one cell (insertion order = slot order) and returns its slot
+    /// index. Cells grow downward from the page tail; the slot array grows
+    /// up from [`SLOTS_BASE`]; the append fails with [`PageError::Full`] the
+    /// moment the two regions would touch. `xmax`/`undo_ref` are written
+    /// zero (reserved); `page_lsn` is NOT touched here — the access method
+    /// stamps it via [`PageMut::set_page_lsn`] as part of the logged write.
+    pub fn append_cell(&mut self, xmin: u64, payload: &[u8]) -> Result<u16, PageError> {
+        let cell_len = CELL_FIXED + payload.len();
+        if cell_len > u16::MAX as usize {
+            return Err(PageError::CellTooLarge);
+        }
+        let slot = self.slot_count();
+        let slot_array_end = SLOTS_BASE + 2 * slot;
+        let new_free = match self.free_offset().checked_sub(cell_len) {
+            Some(f) if f >= slot_array_end => f,
+            _ => return Err(PageError::Full),
+        };
+        wr_u16(self.buf, new_free, cell_len as u16);
+        wr_u64(self.buf, new_free + 2, xmin);
+        wr_u64(self.buf, new_free + 10, 0); // xmax reserved
+        wr_u64(self.buf, new_free + 18, 0); // undo_ref reserved
+        self.buf[new_free + CELL_FIXED..new_free + cell_len].copy_from_slice(payload);
+        wr_u16(self.buf, slot_array_end, new_free as u16);
+        wr_u16(self.buf, 4, (slot + 1) as u16);
+        wr_u16(self.buf, 6, new_free as u16);
+        Ok(slot as u16)
+    }
+
+    pub fn page_lsn(&self) -> u64 {
+        rd_u64(self.buf, 8)
+    }
+
+    pub fn set_page_lsn(&mut self, lsn: u64) {
+        wr_u64(self.buf, 8, lsn);
+    }
+
+    pub fn free_bytes(&self) -> usize {
+        self.free_offset() - (SLOTS_BASE + 2 * self.slot_count())
+    }
+
+    /// The read-only twin over the same image.
+    pub fn view(&self) -> Result<PageView<'_>, PageError> {
+        PageView::parse(self.buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole layout, pinned byte-for-byte at the only version that will
+    /// ever read these images: all 32 header bytes, the slot array, and both
+    /// cells in full — plus the untouched regions staying zero.
+    #[test]
+    fn layout_golden_literals() {
+        let mut img = [0u8; PAGE_SIZE];
+        {
+            let mut p = PageMut::init(&mut img);
+            assert_eq!(p.append_cell(7, b"ab").unwrap(), 0);
+            assert_eq!(p.append_cell(9, b"cd").unwrap(), 1);
+            p.set_page_lsn(0x0102_0304_0506_0708);
+        }
+
+        // Cell 1 (first appended): len 28 = 26 + 2, at 8192-28 = 8164
+        // (0x1FFC). Cell 2: same size, at 8136 (0x1FC8).
+        assert_eq!(8164, PAGE_SIZE - 28);
+        assert_eq!(8136, PAGE_SIZE - 56);
+        // Header: version 1, kind heap, slot_count 2, free_offset 8136,
+        // page_lsn as set, reserved zero.
+        assert_eq!(
+            &img[..HEADER_LEN],
+            &[
+                0x01, 0x00, // version 1
+                0x01, 0x00, // kind heap
+                0x02, 0x00, // slot_count 2
+                0xC8, 0x1F, // free_offset 8136
+                0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // page_lsn LE
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+            ][..]
+        );
+        // Slot array: slot 0 → 8164 = 0x1FE4, slot 1 → 8136 = 0x1FC8, LE.
+        assert_eq!(&img[SLOTS_BASE..SLOTS_BASE + 4], &[0xE4, 0x1F, 0xC8, 0x1F]);
+        // Cell 0 whole: [len 28][xmin 7][xmax 0][undo 0]["ab"].
+        assert_eq!(
+            &img[8164..8192],
+            &[
+                0x1C, 0x00, // len 28
+                0x07, 0, 0, 0, 0, 0, 0, 0, // xmin 7
+                0, 0, 0, 0, 0, 0, 0, 0, // xmax reserved
+                0, 0, 0, 0, 0, 0, 0, 0, // undo_ref reserved
+                b'a', b'b',
+            ][..]
+        );
+        // Cell 1 whole: [len 28][xmin 9][xmax 0][undo 0]["cd"].
+        assert_eq!(
+            &img[8136..8164],
+            &[
+                0x1C, 0x00, //
+                0x09, 0, 0, 0, 0, 0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0, 0, //
+                b'c', b'd',
+            ][..]
+        );
+        // The gap between slot array end (36) and cell 1 (8136) is untouched.
+        assert!(img[36..8136].iter().all(|&b| b == 0));
+    }
+
+    /// Init → append → parse → read back, and the accessors agree with the
+    /// writer's accounting.
+    #[test]
+    fn roundtrip_readback() {
+        let mut img = [0u8; PAGE_SIZE];
+        let free_after_append;
+        let lsn = 0xA5A5_A5A5;
+        {
+            let mut p = PageMut::init(&mut img);
+            let slots: Vec<u16> = (0..100u64)
+                .map(|i| {
+                    p.append_cell(1_000 + i, &vec![b'x'; (i % 40) as usize])
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(slots.len(), 100);
+            free_after_append = p.free_bytes();
+            p.set_page_lsn(lsn);
+        } // the mutable borrow ends here; the image is read back below
+
+        let v = PageView::parse(&img).unwrap();
+        assert_eq!(v.slot_count(), 100);
+        assert_eq!(v.page_lsn(), lsn);
+        assert_eq!(v.free_bytes(), free_after_append);
+        for (i, cell) in v.iter().enumerate() {
+            assert_eq!(cell.xmin, 1_000 + i as u64);
+            assert_eq!(cell.xmax, 0, "reserved");
+            assert_eq!(cell.undo_ref, 0, "reserved");
+            assert_eq!(cell.payload, vec![b'x'; i % 40]);
+        }
+    }
+
+    /// Zero-payload fills until the two growth regions touch, at an exact
+    /// count: cells of 26 bytes down from 8192, slots of 2 bytes up from 32
+    /// admit 291 cells, leaving free_bytes == 12 — and the 292nd append is
+    /// refused, not truncated.
+    #[test]
+    fn full_boundary_is_exact() {
+        let mut img = [0u8; PAGE_SIZE];
+        let mut p = PageMut::init(&mut img);
+        let mut n = 0;
+        while p.append_cell(1, &[]).is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 291);
+        assert_eq!(p.free_bytes(), 12);
+        assert!(matches!(
+            p.append_cell(1, &[]),
+            Err(PageError::Full)
+        ));
+        // The refused append left the page consistent.
+        assert_eq!(p.view().unwrap().slot_count(), 291);
+    }
+
+    /// A payload that cannot fit the u16 length field is refused up front.
+    #[test]
+    fn oversized_cell_refused() {
+        let mut img = [0u8; PAGE_SIZE];
+        let mut p = PageMut::init(&mut img);
+        let huge = vec![0u8; u16::MAX as usize]; // > u16::MAX - 26
+        assert!(matches!(
+            p.append_cell(1, &huge),
+            Err(PageError::CellTooLarge)
+        ));
+    }
+
+    /// Every corruption class the parser promises to catch, one test each on
+    /// a hand-mangled image.
+    #[test]
+    fn malformed_images_are_refused() {
+        let mut img = [0u8; PAGE_SIZE];
+        {
+            let mut p = PageMut::init(&mut img);
+            p.append_cell(5, b"row").unwrap();
+        }
+
+        // Uninitialized: a zeroed page.
+        assert!(matches!(
+            PageView::parse(&[0u8; PAGE_SIZE]),
+            Err(PageError::Uninitialized)
+        ));
+
+        // Wrong version.
+        let mut bad = img;
+        bad[0] = 2;
+        assert!(matches!(PageView::parse(&bad), Err(PageError::WrongVersion(2))));
+
+        // Wrong kind.
+        let mut bad = img;
+        bad[2] = 7;
+        assert!(matches!(PageView::parse(&bad), Err(PageError::WrongKind(7))));
+
+        // Slot count overflows the slot area.
+        let mut bad = img;
+        bad[4] = 0x88; // 0x8811 > MAX_SLOTS (4080) — hand-picked LE pair
+        bad[5] = 0x11;
+        assert!(matches!(PageView::parse(&bad), Err(PageError::Malformed(_))));
+
+        // Free offset pulled below the slot array's end (overlap).
+        let mut bad = img;
+        bad[6] = 0;
+        bad[7] = 0;
+        assert!(matches!(PageView::parse(&bad), Err(PageError::Malformed(_))));
+
+        // Slot pointer moved out of the cell region (into the header area).
+        let mut bad = img;
+        bad[SLOTS_BASE] = 0;
+        bad[SLOTS_BASE + 1] = 0; // slot 0 → offset 0
+        assert!(matches!(PageView::parse(&bad), Err(PageError::Malformed(_))));
+
+        // Cell length shrunk below the fixed part.
+        let mut bad = img;
+        bad[PAGE_SIZE - 29] = 3; // len 3 < 26
+        bad[PAGE_SIZE - 28] = 0;
+        assert!(matches!(PageView::parse(&bad), Err(PageError::Malformed(_))));
+
+        // Cell length extended past the page tail.
+        let mut bad = img;
+        bad[PAGE_SIZE - 29] = 0xFF; // len 0x0FFF… past the tail
+        bad[PAGE_SIZE - 28] = 0x0F;
+        assert!(matches!(PageView::parse(&bad), Err(PageError::Malformed(_))));
+    }
+
+    /// `wrap` admits a good image and refuses a bad one — the mutation path
+    /// never bypasses the read path's rules.
+    #[test]
+    fn wrap_validates_like_parse() {
+        let mut good = [0u8; PAGE_SIZE];
+        PageMut::init(&mut good);
+        assert!(PageMut::wrap(&mut good).is_ok());
+
+        let mut bad = [0u8; PAGE_SIZE];
+        bad[0] = 1; // a real version, so we get past the initialization check
+        bad[2] = 9; // wrong kind
+        assert!(matches!(PageMut::wrap(&mut bad), Err(PageError::WrongKind(9))));
+    }
+}
