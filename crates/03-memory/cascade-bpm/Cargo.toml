@@ -10,9 +10,9 @@ description = "Userspace Buffer Pool Manager. Pillar §3.5. Per-database page ac
 
 [dependencies]
 cascade-types     = { workspace = true }
-cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-storage   = { workspace = true }
+libc              = { workspace = true }
 
 [dev-dependencies]
 futures-lite      = { workspace = true }

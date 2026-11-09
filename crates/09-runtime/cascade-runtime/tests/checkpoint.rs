@@ -82,8 +82,8 @@ fn reactor_named(name: &str) -> glommio::LocalExecutor {
 ///
 /// | pass | dirty at start                | outcome                       | frontier |
 /// |------|-------------------------------|-------------------------------|----------|
-/// | 1    | p1@l1 p2@l2 p3@l3 (p3 pinned) | 2 flushed, 1 refused          | min = l1 |
-/// | 2    | p3 (guard dropped)            | 1 flushed                     | advances to l3 |
+/// | 1    | p1@l1 p2@l2 p3@l3             | 3 flushed                     | min = l1 |
+/// | 2    | p3 re-stamped UNDER its pin   | 1 flushed while pinned (T6.2) | advances to l3 |
 /// | 3    | nothing                       | no-op                         | stays l3 |
 /// | 4    | p4@l4, durable < l4           | parks on the gate (T3.2 rerun) until the WAL flush publishes | l4 |
 #[test]
@@ -103,10 +103,18 @@ fn flush_pass_flushes_gated_pages_and_advances_the_frontier() {
         })
         .expect("store mounts");
         let store = manager.local_worker(0);
-        // Rc so the parked-pass task below can own them ('static —
-        // spawn_local takes no borrows); the reactor-locality invariant is
-        // unchanged (Rc never crosses a thread).
-        let bpm = Rc::new(Bpm::new(store, BpmConfig { max_frames: 8 }, PerDbAccounting::default()));
+        // The pool is the §8.1 shared case (Arc — T6.2): it holds no store,
+        // every call passes this reactor's own. Rc stays for the
+        // parked-pass task's trunc ('static — spawn_local takes no
+        // borrows; Rc never crosses a thread).
+        let bpm = Bpm::arced(
+            BpmConfig {
+                max_frames: 8,
+                cores_on_numa: 1,
+                numa: None,
+            },
+            PerDbAccounting::default(),
+        );
         let trunc = Rc::new(trunc);
         bpm.set_gate(wal_gate(&writer));
 
@@ -125,42 +133,57 @@ fn flush_pass_flushes_gated_pages_and_advances_the_frontier() {
             .expect("wal handle opens");
         writer.flush_wal(&handle, l3).await.expect("flush to l3");
 
-        // Three stamped dirty pages; p3 pinned.
+        // Three stamped dirty pages.
         for (page_no, lsn) in [(1u32, l1), (2, l2), (3, l3)] {
-            let mut g = bpm.page(page(db, page_no)).await.expect("page loads");
+            let mut g = bpm
+                .page_exclusive(&store, page(db, page_no))
+                .await
+                .expect("page loads");
             g.write_logged(lsn, |buf| buf[0] = 0xAA);
         }
-        let pinned = bpm.page(page(db, 3)).await.expect("p3 pins");
 
-        // Pass 1: two flushes, one refusal — and the floor still includes
-        // the refused page's stamp (its state lives only in the log).
-        let report = checkpointer::flush_pass(&bpm, db, &trunc)
+        // Pass 1: everything flushes — the floor is the minimum
+        // dirty-at-start stamp.
+        let report = checkpointer::flush_pass(&bpm, &store, db, &trunc)
             .await
             .expect("pass 1");
         assert_eq!(
             (report.scanned, report.flushed, report.refused),
-            (3, 2, 1),
-            "pinned page is skipped, not forced"
+            (3, 3, 0),
+            "all dirty pages written back"
         );
         assert_eq!(trunc.get(), l1, "frontier = min dirty-at-start stamp");
         assert_eq!(bpm.is_dirty(&page(db, 1)), Some(false), "p1 written back");
         assert_eq!(bpm.is_dirty(&page(db, 2)), Some(false), "p2 written back");
-        assert_eq!(
-            bpm.is_dirty(&page(db, 3)),
-            Some(true),
-            "pinned p3 stays dirty"
-        );
+        assert_eq!(bpm.is_dirty(&page(db, 3)), Some(false), "p3 written back");
 
-        // Pass 2: p3's guard dropped, its flush lifts the frontier further.
-        drop(pinned);
-        let report = checkpointer::flush_pass(&bpm, db, &trunc)
+        // Pass 2 — the T6.2 behavior change, pinned here: a PINNED page
+        // still flushes (coherent snapshot + write ticket make it safe);
+        // refusal is eviction's story now. Re-stamp p3 under its pin and
+        // watch the pass write it back while the guard is alive.
+        let mut pinned = bpm
+            .page_exclusive(&store, page(db, 3))
+            .await
+            .expect("p3 pins");
+        pinned.write_logged(l3, |buf| buf[0] = 0xAA);
+        let report = checkpointer::flush_pass(&bpm, &store, db, &trunc)
             .await
             .expect("pass 2");
-        assert_eq!((report.scanned, report.flushed, report.refused), (1, 1, 0));
-        assert_eq!(trunc.get(), l3, "frontier advances monotonically");
+        assert_eq!(
+            (report.scanned, report.flushed, report.refused),
+            (1, 1, 0),
+            "the pinned page flushes"
+        );
+        assert_eq!(trunc.get(), l3, "frontier advances to the pinned page's stamp");
+        assert_eq!(
+            bpm.is_dirty(&page(db, 3)),
+            Some(false),
+            "written back while pinned"
+        );
+        drop(pinned);
 
         // Pass 3: nothing dirty — the frontier does not move.
-        let report = checkpointer::flush_pass(&bpm, db, &trunc)
+        let report = checkpointer::flush_pass(&bpm, &store, db, &trunc)
             .await
             .expect("pass 3");
         assert_eq!(report.scanned, 0);
@@ -174,17 +197,21 @@ fn flush_pass_flushes_gated_pages_and_advances_the_frontier() {
         let l4 = r4.end();
         let _ = r4.fill();
         {
-            let mut g = bpm.page(page(db, 4)).await.expect("p4 loads");
+            let mut g = bpm
+                .page_exclusive(&store, page(db, 4))
+                .await
+                .expect("p4 loads");
             g.write_logged(l4, |buf| buf[0] = 0xBB);
         }
         assert!(writer.durable() < l4, "p4's stamp is undurable");
         let done = Rc::new(Cell::new(false));
         let flag = Rc::clone(&done);
         let passer = glommio::spawn_local({
-            let bpm = Rc::clone(&bpm);
+            let bpm = bpm.clone();
             let trunc = Rc::clone(&trunc);
+            let passer_store = manager.local_worker(0);
             async move {
-                checkpointer::flush_pass(&bpm, db, &trunc)
+                checkpointer::flush_pass(&bpm, &passer_store, db, &trunc)
                     .await
                     .expect("pass 4");
                 flag.set(true);
@@ -248,7 +275,14 @@ fn fanout_reaches_the_worker_and_the_housekeeper_touches_no_storage_io() {
                 })
                 .expect("store mounts");
                 let store = manager.local_worker(0);
-                let bpm = Bpm::new(store, BpmConfig { max_frames: 8 }, PerDbAccounting::default());
+                let bpm = Bpm::arced(
+                    BpmConfig {
+                        max_frames: 8,
+                        cores_on_numa: 1,
+                        numa: None,
+                    },
+                    PerDbAccounting::default(),
+                );
                 bpm.set_gate(wal_gate(&worker_writer));
 
                 // Four stamped dirty pages; durability stays at 0, so any
@@ -261,7 +295,7 @@ fn fanout_reaches_the_worker_and_the_housekeeper_touches_no_storage_io() {
                     let l = r.end();
                     let _ = r.fill();
                     let mut g = bpm
-                        .page(page(db, xid as u32))
+                        .page_exclusive(&store, page(db, xid as u32))
                         .await
                         .expect("page loads");
                     g.write_logged(l, |buf| buf[0] = 0xCC);
@@ -278,7 +312,7 @@ fn fanout_reaches_the_worker_and_the_housekeeper_touches_no_storage_io() {
                 while let Some(msg) = rx.recv().await {
                     match msg {
                         ControlMsg::FlushPass => {
-                            let report = checkpointer::flush_pass(&bpm, db, &trunc)
+                            let report = checkpointer::flush_pass(&bpm, &store, db, &trunc)
                                 .await
                                 .expect("in-pool pass");
                             flushed_total += report.flushed;

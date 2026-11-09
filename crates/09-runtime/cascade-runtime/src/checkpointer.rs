@@ -98,14 +98,17 @@ pub struct FlushReport {
 /// One in-pool flush pass (FR-31's worker half): iterate this pool's dirty
 /// pages for `db`, write each back through the T3.2 gate, advance the
 /// frontier per the conservative redo rule. Runs on the pool's designated
-/// reactor — the BPM is reactor-local (`!Send`), which is the invariant
-/// that makes "in-pool" structural rather than aspirational.
+/// reactor with THAT reactor's own store passed per call — the BPM is
+/// `Send + Sync` (shared across the NUMA's cores, T6.2) but owns no store;
+/// the per-call `&impl PageStore` is what keeps "in-pool" structural
+/// rather than aspirational.
 ///
 /// A page stamped beyond the writer's durable watermark parks the pass on
 /// the gate until durability catches up — the same wait a committing
 /// session takes, and the same back-pressure T3.2's single-page flush has.
 pub async fn flush_pass<S: PageStore>(
-    bpm: &Bpm<S>,
+    bpm: &Bpm,
+    store: &S,
     db: DatabaseId,
     trunc: &TruncatableLsn,
 ) -> Result<FlushReport, BpmError> {
@@ -116,8 +119,10 @@ pub async fn flush_pass<S: PageStore>(
         .collect();
     let scanned = dirty.len();
     // Conservative redo floor: minimum stamp over ALL dirty-at-start
-    // pages — a refused (pinned) page's stamp still constrains, because
+    // pages — a not-yet-flushed page's stamp still constrains, because
     // its accumulated state lives only in the log until it flushes.
+    // (T6.5 replaces this rule with the drained-pass rule + in-flight
+    // registry — FR-48/49.)
     let mut floor: Option<Lsn> = None;
     let mut flushed = 0;
     let mut refused = 0;
@@ -131,7 +136,7 @@ pub async fn flush_pass<S: PageStore>(
                 None => l,
             });
         }
-        if bpm.flush_page(page).await? {
+        if bpm.flush_page(store, page).await? {
             flushed += 1;
         } else {
             refused += 1;

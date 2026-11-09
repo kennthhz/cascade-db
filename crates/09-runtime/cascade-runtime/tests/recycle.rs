@@ -181,15 +181,18 @@ fn engine_recycle_protects_a_concurrent_checkpoint() {
         })
         .expect("store mounts");
         let store = manager.local_worker(0);
-        // Rc so the parked-pass task can own them (spawn_local is
-        // 'static); reactor-locality is unchanged (Rc never crosses).
-        let bpm = std::rc::Rc::new(Bpm::new(
-            store,
-            BpmConfig { max_frames: 8 },
+        // The pool is the §8.1 shared case (Arc — T6.2): it holds no
+        // store, every call passes this reactor's own. Rc stays for the
+        // parked-pass task's trunc (spawn_local is 'static; Rc never
+        // crosses a thread).
+        let bpm = Bpm::arced(
+            BpmConfig {
+                max_frames: 8,
+                cores_on_numa: 1,
+                numa: None,
+            },
             PerDbAccounting::default(),
-        ));
-        // Rc so the parked-pass task can own it (spawn_local is 'static);
-        // reactor-locality is unchanged — it never crosses a thread.
+        );
         let trunc = std::rc::Rc::new(TruncatableLsn::new());
         bpm.set_gate(wal_gate(&writer));
 
@@ -208,30 +211,40 @@ fn engine_recycle_protects_a_concurrent_checkpoint() {
         writer.flush_wal(&handle, l3).await.expect("flush to l3");
 
         // Checkpoint passes (the real T4.2 path) walk the frontier to l3:
-        // p3 pinned through pass 1 (frontier floor = l1), unpinned for
-        // pass 2 (floor = l3).
+        // pass 1 flushes all three (the floor is the min stamp, l1); the
+        // re-stamped pass 2 lifts it to l3.
         for (page_no, lsn) in [(1u32, l1), (2, l2), (3, l3)] {
-            let mut g = bpm.page(page(db, page_no)).await.expect("page loads");
+            let mut g = bpm
+                .page_exclusive(&store, page(db, page_no))
+                .await
+                .expect("page loads");
             g.write_logged(lsn, |buf| buf[0] = 0xAA);
         }
-        let pinned = bpm.page(page(db, 3)).await.expect("p3 pins");
-        let report = checkpointer::flush_pass(&bpm, db, &trunc)
+        let report = checkpointer::flush_pass(&bpm, &store, db, &trunc)
             .await
             .expect("pass 1");
-        assert_eq!((report.flushed, report.refused), (2, 1));
+        assert_eq!((report.flushed, report.refused), (3, 0));
         assert_eq!(trunc.get(), l1);
-        drop(pinned);
-        checkpointer::flush_pass(&bpm, db, &trunc)
+        let mut pinned = bpm
+            .page_exclusive(&store, page(db, 3))
+            .await
+            .expect("p3 pins");
+        pinned.write_logged(l3, |buf| buf[0] = 0xAA);
+        checkpointer::flush_pass(&bpm, &store, db, &trunc)
             .await
             .expect("pass 2");
         assert_eq!(trunc.get(), l3, "the checkpointer owns the frontier");
+        drop(pinned);
 
         // The concurrent checkpoint: p4 stamped l4, dirty, undurable.
         let r4 = writer.append_wal(&WalRecord::BeginTxn { xid: 4 });
         let l4 = r4.end();
         let _ = r4.fill();
         {
-            let mut g = bpm.page(page(db, 4)).await.expect("p4 loads");
+            let mut g = bpm
+                .page_exclusive(&store, page(db, 4))
+                .await
+                .expect("p4 loads");
             g.write_logged(l4, |buf| buf[0] = 0xBB);
         }
         assert!(writer.durable() < l4, "a checkpoint is genuinely in flight");
@@ -265,10 +278,11 @@ fn engine_recycle_protects_a_concurrent_checkpoint() {
         let done = std::rc::Rc::new(std::cell::Cell::new(false));
         let flag = std::rc::Rc::clone(&done);
         let passer = glommio::spawn_local({
-            let bpm = std::rc::Rc::clone(&bpm);
+            let bpm = bpm.clone();
             let trunc = std::rc::Rc::clone(&trunc);
+            let passer_store = manager.local_worker(0);
             async move {
-                checkpointer::flush_pass(&bpm, db, &trunc)
+                checkpointer::flush_pass(&bpm, &passer_store, db, &trunc)
                     .await
                     .expect("pass 3");
                 flag.set(true);

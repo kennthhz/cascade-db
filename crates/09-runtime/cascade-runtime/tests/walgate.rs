@@ -40,7 +40,7 @@ fn gate_resolves_only_when_the_writer_publishes_durability() {
         let flag = Rc::clone(&parked);
         // Detached on purpose: the flag below is polled, not awaited.
         let _waiter = {
-            let gate = Rc::clone(&gate);
+            let gate = Arc::clone(&gate);
             glommio::spawn_local(async move {
                 gate.wait_durable(end).await.expect("gate resolves");
                 flag.set(true);

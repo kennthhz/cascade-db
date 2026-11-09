@@ -8,17 +8,19 @@
 //! semantics (blocking, refusal, re-modified stamps) in cascade-bpm's
 //! tests against fakes, watermark semantics in cascade-wal's tests against
 //! the real writer. This adapter adds only the error mapping and the
-//! `Arc`→`Rc` handoff for the (reactor-bound) pool side; the smoke test
-//! in `tests/walgate.rs` proves the composition resolves.
+//! `Arc<dyn WalDurability>` handoff (the gate became `Send + Sync` with
+//! the cross-core pool, T6.2 — pools ride `Arc` now); the smoke test in
+//! `tests/walgate.rs` proves the composition resolves.
 
-use std::{future::Future, pin::Pin, rc::Rc, sync::Arc};
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use cascade_bpm::{BpmError, WalDurability};
 use cascade_types::Lsn;
 use cascade_wal::WalWriter;
 
-/// The gate a pool's BPM holds: the DB's shared writer behind an `Rc`
-/// (pool side is reactor-bound; the writer itself is `Arc`-shared).
+/// The gate a pool's BPM holds: the DB's shared writer behind an `Arc`
+/// (pool side shares it across reactors; the writer itself is
+/// `Arc`-shared).
 pub struct WalGate(Arc<WalWriter>);
 
 impl WalDurability for WalGate {
@@ -42,6 +44,6 @@ impl WalDurability for WalGate {
 }
 
 /// The gate for a DB's writer, ready for `Bpm::set_gate`.
-pub fn wal_gate(writer: &Arc<WalWriter>) -> Rc<dyn WalDurability> {
-    Rc::new(WalGate(Arc::clone(writer)))
+pub fn wal_gate(writer: &Arc<WalWriter>) -> Arc<dyn WalDurability> {
+    Arc::new(WalGate(Arc::clone(writer)))
 }
