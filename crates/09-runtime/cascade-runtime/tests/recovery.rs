@@ -326,3 +326,43 @@ fn boot_replays_then_restarts_preserve_everything() {
     drop(fx.rt);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A CRC-valid record whose declared LSN contradicts its position — the
+/// transplant shape the v2 self-describing header exists to catch —
+/// refuses boot with the NAMED error. Flattening it into the CRC-failure
+/// bucket would tell the operator "corrupt history" about bytes whose CRC
+/// verifies fine, sending them chasing bit rot instead of a hand-edit or
+/// copy-paste bug.
+#[test]
+fn transplanted_record_refuses_boot_by_name() {
+    let dir = temp_wal_dir();
+    write_txn(&dir, 1, "a");
+
+    // Append a perfectly valid record that declares a foreign LSN.
+    let bytes = cascade_wal::format::encode(
+        &WalRecord::CommitTxn {
+            xid: 9,
+            commit_ts: cascade_types::Hlc(9),
+        },
+        Lsn(0x9999),
+        0,
+    );
+    let path = dir.join(format!("db_{}.log", db().0));
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("log opens");
+    f.write_all(&bytes).expect("transplant planted");
+    f.sync_all().expect("planted");
+
+    let start =
+        cascade_wal::log_len(&dir, db()).expect("log length") - bytes.len() as u64;
+    match recovery::prepare(&dir, db()) {
+        Err(RecoveryError::LsnMismatch { at, declared }) => {
+            assert_eq!(at, Lsn(start), "named at the transplant's position");
+            assert_eq!(declared, Lsn(0x9999), "the foreign declaration surfaces");
+        }
+        other => panic!("expected named LsnMismatch, got {other:?}"),
+    }
+}

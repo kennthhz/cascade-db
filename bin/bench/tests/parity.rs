@@ -238,3 +238,49 @@ fn wire_and_wal_parity_between_architectures() {
     assert!(cascade_shapes.contains(&"insert:(3,three)".to_owned()));
     assert!(!cascade_shapes.iter().any(|s| s.contains("five")));
 }
+
+/// The pgmodel's forked backends share one WAL fd, so concurrent clients
+/// interleave commits in one log. v2 records are self-describing — each
+/// declares its LSN, and the reader refuses one read at the wrong
+/// position (`LsnMismatch`) even when every CRC holds — so this walk is
+/// the discriminator for the reservation serialization in `wal_commit`
+/// (the WALInsertLock analog): before the lock, two backends could lseek
+/// the same EOF and the loser's blob landed somewhere other than where it
+/// declared.
+#[test]
+fn concurrent_backends_keep_the_log_self_describing() {
+    let wal_dir = temp_wal_dir("pgmodel-concurrent");
+    let pg = spawn_pgmodel(&wal_dir);
+
+    const CLIENTS: usize = 4;
+    const COMMITS_PER_CLIENT: usize = 40;
+    let mut threads = Vec::new();
+    for t in 0..CLIENTS {
+        let addr = pg.addr.clone();
+        threads.push(std::thread::spawn(move || {
+            let mut c = Client::connect(&addr).expect("client connects");
+            for i in 0..COMMITS_PER_CLIENT {
+                let id = (t * 1000 + i) as i32;
+                let sql = format!("INSERT INTO debug_table VALUES ({id}, 'c{t}-{i}')");
+                c.query(&sql).expect("query round trip");
+            }
+        }));
+    }
+    for t in threads {
+        t.join().expect("client thread joins");
+    }
+    drop(pg); // the child must not outlive the walk into a temp dir
+
+    // The walk IS the assertion: wal_shapes refuses on any read error,
+    // and every record must decode at its declared position. Each bare
+    // INSERT autocommits, so the log holds exactly three shapes per
+    // commit — begin, insert, commit — with none lost or duplicated.
+    let shapes = wal_shapes(&wal_dir);
+    assert_eq!(
+        shapes.len(),
+        CLIENTS * COMMITS_PER_CLIENT * 3,
+        "every autocommit lands exactly begin + insert + commit"
+    );
+    assert!(shapes.contains(&"insert:(0,c0-0)".to_owned()));
+    assert!(shapes.contains(&"insert:(3012,c3-12)".to_owned()));
+}

@@ -78,6 +78,23 @@ pub enum RecoveryError {
     /// durability nobody can vouch for.
     #[error("wal record at {lsn:?} failed its CRC mid-stream — refusing boot over corrupt history")]
     Corrupt { lsn: Lsn },
+    /// A record whose bytes are internally consistent but whose placement
+    /// contradicts the log: the header declares an LSN other than the
+    /// position it was read from — a transplant. The CRC may still hold,
+    /// so this is named on its own: "CRC failed" would send the operator
+    /// chasing bit rot instead of a hand-edit or copy-paste bug (the
+    /// loud-refusal family, WP1 F3 / wal invariant 7).
+    #[error("wal record at {at:?} declares LSN {declared:?} — transplanted bytes, refusing boot")]
+    LsnMismatch { at: Lsn, declared: Lsn },
+    /// The log carries a record type byte this build cannot decode —
+    /// written by a newer producer ("extend, never renumber" means old
+    /// builds refuse loudly). Same refuse posture as a CRC failure,
+    /// named so the operator sees producer/decoder version skew, not
+    /// hardware failure.
+    #[error(
+        "wal record at {lsn:?} has unknown record type {type_byte} — refusing boot (newer producer?)"
+    )]
+    UnknownRecordType { lsn: Lsn, type_byte: u8 },
     /// The log carries a record version this build cannot decode — newer
     /// or bit-flipped format. Same refuse posture as a CRC failure.
     #[error("wal record version {version} is unknown to this build — refusing boot")]
@@ -187,11 +204,15 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
 fn wal_err(e: WalError, at: Lsn) -> RecoveryError {
     match e {
         WalError::Corruption(lsn) => RecoveryError::Corrupt { lsn },
-        // A transplant and an unknown producer's record are both
-        // refuse-boot integrity failures — recovery never serves over
-        // bytes it cannot fully explain.
-        WalError::LsnMismatch { at, .. } => RecoveryError::Corrupt { lsn: at },
-        WalError::UnknownRecordType { at, .. } => RecoveryError::Corrupt { lsn: at },
+        // Named refusals stay named through the boot boundary — a
+        // transplant and an unknown producer's record are integrity
+        // failures recovery must refuse over, but their causes are not
+        // CRC failures and must not read as one.
+        WalError::LsnMismatch { at, declared } => RecoveryError::LsnMismatch { at, declared },
+        WalError::UnknownRecordType { at, type_byte } => RecoveryError::UnknownRecordType {
+            lsn: at,
+            type_byte,
+        },
         WalError::UnknownRecordVersion(v) => RecoveryError::UnknownVersion { version: v },
         WalError::Io(io) => RecoveryError::Io(io),
         // The walk handles torn tails itself; this arm is unreachable but

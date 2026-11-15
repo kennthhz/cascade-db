@@ -177,6 +177,40 @@ fn panic_between_reserve_and_fill_tears_the_log() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The size gate fires BEFORE the LSN reserve: a record that cannot
+/// encode (a legacy value past the u16 ceiling — reachable from a
+/// legitimate client, the protocol allows 1 MiB messages) must refuse
+/// without consuming LSN space, because a reserved-but-unfillable gap
+/// wedges the writer's filled watermark — and therefore every future
+/// commit on the DB — permanently. The writer stays healthy after the
+/// refusal.
+#[test]
+fn oversized_value_refuses_before_consuming_lsn_space() {
+    let dir = temp_dir();
+    let w = WalWriter::new();
+    reactor().run(async {
+        let _h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let before = w.reserved().0;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = w.append_wal(&insert(1, 1, &"x".repeat(u16::MAX as usize + 1)));
+        }));
+        assert!(outcome.is_err(), "the oversized value must refuse loudly");
+        assert_eq!(
+            w.reserved().0,
+            before,
+            "the refusal must not consume LSN space — a gap here wedges the log forever"
+        );
+        assert_eq!(w.filled().0, before);
+        assert_eq!(w.durable().0, before);
+
+        // The writer is unharmed: normal records still reserve, fill,
+        // and flush past the refused position.
+        let b1 = fill(&insert(2, 2, "ok"), &w);
+        assert_eq!(w.filled(), b1);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// FR-26: concurrent flushers elect one leader; the group is written
 /// exactly once (total bytes on the wire == total record bytes, no
 /// duplicated batches), and every caller sees the durable LSN cover it.

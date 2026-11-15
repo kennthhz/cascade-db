@@ -45,7 +45,8 @@ pub const TYPE_ABORT: u8 = 3;
 pub const TYPE_LEGACY_INSERT: u8 = 4;
 /// §6 HEAP_INSERT (`[segment u32][cell bytes verbatim as cascade-page lays
 /// them down]`) — the type byte is reserved here; its variant and payload
-/// land with the heap redo producer (T1.3).
+/// land with the heap redo producer (T1.3). Until then a decoder meeting
+/// byte 5 refuses it as *unknown* (version skew), never as corruption.
 pub const TYPE_HEAP_INSERT: u8 = 5;
 /// §7 idle-scope advance — payload `closed_ts` u64. Reserved: nothing
 /// emits it yet.
@@ -58,9 +59,26 @@ pub const TYPE_BULK_LOAD: u8 = 8;
 /// §17 non-logged path — payload shape lands with that feature. Reserved.
 pub const TYPE_UNLOGGED_MARKER: u8 = 9;
 
+/// The legacy insert's payload length, validating the u16 value-length
+/// field's ceiling. The one size gate both sides call: the writer, before
+/// it reserves an LSN (a record that cannot encode must refuse *before*
+/// consuming LSN space — a reserved-but-unfillable gap wedges the log
+/// forever), and the encoder, before it builds bytes.
+fn legacy_payload_len(val: &str) -> usize {
+    assert!(
+        val.len() <= u16::MAX as usize,
+        "row value of {} bytes exceeds the legacy WAL payload limit ({}); \
+         the heap redo record lifts this",
+        val.len(),
+        u16::MAX
+    );
+    4 + 4 + 2 + val.len()
+}
+
 /// A record's encoded length — the pure, header-only arithmetic the writer
 /// needs *before* it reserves an LSN ([`encode`] then stamps the real one;
-/// the length never depends on the LSN).
+/// the length never depends on the LSN). Size validation happens here, so
+/// `append_wal` refuses an unencodable record before its `fetch_add`.
 pub(crate) fn encoded_len(rec: &WalRecord) -> usize {
     HEADER_LEN
         + CRC_LEN
@@ -72,7 +90,7 @@ pub(crate) fn encoded_len(rec: &WalRecord) -> usize {
             WalRecord::CommitTxn { .. }
             | WalRecord::ClosedTsHeartbeat { .. }
             | WalRecord::HlcHighWater { .. } => 8,
-            WalRecord::LegacyInsert { val, .. } => 4 + 4 + 2 + val.len(),
+            WalRecord::LegacyInsert { val, .. } => legacy_payload_len(val),
         }
 }
 
@@ -91,18 +109,10 @@ pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
         }
         WalRecord::AbortTxn { .. } => (TYPE_ABORT, Vec::new()),
         WalRecord::LegacyInsert { table, id, val, .. } => {
-            // Full row image (I8): table segment + every column. The v1
-            // payload carries the value length as u16 — refuse oversized
-            // values loudly instead of letting the cast truncate them into
-            // a record that cannot decode.
-            assert!(
-                val.len() <= u16::MAX as usize,
-                "row value of {} bytes exceeds the legacy WAL payload limit ({}); \
-                 the heap redo record lifts this",
-                val.len(),
-                u16::MAX
-            );
-            let mut p = Vec::with_capacity(4 + 4 + 2 + val.len());
+            // Full row image (I8): table segment + every column. The u16
+            // value-length ceiling is validated by [`legacy_payload_len`]
+            // — the same gate the writer's reserve goes through.
+            let mut p = Vec::with_capacity(legacy_payload_len(val));
             p.extend_from_slice(&table.0.to_le_bytes());
             p.extend_from_slice(&id.to_le_bytes());
             p.extend_from_slice(&(val.len() as u16).to_le_bytes());
@@ -236,10 +246,24 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
     })
 }
 
-/// The type bytes this decoder knows (F3's table). A byte outside this set
-/// comes from a newer producer — refuse it loudly.
+/// The type bytes this decoder can actually decode. [`TYPE_HEAP_INSERT`]
+/// (5) is deliberately absent until its decode arm lands (T1.3): a byte
+/// this build cannot decode must refuse as
+/// [`DecodeError::UnknownRecordType`] — version skew, named — never as
+/// `Corruption`, which reads as bit rot and sends the operator chasing
+/// hardware.
 fn is_known_type(t: u8) -> bool {
-    (TYPE_BEGIN..=TYPE_UNLOGGED_MARKER).contains(&t)
+    matches!(
+        t,
+        TYPE_BEGIN
+            | TYPE_COMMIT
+            | TYPE_ABORT
+            | TYPE_LEGACY_INSERT
+            | TYPE_CLOSED_TS_HEARTBEAT
+            | TYPE_HLC_HIGH_WATER
+            | TYPE_BULK_LOAD
+            | TYPE_UNLOGGED_MARKER
+    )
 }
 
 #[cfg(test)]
@@ -448,5 +472,32 @@ mod tests {
         ] {
             assert_eq!(encoded_len(&rec), encode(&rec, Lsn(0), 0).len());
         }
+    }
+
+    /// The u16 value-length ceiling refuses loudly at the encoder too
+    /// (tools call encode directly, without the writer's gate).
+    #[test]
+    #[should_panic(expected = "exceeds the legacy WAL payload limit")]
+    fn oversized_legacy_value_refuses_to_encode() {
+        let val = "x".repeat(u16::MAX as usize + 1);
+        let _ = encode(&legacy_insert(1, 2, &val), Lsn(0), 0);
+    }
+
+    /// The reserved-but-undecodable type byte refuses *by name*: a
+    /// CRC-valid record of a type this build cannot decode is version
+    /// skew, and lumping it into Corruption misreads it as bit rot
+    /// (invariant 7). TYPE_HEAP_INSERT is the pinned case — reserved in
+    /// this build, decodable only once T1.3's arm lands.
+    #[test]
+    fn reserved_type_5_refuses_by_name() {
+        let mut bytes = encode(&WalRecord::BeginTxn { xid: 1 }, Lsn(0), 0);
+        bytes[8] = TYPE_HEAP_INSERT;
+        let n = bytes.len();
+        let crc = crc32fast::hash(&bytes[..n - CRC_LEN]);
+        bytes[n - CRC_LEN..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode(&bytes),
+            Err(DecodeError::UnknownRecordType(TYPE_HEAP_INSERT))
+        ));
     }
 }

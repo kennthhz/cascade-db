@@ -13,8 +13,9 @@
 //! | dispatch       | postmaster → handoff | postmaster → fork       |
 //! | execution unit | pinned reactor task  | OS process              |
 //! | socket I/O     | io_uring, async      | blocking read/write     |
-//! | WAL commit     | shm watermarks + one | O_APPEND + fdatasync    |
-//! |                | CAS-elected leader   | per backend, per commit |
+//! | WAL commit     | shm watermarks + one | fcntl lock (WALInsert-  |
+//! |                | CAS-elected leader   | Lock analog) + O_APPEND |
+//! |                |                      | + fdatasync per backend |
 //!
 //! The last row is the honest asymmetry: cascade's group commit is cheap
 //! *because* it is one process with shared memory. Reproducing it here
@@ -318,20 +319,38 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
     static XID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     // Per-process xid base keeps records unique across backends without
     // shm coordination (the stripped-PG baseline; real PG uses shm counters).
-    let base = std::process::id() as u64 % 1000 * 1_000_000_000;
-    let xid = base + XID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let xid_base = std::process::id() as u64 % 1000 * 1_000_000_000;
+    let xid = xid_base + XID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let mut bytes = Vec::new();
-    // v2 records are self-describing (F3): each carries its own file LSN.
-    // O_APPEND lands at EOF, so seek-to-end *is* the blob's reservation —
-    // the stripped baseline composes and writes one txn as a unit and is
-    // driven one backend at a time; cascade's atomic reserve is the real
-    // answer to concurrent appends.
-    let base = unsafe { libc::lseek(wal_fd, 0, libc::SEEK_END) };
-    if base < 0 {
+    // v2 records are self-describing (F3): each carries its own file LSN,
+    // so reserving (seek-to-end) must be atomic with composing and writing
+    // the blob — two backends that lseek the same EOF would stamp LSNs the
+    // log never keeps, and the reader would refuse them as transplants.
+    // The whole-file record lock is this baseline's WALInsertLock (PG also
+    // holds its lock across reserve + record copy). It must be a POSIX
+    // fcntl lock, NOT flock: the backends inherit the postmaster's fd, and
+    // flock is keyed on the open file description the fork shares, so two
+    // holders of the same OFD would never block each other; fcntl locks
+    // are per-process and serialize the forked backends for real.
+    let whole_file = |l_type: libc::c_short| libc::flock {
+        l_type,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: 0,
+        l_len: 0, // to infinity: covers every byte we are about to append
+        l_pid: 0, // only F_GETLK reports it
+    };
+    if unsafe { libc::fcntl(wal_fd, libc::F_SETLKW, &whole_file(libc::F_WRLCK as libc::c_short)) }
+        < 0
+    {
+        return Err(("XX000".to_owned(), "wal lock failed".to_owned()));
+    }
+    let blob_base = unsafe { libc::lseek(wal_fd, 0, libc::SEEK_END) };
+    if blob_base < 0 {
+        unsafe { libc::fcntl(wal_fd, libc::F_SETLK, &whole_file(libc::F_UNLCK as libc::c_short)) };
         return Err(("XX000".to_owned(), "wal seek failed".to_owned()));
     }
-    let mut off = base as u64;
+    let mut off = blob_base as u64;
+    let mut bytes = Vec::new();
     let b = format::encode(
         &cascade_wal::WalRecord::BeginTxn { xid },
         cascade_types::Lsn(off),
@@ -366,7 +385,12 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
     bytes.extend_from_slice(&b);
 
     let mut file = unsafe { std::fs::File::from_raw_fd(wal_fd) };
-    let r = file.write_all(&bytes).and_then(|_| file.sync_data());
+    let write_r = file.write_all(&bytes);
+    // Release before the durability barrier — PG releases WALInsertLock
+    // before waiting for its group's flush; the barrier stays per-backend
+    // and each one's fdatasync covers every blob landed before it.
+    unsafe { libc::fcntl(wal_fd, libc::F_SETLK, &whole_file(libc::F_UNLCK as libc::c_short)) };
+    let r = write_r.and_then(|_| file.sync_data());
     std::mem::forget(file); // fd belongs to the backend, not this File
     r.map_err(|e| ("XX000".to_owned(), format!("wal write failed: {e}")))
 }
