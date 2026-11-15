@@ -8,6 +8,7 @@ Foundation crate. Defines shared value types referenced by multiple layers. Has 
 
 - **§6.4 (Disaggregated storage):** `PageId` is `(DatabaseId, SegmentId, PageNo)` — backend-agnostic. Never `(file_path, offset)`. This must remain true.
 - **§6.1 (Multi-tenant governance):** `TenantId` exists in v1 (may equal `DatabaseId`); types that flow through hot paths must already carry it where applicable.
+- **HLD v2 §6 / WP1 F1 (version identity):** `VersionWord` (top bit = uncommitted tag over a 63-bit `Xid`, else packed `commit_ts`; 0 = EMPTY) and `Hlc` (48-bit ms `<< 16 | 16-bit logical`) live here. The **HLC epoch is custom (2026-01-01Z, `HLC_EPOCH_UNIX_MS`)** — that is what keeps bit 63 clear on every committed word until ≈ year 6488; WP2's clock must count ms from that epoch or `VersionWord::committed` panics by design. The constructors' panics are programmer-error guards (tag/epoch contract violations), not runtime failure paths — within invariant 2's spirit for a types-only crate.
 
 ## Hard Invariants
 

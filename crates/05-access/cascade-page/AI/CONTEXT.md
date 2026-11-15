@@ -21,15 +21,22 @@ offset 32: slot array — slot_count × u16 LE cell offsets, growing UP
 tail:     cells growing DOWN from PAGE_SIZE
 ```
 
-A cell is `[len u16][xmin u64][xmax u64][undo_ref u64][payload..]`; `len` counts
+A cell is `[len u16][xmin u64][xmax u64][next u64][payload..]`; `len` counts
 the whole cell (`CELL_FIXED = 26` + payload). A cell fits iff
 `free_offset − len ≥ 32 + 2·slot_count` (the two growth regions must never
-touch). `xmax`/`undo_ref` are reserved zero until the MVCC/undo milestone.
+touch). `xmin`/`xmax` are **typed version words** (`cascade_types::VersionWord`,
+WP1 F1 — upstream HLD §12's creator/deleter; top bit = uncommitted tag over a
+63-bit `Xid`, else the packed `Hlc` commit_ts; 0 = EMPTY). `next` is the packed
+chain word (`NextWord`: bits 0..15 slot, 16..47 relation-local `PageNo`,
+48..63 flags `HAS_NEXT`/`HEAP_ONLY`/`HAS_TOAST`; `HAS_NEXT` clear ⇒ chain
+ends; "HOT-updated root" is derived as `HAS_NEXT && same page`) — the v1
+`undo_ref` reservation repurposed at WP1 F2 without moving a byte (the heap
+has no undo; undo chains are IOT, §11). Fresh cells stamp `xmax`/`next` zero.
 `payload` is opaque here — heap row encoding is `cascade-heap`'s.
 
 ## Pillar Reservations
 
-- **§3.3 (In-place MVCC):** row headers (xmin, xmax, undo pointer) live on the page; this crate defines their offsets. The cell layout above is the reservation: `xmin` is stamped at insert, `xmax`/`undo_ref` wait for the visibility milestone.
+- **HLD v2 §6/§12 (version words + heap tuple header; superseded the old §3.3 mapping):** the row header lives on the page and this crate defines its offsets: `xmin` is stamped at insert via `append_cell(VersionWord::uncommitted(Xid), …)`, `xmax`/`next` are stamped by `set_xmax`/`set_next` at the §12 delete/update steps (format level only — engine semantics are the heap engine's, T3.x).
 - **§6.3 (CDC):** rows must carry enough header state for logical decoders to interpret historical row formats. Schema version stays undecided (below).
 
 ## Hard Invariants
@@ -48,7 +55,20 @@ touch). `xmax`/`undo_ref` are reserved zero until the MVCC/undo milestone.
 - Columnar segment format (lives in `cascade-columnar` — different format, different crate, same 8 KB unit).
 - The outer integrity CRC (lives in `cascade-storage`, see invariant 1).
 
-## Existing Code (T6.1)
+## Existing Code (T6.1, amended T1.1)
+
+**T1.1 (WP1 F1/F2, 2026-11-14):** `xmin`/`xmax` are `VersionWord`s and the
+reserved `undo_ref` became `NextWord` (`chain(page_no, slot, flags)` forces
+`HAS_NEXT`; flag consts `NEXT_HAS_NEXT`/`NEXT_HEAP_ONLY`/`NEXT_HAS_TOAST`);
+`append_cell` takes the typed creator word; `set_xmax(slot, VersionWord)` and
+`set_next(slot, NextWord)` mutate cells in place (out-of-range slot = panic).
+`CELL_FIXED` stays 26; `FORMAT_VERSION` stays 1 (no persisted readers exist;
+the evolution is documented in docs/storage-wp1-formats.md). Parse remains
+structural — version-word semantics are the visibility layer's, never the
+page parser's. Tests grew: version-word bit matrix (cascade-types), chain
+word layout literal (`0x0003_0102_0304_0506` for `chain(0x01020304, 0x0506,
+NEXT_HEAP_ONLY)`), stamp read-back, out-of-range `set_xmax` refusal; the
+goldens moved exactly one byte per cell (the creator word's tag MSB).
 
 `src/lib.rs`: constants (`FORMAT_VERSION`, `PAGE_KIND_HEAP`, `HEADER_LEN = 32`,
 `SLOTS_BASE = 32`, `CELL_FIXED = 26`, compile-time format locks),

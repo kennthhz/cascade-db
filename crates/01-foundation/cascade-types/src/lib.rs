@@ -41,6 +41,98 @@ pub struct Lsn(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Xid(pub u64);
 
+/// Hybrid logical clock timestamp (HLD v2 §6): `48-bit ms << 16 | 16-bit
+/// logical counter`.
+///
+/// The physical part counts **milliseconds since 2026-01-01T00:00:00Z** — a
+/// custom epoch, required by the version-word contract ([`VersionWord`]): it
+/// keeps bit 63 clear on every issued timestamp until roughly year 6488, so a
+/// committed word can never collide with the uncommitted tag. WP2 owns the
+/// clock machinery; this type pins only the wire encoding and the epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Hlc(pub u64);
+
+/// Milliseconds between the Unix epoch and the HLC epoch (2026-01-01Z).
+pub const HLC_EPOCH_UNIX_MS: u64 = 1_767_225_600_000;
+
+/// 64-bit MVCC version word (HLD v2 §6, WP1 F1) — the field that sits in
+/// every row header and index entry.
+///
+/// ```text
+/// 0                       → EMPTY: absent deleter; never a valid creator
+/// bit 63 = 1              → UNCOMMITTED: bits 0..62 = Xid
+/// bit 63 = 0, word ≠ 0    → COMMITTED: word = commit_ts (packed Hlc)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionWord(pub u64);
+
+impl VersionWord {
+    /// The absent word: no deleter, reserved zero.
+    pub const EMPTY: VersionWord = VersionWord(0);
+
+    const UNCOMMITTED_TAG: u64 = 1 << 63;
+
+    /// The word an in-flight txn stamps: tagged with its Xid.
+    ///
+    /// Panics on `xid ≥ 2^63` — the top bit is the tag and must stay free
+    /// (a programmer error, not a runtime condition).
+    pub fn uncommitted(xid: Xid) -> Self {
+        assert!(
+            xid.0 < Self::UNCOMMITTED_TAG,
+            "xid {} overflows 63 bits — the top bit is the uncommitted tag",
+            xid.0
+        );
+        VersionWord(xid.0 | Self::UNCOMMITTED_TAG)
+    }
+
+    /// The word a commit stamps: the commit_ts itself.
+    ///
+    /// Panics on `ts ≥ 2^63` — impossible with the HLC custom epoch (see
+    /// [`HLC_EPOCH_UNIX_MS`]); this is the WP1/F1 invariant guard against a
+    /// clock that ignored the epoch contract.
+    pub fn committed(ts: Hlc) -> Self {
+        assert!(
+            ts.0 < Self::UNCOMMITTED_TAG,
+            "commit_ts {:#018x} has bit 63 set — the HLC epoch guarantees it cannot; \
+             a non-custom-epoch clock would corrupt the version-word contract",
+            ts.0
+        );
+        VersionWord(ts.0)
+    }
+
+    /// Decodes any raw word. Page parse is structural; word semantics are
+    /// the visibility layer's (WP1 F2, invariant 3) — so decode is total.
+    pub const fn from_raw(word: u64) -> Self {
+        VersionWord(word)
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn is_uncommitted(&self) -> bool {
+        self.0 & Self::UNCOMMITTED_TAG != 0
+    }
+
+    /// The owning txn of an uncommitted word. Panics on a committed or
+    /// empty word — call sites branch on [`is_uncommitted`] first (misuse
+    /// is a bug, not a runtime condition).
+    pub fn xid(&self) -> Xid {
+        assert!(self.is_uncommitted(), "xid() on a non-uncommitted word");
+        Xid(self.0 & !Self::UNCOMMITTED_TAG)
+    }
+
+    /// The commit_ts of a committed word. Panics on an uncommitted or
+    /// empty word, for the same reason as [`xid`].
+    pub fn commit_ts(&self) -> Hlc {
+        assert!(
+            !self.is_uncommitted() && !self.is_empty(),
+            "commit_ts() on a committed word only"
+        );
+        Hlc(self.0)
+    }
+}
+
 // -----------------------------------------------------------------------------
 // I/O buffer
 // -----------------------------------------------------------------------------
@@ -150,5 +242,71 @@ mod tests {
         let b = AlignedBuf::zeroed(PAGE_SIZE);
         a.as_mut_slice()[100] = 1;
         assert_eq!(b.as_slice()[100], 0, "no aliasing between buffers");
+    }
+
+    // ---- version word (WP1 F1) ----
+
+    #[test]
+    fn version_word_roundtrips_both_states() {
+        let uncommitted = VersionWord::uncommitted(Xid(u64::MAX >> 1)); // max 63-bit
+        assert!(uncommitted.is_uncommitted());
+        assert!(!uncommitted.is_empty());
+        assert_eq!(uncommitted.xid(), Xid(u64::MAX >> 1));
+        assert_eq!(uncommitted.0, u64::MAX, "tag bit | all-ones xid");
+
+        let committed = VersionWord::committed(Hlc(0x0123_4567_89AB_CDEF));
+        assert!(!committed.is_uncommitted());
+        assert_eq!(committed.commit_ts(), Hlc(0x0123_4567_89AB_CDEF));
+        assert_eq!(committed.0, 0x0123_4567_89AB_CDEF);
+    }
+
+    #[test]
+    fn version_word_bit63_discriminates_every_time() {
+        // The tag must survive any xid low bits — including all-ones low bits
+        // — and committed words must keep bit 63 clear for any legal ts.
+        for xid in [1u64, 2, 0x1234_5678, u64::MAX >> 1, (u64::MAX >> 1) - 1] {
+            assert!(VersionWord::uncommitted(Xid(xid)).is_uncommitted());
+        }
+        for ts in [1u64, 2, 0x0F0F_0F0F_0F0F_0F0F, u64::MAX >> 1] {
+            assert!(!VersionWord::committed(Hlc(ts)).is_uncommitted());
+        }
+    }
+
+    #[test]
+    fn empty_word_is_only_zero() {
+        assert!(VersionWord::EMPTY.is_empty());
+        assert!(!VersionWord::EMPTY.is_uncommitted());
+        assert_eq!(VersionWord::from_raw(0), VersionWord::EMPTY);
+        // 0 is never issued as an HLC (physical part > 0 from the epoch), so
+        // EMPTY can never alias a committed word — F1's rationale.
+        assert_ne!(
+            VersionWord::committed(Hlc(1)).0,
+            VersionWord::EMPTY.0,
+            "the first legal commit_ts must differ from EMPTY"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows 63 bits")]
+    fn xid_overflow_is_refused() {
+        VersionWord::uncommitted(Xid(1u64 << 63));
+    }
+
+    #[test]
+    #[should_panic(expected = "bit 63 set")]
+    fn commit_ts_with_tag_bit_is_refused() {
+        VersionWord::committed(Hlc(1u64 << 63));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-uncommitted")]
+    fn xid_accessor_refused_on_committed_word() {
+        let _ = VersionWord::committed(Hlc(7)).xid();
+    }
+
+    #[test]
+    #[should_panic(expected = "committed word only")]
+    fn commit_ts_accessor_refused_on_uncommitted_word() {
+        let _ = VersionWord::uncommitted(Xid(7)).commit_ts();
     }
 }

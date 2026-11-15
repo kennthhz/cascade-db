@@ -24,12 +24,15 @@
 //! tail:     cells growing DOWN from `PAGE_SIZE`.
 //! ```
 //!
-//! A cell is `[len u16][xmin u64][xmax u64][undo_ref u64][payload..]` where
-//! `len` counts the whole cell (`CELL_FIXED + payload.len()`), `xmin` is the
-//! inserting XID, and `xmax`/`undo_ref` are reserved zero until the MVCC/undo
-//! milestones land (§3.3's reservation: the row header lives on the page).
-//! The payload is opaque here — heap row encoding is `cascade-heap`'s (out of
-//! scope, per the crate's AI/CONTEXT).
+//! A cell is `[len u16][xmin u64][xmax u64][next u64][payload..]` where
+//! `len` counts the whole cell (`CELL_FIXED + payload.len()`); `xmin`/`xmax`
+//! are the MVCC version words ([`VersionWord`], WP1 F1 — upstream §12's
+//! creator and deleter), and `next` is the packed chain word ([`NextWord`],
+//! WP1 F2 — §12's next-tuple pointer plus flags; the heap has no undo, so
+//! the v1 `undo_ref` reservation was repurposed without moving a byte). A
+//! fresh cell stamps `xmax`/`next` zero: live, chain ends. The payload is
+//! opaque here — heap row encoding is `cascade-heap`'s (out of scope, per
+//! the crate's AI/CONTEXT).
 //!
 //! Checksum division (invariant 1): the OUTER integrity CRC lives in
 //! `cascade-storage` — every stored page image is
@@ -40,7 +43,7 @@
 
 use thiserror::Error;
 
-use cascade_types::PAGE_SIZE;
+use cascade_types::{PageNo, VersionWord, PAGE_SIZE};
 
 /// Format version this crate reads and writes.
 pub const FORMAT_VERSION: u16 = 1;
@@ -54,8 +57,75 @@ pub const HEADER_LEN: usize = 32;
 /// First slot's byte offset (`slot i` lives at `SLOTS_BASE + 2*i`).
 pub const SLOTS_BASE: usize = HEADER_LEN;
 
-/// The fixed part of a cell: `[len u16][xmin u64][xmax u64][undo_ref u64]`.
+/// The fixed part of a cell: `[len u16][xmin u64][xmax u64][next u64]`.
 pub const CELL_FIXED: usize = 2 + 8 + 8 + 8;
+
+/// `next`-word flag (WP1 F2): the chain continues — without it the rest of
+/// the word is ignored, so the all-zero word unambiguously means "this
+/// tuple ends its chain".
+pub const NEXT_HAS_NEXT: u16 = 1 << 0;
+/// `next`-word flag (§12): HOT chain member — reachable only through the
+/// chain, never by an index entry.
+pub const NEXT_HEAP_ONLY: u16 = 1 << 1;
+/// `next`-word flag (§12): the tuple carries out-of-line TOASTed columns.
+pub const NEXT_HAS_TOAST: u16 = 1 << 2;
+
+/// The packed chain word occupying the cell's third field (`next`, WP1 F2 —
+/// upstream §12's next-tuple pointer; the heap has no undo, so chains run
+/// through tuple identity while undo chains stay an IOT concern).
+///
+/// Bit layout (LE u64): bits 0..15 slot, bits 16..47 relation-local
+/// `PageNo` (a chain never leaves its relation), bits 48..63 flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NextWord(pub u64);
+
+impl NextWord {
+    /// Chain ends here — also the fresh-appended state.
+    pub const NONE: NextWord = NextWord(0);
+
+    /// A continuation word. `HAS_NEXT` is forced on: the flag *is* the
+    /// meaning of the word, so call sites cannot forget it.
+    pub fn chain(page_no: PageNo, slot: u16, flags: u16) -> Self {
+        NextWord(
+            ((page_no as u64) << 16)
+                | (slot as u64)
+                | ((flags as u64 | NEXT_HAS_NEXT as u64) << 48),
+        )
+    }
+
+    /// Decodes any raw word (parse is structural; see [`VersionWord`]).
+    pub const fn from_raw(word: u64) -> Self {
+        NextWord(word)
+    }
+
+    pub const fn is_none(&self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn has_next(&self) -> bool {
+        // The flag bits live in the top u16 — shift down before masking.
+        ((self.0 >> 48) & (NEXT_HAS_NEXT as u64)) != 0
+    }
+
+    /// The chained tuple's page. Panics on a chain-ending word — call sites
+    /// branch on [`has_next`] first (misuse is a bug, not a runtime path).
+    pub fn page_no(&self) -> PageNo {
+        assert!(self.has_next(), "page_no() on a chain-ending word");
+        (self.0 >> 16) as u32
+    }
+
+    /// The chained tuple's slot; see [`page_no`] for the panic contract.
+    pub fn slot(&self) -> u16 {
+        assert!(self.has_next(), "slot() on a chain-ending word");
+        self.0 as u16
+    }
+
+    /// The raw flag bits (may include reserved bits; the visibility layer
+    /// reads the named flags via the constants).
+    pub const fn flags(&self) -> u16 {
+        (self.0 >> 48) as u16
+    }
+}
 
 /// Compile-time format locks: the header fits, and the page size is the
 /// workspace's 8 KiB (a change here is a new format version, not an edit).
@@ -102,14 +172,19 @@ fn rd_u64(buf: &[u8; PAGE_SIZE], off: usize) -> u64 {
     u64::from_le_bytes(b)
 }
 
-/// One decoded cell: the reserved row-header fields plus the opaque payload.
-/// The `payload` borrows the page image; nothing points into the page from
-/// outside it (invariant 4 — a row is addressed by `(PageId, SlotId)`).
+/// One decoded cell: the MVCC row header (typed words — WP1 F2) plus the
+/// opaque payload. The `payload` borrows the page image; nothing points
+/// into the page from outside it (invariant 4 — a row is addressed by
+/// `(PageId, SlotId)`).
 #[derive(Debug)]
 pub struct CellRef<'a> {
-    pub xmin: u64,
-    pub xmax: u64,
-    pub undo_ref: u64,
+    /// The §12 creator word: uncommitted-tagged `Xid` until the commit
+    /// stamps the `commit_ts`.
+    pub xmin: VersionWord,
+    /// The §12 deleter word — [`VersionWord::EMPTY`] while the tuple is live.
+    pub xmax: VersionWord,
+    /// The §12 next-tuple pointer (chain + flags); [`NextWord::NONE`] ends it.
+    pub next: NextWord,
     pub payload: &'a [u8],
 }
 
@@ -186,9 +261,9 @@ impl<'a> PageView<'a> {
         let off = rd_u16(self.buf, SLOTS_BASE + 2 * slot) as usize;
         let len = rd_u16(self.buf, off) as usize;
         Ok(CellRef {
-            xmin: rd_u64(self.buf, off + 2),
-            xmax: rd_u64(self.buf, off + 10),
-            undo_ref: rd_u64(self.buf, off + 18),
+            xmin: VersionWord::from_raw(rd_u64(self.buf, off + 2)),
+            xmax: VersionWord::from_raw(rd_u64(self.buf, off + 10)),
+            next: NextWord::from_raw(rd_u64(self.buf, off + 18)),
             payload: &self.buf[off + CELL_FIXED..off + len],
         })
     }
@@ -252,10 +327,11 @@ impl<'a> PageMut<'a> {
     /// Appends one cell (insertion order = slot order) and returns its slot
     /// index. Cells grow downward from the page tail; the slot array grows
     /// up from [`SLOTS_BASE`]; the append fails with [`PageError::Full`] the
-    /// moment the two regions would touch. `xmax`/`undo_ref` are written
-    /// zero (reserved); `page_lsn` is NOT touched here — the access method
+    /// moment the two regions would touch. `xmin` is the §12 creator word
+    /// (tagged with the writer's `Xid`); `xmax`/`next` are written zero —
+    /// live, chain ends. `page_lsn` is NOT touched here — the access method
     /// stamps it via [`PageMut::set_page_lsn`] as part of the logged write.
-    pub fn append_cell(&mut self, xmin: u64, payload: &[u8]) -> Result<u16, PageError> {
+    pub fn append_cell(&mut self, xmin: VersionWord, payload: &[u8]) -> Result<u16, PageError> {
         let cell_len = CELL_FIXED + payload.len();
         if cell_len > u16::MAX as usize {
             return Err(PageError::CellTooLarge);
@@ -267,14 +343,38 @@ impl<'a> PageMut<'a> {
             _ => return Err(PageError::Full),
         };
         wr_u16(self.buf, new_free, cell_len as u16);
-        wr_u64(self.buf, new_free + 2, xmin);
-        wr_u64(self.buf, new_free + 10, 0); // xmax reserved
-        wr_u64(self.buf, new_free + 18, 0); // undo_ref reserved
+        wr_u64(self.buf, new_free + 2, xmin.0);
+        wr_u64(self.buf, new_free + 10, 0); // xmax: live
+        wr_u64(self.buf, new_free + 18, 0); // next: chain ends
         self.buf[new_free + CELL_FIXED..new_free + cell_len].copy_from_slice(payload);
         wr_u16(self.buf, slot_array_end, new_free as u16);
         wr_u16(self.buf, 4, (slot + 1) as u16);
         wr_u16(self.buf, 6, new_free as u16);
         Ok(slot as u16)
+    }
+
+    /// Stamps the deleter word on an existing cell (the format-level §12
+    /// delete/update step; the engine semantics that decide *when* —
+    /// conflict checks, WAL records — are the heap engine's). Panics on an
+    /// out-of-range slot.
+    pub fn set_xmax(&mut self, slot: u16, word: VersionWord) {
+        let off = self.cell_offset(slot);
+        wr_u64(self.buf, off + 10, word.0);
+    }
+
+    /// Sets the chain word on an existing cell (the §12 update step: the old
+    /// tuple points at the newer version). Panics on an out-of-range slot.
+    pub fn set_next(&mut self, slot: u16, word: NextWord) {
+        let off = self.cell_offset(slot);
+        wr_u64(self.buf, off + 18, word.0);
+    }
+
+    fn cell_offset(&self, slot: u16) -> usize {
+        assert!(
+            (slot as usize) < self.slot_count(),
+            "slot out of range"
+        );
+        rd_u16(self.buf, SLOTS_BASE + 2 * slot as usize) as usize
     }
 
     pub fn page_lsn(&self) -> u64 {
@@ -298,6 +398,7 @@ impl<'a> PageMut<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascade_types::{Hlc, Xid};
 
     /// The whole layout, pinned byte-for-byte at the only version that will
     /// ever read these images: all 32 header bytes, the slot array, and both
@@ -307,8 +408,14 @@ mod tests {
         let mut img = [0u8; PAGE_SIZE];
         {
             let mut p = PageMut::init(&mut img);
-            assert_eq!(p.append_cell(7, b"ab").unwrap(), 0);
-            assert_eq!(p.append_cell(9, b"cd").unwrap(), 1);
+            assert_eq!(
+                p.append_cell(VersionWord::uncommitted(Xid(7)), b"ab").unwrap(),
+                0
+            );
+            assert_eq!(
+                p.append_cell(VersionWord::uncommitted(Xid(9)), b"cd").unwrap(),
+                1
+            );
             p.set_page_lsn(0x0102_0304_0506_0708);
         }
 
@@ -332,23 +439,26 @@ mod tests {
         );
         // Slot array: slot 0 → 8164 = 0x1FE4, slot 1 → 8136 = 0x1FC8, LE.
         assert_eq!(&img[SLOTS_BASE..SLOTS_BASE + 4], &[0xE4, 0x1F, 0xC8, 0x1F]);
-        // Cell 0 whole: [len 28][xmin 7][xmax 0][undo 0]["ab"].
+        // Cell 0 whole: [len 28][xmin uncommitted(7)][xmax 0][next 0]["ab"].
+        // The typed words changed exactly one golden byte: the creator word
+        // now carries the uncommitted tag in its MSB (WP1 F1); xmax/next
+        // stay byte-identical to the v1 reserved zeros when fresh.
         assert_eq!(
             &img[8164..8192],
             &[
                 0x1C, 0x00, // len 28
-                0x07, 0, 0, 0, 0, 0, 0, 0, // xmin 7
-                0, 0, 0, 0, 0, 0, 0, 0, // xmax reserved
-                0, 0, 0, 0, 0, 0, 0, 0, // undo_ref reserved
+                0x07, 0, 0, 0, 0, 0, 0, 0x80, // xmin: uncommitted(7), tag MSB
+                0, 0, 0, 0, 0, 0, 0, 0, // xmax: live (EMPTY)
+                0, 0, 0, 0, 0, 0, 0, 0, // next: chain ends
                 b'a', b'b',
             ][..]
         );
-        // Cell 1 whole: [len 28][xmin 9][xmax 0][undo 0]["cd"].
+        // Cell 1 whole: [len 28][xmin uncommitted(9)][xmax 0][next 0]["cd"].
         assert_eq!(
             &img[8136..8164],
             &[
                 0x1C, 0x00, //
-                0x09, 0, 0, 0, 0, 0, 0, 0, //
+                0x09, 0, 0, 0, 0, 0, 0, 0x80, // xmin: uncommitted(9)
                 0, 0, 0, 0, 0, 0, 0, 0, //
                 0, 0, 0, 0, 0, 0, 0, 0, //
                 b'c', b'd',
@@ -369,8 +479,11 @@ mod tests {
             let mut p = PageMut::init(&mut img);
             let slots: Vec<u16> = (0..100u64)
                 .map(|i| {
-                    p.append_cell(1_000 + i, &vec![b'x'; (i % 40) as usize])
-                        .unwrap()
+                    p.append_cell(
+                        VersionWord::uncommitted(Xid(1_000 + i)),
+                        &vec![b'x'; (i % 40) as usize],
+                    )
+                    .unwrap()
                 })
                 .collect();
             assert_eq!(slots.len(), 100);
@@ -383,11 +496,73 @@ mod tests {
         assert_eq!(v.page_lsn(), lsn);
         assert_eq!(v.free_bytes(), free_after_append);
         for (i, cell) in v.iter().enumerate() {
-            assert_eq!(cell.xmin, 1_000 + i as u64);
-            assert_eq!(cell.xmax, 0, "reserved");
-            assert_eq!(cell.undo_ref, 0, "reserved");
+            assert_eq!(cell.xmin, VersionWord::uncommitted(Xid(1_000 + i as u64)));
+            assert_eq!(cell.xmax, VersionWord::EMPTY, "fresh cell is live");
+            assert_eq!(cell.next, NextWord::NONE, "fresh cell ends its chain");
             assert_eq!(cell.payload, vec![b'x'; i % 40]);
         }
+    }
+
+    /// The WP1 F2 mutation steps: stamp a deleter word and a chain word on
+    /// an existing cell, then read them back through a fresh parse.
+    #[test]
+    fn deleter_and_chain_stamp_read_back() {
+        let mut img = [0u8; PAGE_SIZE];
+        let commit_ts = Hlc(0x0123_4567_89AB_CDEF);
+        {
+            let mut p = PageMut::init(&mut img);
+            let s = p
+                .append_cell(VersionWord::uncommitted(Xid(5)), b"row")
+                .unwrap();
+            p.set_xmax(s, VersionWord::committed(commit_ts));
+            p.set_next(
+                s,
+                NextWord::chain(0x0102_0304, 0x0506, NEXT_HEAP_ONLY | NEXT_HAS_TOAST),
+            );
+        }
+        let cell = PageView::parse(&img).unwrap().cell(0).unwrap();
+        assert_eq!(cell.xmax, VersionWord::committed(commit_ts));
+        assert!(cell.next.has_next());
+        assert_eq!(cell.next.page_no(), 0x0102_0304);
+        assert_eq!(cell.next.slot(), 0x0506);
+        assert_eq!(
+            cell.next.flags(),
+            NEXT_HAS_NEXT | NEXT_HEAP_ONLY | NEXT_HAS_TOAST,
+            "chain() forces HAS_NEXT on top of the caller's flags"
+        );
+    }
+
+    /// The `next` word's bit layout is format law (WP1 F2): pin the exact
+    /// u64, the flag forcing, and the NONE/chain boundary behavior.
+    #[test]
+    fn next_word_bit_layout_is_pinned() {
+        let w = NextWord::chain(0x0102_0304, 0x0506, NEXT_HEAP_ONLY);
+        assert_eq!(
+            w.0,
+            0x0003_0102_0304_0506,
+            "slot|page_no<<16|flags<<48 with HAS_NEXT|HEAP_ONLY = 0x0003 in the top u16"
+        );
+        assert_eq!(w.page_no(), 0x0102_0304);
+        assert_eq!(w.slot(), 0x0506);
+
+        // chain() cannot produce a word that reads as chain-ending, whatever
+        // flags the caller passes.
+        assert!(NextWord::chain(7, 9, 0).has_next());
+        assert!(NextWord::chain(7, 9, u16::MAX).has_next());
+
+        // NONE and from_raw(0) are the same chain-ending word; its accessors
+        // refuse to synthesize a position.
+        assert_eq!(NextWord::NONE, NextWord::from_raw(0));
+        assert!(NextWord::NONE.is_none());
+        assert!(!NextWord::NONE.has_next());
+    }
+
+    #[test]
+    #[should_panic(expected = "slot out of range")]
+    fn set_xmax_refuses_out_of_range_slot() {
+        let mut img = [0u8; PAGE_SIZE];
+        let mut p = PageMut::init(&mut img);
+        p.set_xmax(0, VersionWord::EMPTY);
     }
 
     /// Zero-payload fills until the two growth regions touch, at an exact
@@ -399,13 +574,16 @@ mod tests {
         let mut img = [0u8; PAGE_SIZE];
         let mut p = PageMut::init(&mut img);
         let mut n = 0;
-        while p.append_cell(1, &[]).is_ok() {
+        while p
+            .append_cell(VersionWord::uncommitted(Xid(1)), &[])
+            .is_ok()
+        {
             n += 1;
         }
         assert_eq!(n, 291);
         assert_eq!(p.free_bytes(), 12);
         assert!(matches!(
-            p.append_cell(1, &[]),
+            p.append_cell(VersionWord::uncommitted(Xid(1)), &[]),
             Err(PageError::Full)
         ));
         // The refused append left the page consistent.
@@ -419,7 +597,7 @@ mod tests {
         let mut p = PageMut::init(&mut img);
         let huge = vec![0u8; u16::MAX as usize]; // > u16::MAX - 26
         assert!(matches!(
-            p.append_cell(1, &huge),
+            p.append_cell(VersionWord::uncommitted(Xid(1)), &huge),
             Err(PageError::CellTooLarge)
         ));
     }
@@ -431,7 +609,8 @@ mod tests {
         let mut img = [0u8; PAGE_SIZE];
         {
             let mut p = PageMut::init(&mut img);
-            p.append_cell(5, b"row").unwrap();
+            p.append_cell(VersionWord::uncommitted(Xid(5)), b"row")
+                .unwrap();
         }
 
         // Uninitialized: a zeroed page.
