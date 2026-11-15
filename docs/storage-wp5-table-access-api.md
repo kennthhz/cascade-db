@@ -383,7 +383,7 @@ Carried forward:
 | Locator validity beyond one statement (cursor pinning) | sharpened §10 invariant | Executor/cursor design; until then same-statement only (D2) |
 | Wait-queue structure and fairness | §7 | WP2 (owns status-table waiting; D3 pins only the observable contract) |
 | `TableStats` shape the planner needs | §10 | Planner design (explicitly out of scope) |
-| Exact `KeyRange` bound semantics for nullable/multi-column keys | D13 | WP1 joint deliverable |
+| ~~Exact `KeyRange` bound semantics for nullable/multi-column keys~~ | D13 | Closed at WP1 T1.4: NULLS LAST is bytewise (bare `0xFF` marker, above every non-null tag); multi-column keys are per-column encodings concatenated, prefix scans are ranges over the concatenation with uppers constructed so NULL continuations stay in range. Per-type encodings for numeric/temporal/etc. remain gated on invariant 7 (order-preserving normalization) before those types join an index |
 | Sequences/identity on sharded tables | §14, §17 | Sharding design |
 | Index MVCC costs (delete-word churn, deferred index writes) | §13 | WP8 (API unaffected; `UniqueViolation`/D12 already value-shaped) |
 
@@ -409,7 +409,7 @@ Carried forward:
 | D10 statement boundary (`StmtCtx`, serial, schema version) | Decided |
 | D11 scan protocol: locators in items, rescan, mark/restore, drop semantics, capabilities, SSI hook reserved | Decided |
 | D12 upsert via speculative-insert primitives | Decided |
-| D13 key contract co-owned with WP1 | Decided (encoding is WP1's joint deliverable) |
+| D13 key contract co-owned with WP1 | Decided; encoding implemented at WP1 T1.4 (`KeyBytes` tag scheme in cascade-pgtypes) |
 | D14 DDL = physical phase; schema versions from `StmtCtx` | Decided |
 | D15 `RowRef` owns buffer + engine handle for lazy TOAST | Decided |
 
