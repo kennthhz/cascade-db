@@ -127,13 +127,13 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
                         cascade_wal::WalRecord::BeginTxn { xid } => {
                             open.entry(xid).or_default();
                         }
-                        cascade_wal::WalRecord::Insert { xid, id, val, .. } => {
+                        cascade_wal::WalRecord::LegacyInsert { xid, id, val, .. } => {
                             open.entry(xid).or_default().push((id, val));
                         }
                         // Commit order is replay order: the row vector is
                         // exactly what the acking boot served from its
                         // table.
-                        cascade_wal::WalRecord::CommitTxn { xid } => {
+                        cascade_wal::WalRecord::CommitTxn { xid, .. } => {
                             if let Some(rows) = open.remove(&xid) {
                                 seed_rows.extend(rows);
                             }
@@ -141,6 +141,12 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
                         cascade_wal::WalRecord::AbortTxn { xid } => {
                             open.remove(&xid);
                         }
+                        // Reserved families (§6/§7/§17): no replay effect
+                        // in the debug slice — they carry no row data.
+                        cascade_wal::WalRecord::ClosedTsHeartbeat { .. }
+                        | cascade_wal::WalRecord::HlcHighWater { .. }
+                        | cascade_wal::WalRecord::BulkLoad
+                        | cascade_wal::WalRecord::UnloggedMarker => {}
                     }
                     cursor = entry.next;
                 }
@@ -181,6 +187,11 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
 fn wal_err(e: WalError, at: Lsn) -> RecoveryError {
     match e {
         WalError::Corruption(lsn) => RecoveryError::Corrupt { lsn },
+        // A transplant and an unknown producer's record are both
+        // refuse-boot integrity failures — recovery never serves over
+        // bytes it cannot fully explain.
+        WalError::LsnMismatch { at, .. } => RecoveryError::Corrupt { lsn: at },
+        WalError::UnknownRecordType { at, .. } => RecoveryError::Corrupt { lsn: at },
         WalError::UnknownRecordVersion(v) => RecoveryError::UnknownVersion { version: v },
         WalError::Io(io) => RecoveryError::Io(io),
         // The walk handles torn tails itself; this arm is unreachable but

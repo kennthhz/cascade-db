@@ -215,17 +215,35 @@ impl WalReader for DebugWalReader {
             return Err(WalError::TornTail(start));
         }
         match format::decode(&bytes) {
-            Ok((rec, consumed)) => {
-                debug_assert_eq!(consumed, total);
+            Ok(decoded) => {
+                debug_assert_eq!(decoded.total, total);
+                // v2 records are self-describing (F3): the declared LSN
+                // must agree with where this record was found. A mismatch
+                // is a transplant — internally consistent bytes at the
+                // wrong address — and the reader refuses it rather than
+                // serve a record the position never promised.
+                if decoded.lsn != start.0 {
+                    return Err(WalError::LsnMismatch {
+                        at: start,
+                        declared: Lsn(decoded.lsn),
+                    });
+                }
                 Ok(Some(crate::WalEntry {
                     lsn: start,
-                    record: rec,
-                    next: Lsn(start.0 + consumed as u64),
+                    epoch: decoded.epoch,
+                    record: decoded.record,
+                    next: Lsn(start.0 + decoded.total as u64),
                 }))
             }
             Err(format::DecodeError::Corruption) => Err(WalError::Corruption(start)),
             Err(format::DecodeError::UnknownRecordVersion(v)) => {
                 Err(WalError::UnknownRecordVersion(v))
+            }
+            Err(format::DecodeError::UnknownRecordType(t)) => {
+                Err(WalError::UnknownRecordType {
+                    at: start,
+                    type_byte: t,
+                })
             }
         }
     }

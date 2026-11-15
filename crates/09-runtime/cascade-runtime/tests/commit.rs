@@ -116,20 +116,25 @@ fn replay_committed_rows(dir: &Path) -> Vec<(i32, String)> {
             };
             match entry.record {
                 WalRecord::BeginTxn { xid } => open.push((xid, Vec::new())),
-                WalRecord::Insert { xid, id, val, .. } => {
+                WalRecord::LegacyInsert { xid, id, val, .. } => {
                     open.iter_mut().for_each(|(x, r)| {
                         if *x == xid {
                             r.push((id, val.clone()));
                         }
                     });
                 }
-                WalRecord::CommitTxn { xid } => {
+                WalRecord::CommitTxn { xid, .. } => {
                     if let Some((_, txn_rows)) = open.iter().find(|(x, _)| *x == xid) {
                         rows.extend(txn_rows.iter().cloned());
                     }
                     open.retain(|(x, _)| *x != xid);
                 }
                 WalRecord::AbortTxn { xid } => open.retain(|(x, _)| *x != xid),
+                // Reserved families (§6/§7/§17) carry no row data.
+                WalRecord::ClosedTsHeartbeat { .. }
+                | WalRecord::HlcHighWater { .. }
+                | WalRecord::BulkLoad
+                | WalRecord::UnloggedMarker => {}
             }
             at = entry.next;
         }

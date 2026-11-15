@@ -22,7 +22,7 @@ use std::{
 
 use cascade_telemetry::Span;
 use cascade_tenant::TenantContext;
-use cascade_types::{Lsn, SegmentId};
+use cascade_types::{Hlc, Lsn, SegmentId};
 use cascade_wal::{WalError, WalHandle, WalRecord, WalWriter};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use static_assertions::assert_not_impl_any;
@@ -54,6 +54,18 @@ static NEXT_XID: AtomicU64 = AtomicU64::new(1);
 
 fn next_xid() -> u64 {
     NEXT_XID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Process-wide commit_ts source — the WP2 stand-in: a logical-only
+/// monotonic counter starting at 1 (never 0, which is VersionWord EMPTY).
+/// It orders commits within this process and satisfies the v2 COMMIT
+/// payload shape, but it is NOT a real HLC: no physical component, no
+/// cross-scope coordination. WP2's clock — counting ms from
+/// `HLC_EPOCH_UNIX_MS` per WP1 F1 — replaces it at T2.3.
+static NEXT_COMMIT_TS: AtomicU64 = AtomicU64::new(1);
+
+fn next_commit_ts() -> Hlc {
+    Hlc(NEXT_COMMIT_TS.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Per-connection WAL wiring (T1.11, FR-27): the DB's shared writer plus
@@ -161,7 +173,11 @@ impl From<WalError> for PgError {
             // cover a torn record — impossible by protocol, so it lands in
             // the same integrity bucket as corruption (not a client's
             // fault, never expected).
-            WalError::Corruption(_) | WalError::TornTail(_) | WalError::UnknownRecordVersion(_) => {
+            WalError::Corruption(_)
+            | WalError::TornTail(_)
+            | WalError::LsnMismatch { .. }
+            | WalError::UnknownRecordType { .. }
+            | WalError::UnknownRecordVersion(_) => {
                 PgError::new("XX000", format!("wal integrity failure: {e}"))
             }
         }
@@ -1050,14 +1066,17 @@ async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
     let begin = writer.append_wal(&WalRecord::BeginTxn { xid });
     let mut inserts = Vec::with_capacity(rows.len());
     for (id, val) in rows {
-        inserts.push(writer.append_wal(&WalRecord::Insert {
+        inserts.push(writer.append_wal(&WalRecord::LegacyInsert {
             xid,
             table: DEV_TABLE_SEG,
             id: *id,
             val: val.clone(),
         }));
     }
-    let commit = writer.append_wal(&WalRecord::CommitTxn { xid });
+    let commit = writer.append_wal(&WalRecord::CommitTxn {
+        xid,
+        commit_ts: next_commit_ts(),
+    });
     let end = commit.end();
 
     // Crash-point barrier (T3.3 harness): every reservation exists, no

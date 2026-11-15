@@ -41,6 +41,12 @@ pub struct WalWriter {
     /// Durable watermark (FR-26): everything at or below this offset is
     /// `fdatasync`ed.
     durable: AtomicU64,
+    /// The scope ownership epoch stamped into every record this writer
+    /// emits (§4 fencing; WP1 F3 — 0 until multi-owner). A fenced restart
+    /// in the multi-owner era constructs a *new* writer in a new epoch
+    /// rather than mutating this one; readers refuse records from
+    /// superseded epochs.
+    epoch: u64,
     /// Completed `fdatasync` barriers — the observable behind
     /// [`WalWriter::syncs`]: a caller that has *seen an ack* can assert the
     /// barrier count moved, proving the ack followed durability.
@@ -66,7 +72,7 @@ impl Default for WalWriter {
 
 impl WalWriter {
     pub fn new() -> Self {
-        Self::new_at(Lsn(0))
+        Self::new_in_epoch(Lsn(0), 0)
     }
 
     /// A writer whose watermarks start at `start` instead of 0 — the
@@ -78,15 +84,31 @@ impl WalWriter {
     /// resume point is a record boundary, and everything before it is
     /// durable history this writer never re-mentions.
     pub fn new_at(start: Lsn) -> Self {
+        Self::new_in_epoch(start, 0)
+    }
+
+    /// A writer in scope-ownership `epoch` (§4 fencing, WP1 F3): every
+    /// record it stamps carries that epoch, so a reader can refuse records
+    /// from a superseded owner once the multi-owner era lands. Epoch 0 is
+    /// the single-owner default; a fenced restart takes a *new* epoch, it
+    /// never mutates a live writer's.
+    pub fn new_in_epoch(start: Lsn, epoch: u64) -> Self {
         WalWriter {
             reserved: AtomicU64::new(start.0),
             filled: AtomicU64::new(start.0),
             durable: AtomicU64::new(start.0),
+            epoch,
             syncs: AtomicU64::new(0),
             pending: Mutex::new(BTreeMap::new()),
             leader: AtomicBool::new(false),
             wake: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The epoch stamped into records this writer emits (§4; 0 until
+    /// multi-owner).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Next byte offset [`WalWriter::append_wal`] will hand out — the
@@ -114,14 +136,17 @@ impl WalWriter {
     }
 
     /// §8.2 `append_wal`: atomically reserve a byte range and return the
-    /// reservation. The LSN exists now; the record does not. Finishing is
+    /// reservation. The LSN exists now; the record does not. The length is
+    /// pure arithmetic on the record ([`format::encoded_len`]) — reserve
+    /// first, then encode with the real LSN and this writer's epoch (v2
+    /// records are self-describing, F3; the length never depends on the
+    /// LSN, so the reserve is race-free). Finishing is
     /// [`Reservation::fill`] — dropping the reservation instead leaves a
     /// permanent tear (see the crate doc).
     pub fn append_wal(&self, record: &WalRecord) -> Reservation<'_> {
-        let bytes = format::encode(record);
-        let start = self
-            .reserved
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let len = format::encoded_len(record);
+        let start = self.reserved.fetch_add(len as u64, Ordering::Relaxed);
+        let bytes = format::encode(record, Lsn(start), self.epoch);
         Reservation {
             writer: self,
             start,

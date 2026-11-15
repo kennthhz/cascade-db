@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use cascade_types::{DatabaseId, Lsn, SegmentId};
+use cascade_types::{DatabaseId, Hlc, Lsn, SegmentId};
 use cascade_wal::{
     log_len, read_clean_marker, truncate_log, write_clean_marker, DebugWalReader, WalError,
     WalHandle, WalReader, WalRecord, WalWriter,
@@ -44,7 +44,7 @@ fn temp_dir() -> PathBuf {
 }
 
 fn insert(xid: u64, id: i32, val: &str) -> WalRecord {
-    WalRecord::Insert {
+    WalRecord::LegacyInsert {
         xid,
         table: SegmentId(11),
         id,
@@ -84,7 +84,10 @@ fn flush_stops_at_the_filled_watermark() {
     reactor().run(async {
         let h = WalHandle::open(&dir, DB).await.expect("handle opens");
         let b1 = fill(&insert(1, 10, "a"), &w);
-        let r2 = w.append_wal(&WalRecord::CommitTxn { xid: 1 });
+        let r2 = w.append_wal(&WalRecord::CommitTxn {
+            xid: 1,
+            commit_ts: Hlc(1),
+        });
         assert_eq!(
             r2.start(),
             b1,
@@ -308,7 +311,13 @@ fn txn_sequence_roundtrips_through_the_reader() {
         let h = WalHandle::open(&dir, DB).await.expect("handle opens");
         let b1 = fill(&WalRecord::BeginTxn { xid: 3 }, &w);
         let b2 = fill(&insert(3, 1, "alice"), &w);
-        let b3 = fill(&WalRecord::CommitTxn { xid: 3 }, &w);
+        let b3 = fill(
+            &WalRecord::CommitTxn {
+                xid: 3,
+                commit_ts: Hlc(3),
+            },
+            &w,
+        );
         let durable = w.flush_wal(&h, b3).await.expect("flush");
         assert_eq!(durable, b3);
 
@@ -337,7 +346,14 @@ fn txn_sequence_roundtrips_through_the_reader() {
             .expect("read 3 succeeds")
             .expect("rec 3 exists");
         assert_eq!(e3.lsn, b2);
-        assert!(matches!(e3.record, WalRecord::CommitTxn { xid: 3 }));
+        assert!(matches!(
+            e3.record,
+            WalRecord::CommitTxn {
+                xid: 3,
+                commit_ts: Hlc(3)
+            }
+        ));
+        assert_eq!(e1.epoch, 0, "the default writer stamps epoch 0");
         // The end boundaries chain: e.next is exactly where the next record
         // was written — how recovery steps without knowing lengths.
         assert_eq!(e1.next, b1);
@@ -755,7 +771,10 @@ fn resume_writer_appends_after_the_replayed_prefix() {
 
         let h = WalHandle::open(&dir, DB).await.expect("handle reopens");
         let e3 = fill(&insert(2, 3, "cc"), &w);
-        assert_eq!(e3.0, e2.0 + cascade_wal::format::encode(&insert(2, 3, "cc")).len() as u64);
+        assert_eq!(
+            e3.0,
+            e2.0 + cascade_wal::format::encode(&insert(2, 3, "cc"), Lsn(0), 0).len() as u64
+        );
         w.flush_wal(&h, e3).await.expect("flush");
 
         // All three records decode, each at its own LSN — nothing clobbered.
@@ -802,6 +821,82 @@ fn clean_marker_and_length_helpers_round_trip() {
         assert!(r.read_record(Lsn(0)).await.expect("decodes").is_some());
         assert!(r.read_record(e1).await.expect("decodes").is_some());
         assert!(r.read_record(e2).await.expect("eof").is_none());
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- v2 self-describing records (WP1 F3) -------------------------------------
+
+/// The writer stamps its scope-ownership epoch into every record, and the
+/// header-declared LSN agrees with where the record actually landed — the
+/// reader surfaces both (the `epoch` it read, the position it verified).
+#[test]
+fn records_carry_the_writer_epoch_and_declared_lsn() {
+    let dir = temp_dir();
+    let w = WalWriter::new_in_epoch(Lsn(0), 0xACE);
+    assert_eq!(w.epoch(), 0xACE);
+    reactor().run(async {
+        let h = WalHandle::open(&dir, DB).await.expect("handle opens");
+        let b1 = fill(&insert(1, 1, "a"), &w);
+        let b2 = fill(
+            &WalRecord::CommitTxn {
+                xid: 1,
+                commit_ts: Hlc(7),
+            },
+            &w,
+        );
+        w.flush_wal(&h, b2).await.expect("flush");
+
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        let e1 = r
+            .read_record(Lsn(0))
+            .await
+            .expect("read 1 succeeds")
+            .expect("rec 1 exists");
+        assert_eq!(e1.lsn, Lsn(0), "the record sits where it declares");
+        assert_eq!(e1.epoch, 0xACE, "every record carries the owner epoch");
+        let e2 = r
+            .read_record(b1)
+            .await
+            .expect("read 2 succeeds")
+            .expect("rec 2 exists");
+        assert_eq!(e2.lsn, b1);
+        assert_eq!(e2.epoch, 0xACE);
+        assert_eq!(e2.next, b2);
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A record whose bytes are intact but whose header-declared LSN points
+/// somewhere else — a transplant, how a hand-edit or a copy-paste bug
+/// shows up — is refused by name (`LsnMismatch`), not read as the record
+/// the position promised. This is what the explicit LSN buys: the reader
+/// no longer has to trust the offset it happened to read at.
+#[test]
+fn transplanted_record_is_refused_by_declared_lsn() {
+    let dir = temp_dir();
+    // Encode a perfectly valid record that claims LSN 0x9999, then plant
+    // it at offset 0 — byte-for-byte consistent, wrong address.
+    let bytes = cascade_wal::format::encode(
+        &WalRecord::CommitTxn {
+            xid: 1,
+            commit_ts: Hlc(7),
+        },
+        Lsn(0x9999),
+        0,
+    );
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(dir.join(format!("db_{}.log", DB.0)), &bytes).expect("planted");
+
+    reactor().run(async {
+        let r = DebugWalReader::open(&dir, DB).await.expect("reader opens");
+        match r.read_record(Lsn(0)).await {
+            Err(WalError::LsnMismatch { at, declared }) => {
+                assert_eq!(at, Lsn(0));
+                assert_eq!(declared, Lsn(0x9999));
+            }
+            other => panic!("expected LsnMismatch, got {other:?}"),
+        }
     });
     let _ = std::fs::remove_dir_all(&dir);
 }

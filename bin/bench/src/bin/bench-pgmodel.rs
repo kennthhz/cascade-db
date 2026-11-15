@@ -322,16 +322,48 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
     let xid = base + XID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(&format::encode(&cascade_wal::WalRecord::BeginTxn { xid }));
-    for (id, val) in rows {
-        bytes.extend_from_slice(&format::encode(&cascade_wal::WalRecord::Insert {
-            xid,
-            table: cascade_types::SegmentId(1),
-            id: *id,
-            val: val.clone(),
-        }));
+    // v2 records are self-describing (F3): each carries its own file LSN.
+    // O_APPEND lands at EOF, so seek-to-end *is* the blob's reservation —
+    // the stripped baseline composes and writes one txn as a unit and is
+    // driven one backend at a time; cascade's atomic reserve is the real
+    // answer to concurrent appends.
+    let base = unsafe { libc::lseek(wal_fd, 0, libc::SEEK_END) };
+    if base < 0 {
+        return Err(("XX000".to_owned(), "wal seek failed".to_owned()));
     }
-    bytes.extend_from_slice(&format::encode(&cascade_wal::WalRecord::CommitTxn { xid }));
+    let mut off = base as u64;
+    let b = format::encode(
+        &cascade_wal::WalRecord::BeginTxn { xid },
+        cascade_types::Lsn(off),
+        0,
+    );
+    off += b.len() as u64;
+    bytes.extend_from_slice(&b);
+    for (id, val) in rows {
+        let b = format::encode(
+            &cascade_wal::WalRecord::LegacyInsert {
+                xid,
+                table: cascade_types::SegmentId(1),
+                id: *id,
+                val: val.clone(),
+            },
+            cascade_types::Lsn(off),
+            0,
+        );
+        off += b.len() as u64;
+        bytes.extend_from_slice(&b);
+    }
+    // The xid doubles as the commit_ts here — unique, monotonic, nonzero;
+    // this baseline never reads it back.
+    let b = format::encode(
+        &cascade_wal::WalRecord::CommitTxn {
+            xid,
+            commit_ts: cascade_types::Hlc(xid),
+        },
+        cascade_types::Lsn(off),
+        0,
+    );
+    bytes.extend_from_slice(&b);
 
     let mut file = unsafe { std::fs::File::from_raw_fd(wal_fd) };
     let r = file.write_all(&bytes).and_then(|_| file.sync_data());

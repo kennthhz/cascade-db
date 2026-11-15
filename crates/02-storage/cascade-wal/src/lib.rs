@@ -23,13 +23,18 @@
 //! between reserve and fill means the record never landed — and the tests
 //! plant it deliberately. Recovery/abort handling arrives with T1.11.
 //!
-//! On-disk format (hand-rolled v1, invariant 3+4): every record is
-//! `[u32 payload_len][u32 version = 1][u8 type][3 reserved][u64 xid]
-//! [payload][u32 CRC32 of all preceding bytes]`; the LSN of a record is its
-//! byte offset in the DB's log file. `Insert` carries the full row image
-//! (I8). The file is page-cache-backed (`BufferedFile` + `fdatasync`) —
-//! the spec's `O_DIRECT` mandate is for *data pages*; the WAL is fsync'd
-//! sequential I/O, exactly PostgreSQL's model.
+//! On-disk format (hand-rolled v2, invariant 3+4; WP1 F3): every record is
+//! `[u32 payload_len][u32 format_version = 2][u8 type][3 reserved]
+//! [u64 xid][u64 lsn][u64 epoch][payload][u32 CRC32 of all preceding
+//! bytes]` — a 36-byte header. The LSN of a record is its byte offset in
+//! the DB's log file *and* the explicit header field, so records are
+//! self-describing (§5): the reader cross-checks the two and refuses a
+//! transplant. The epoch field reserves §4 scope fencing in the format (0
+//! until multi-owner). `LegacyInsert` (type 4) carries the v1 debug row
+//! image (I8); the heap redo record (HEAP_INSERT, type 5) lands with its
+//! producer (T1.3). The file is page-cache-backed (`BufferedFile` +
+//! `fdatasync`) — the spec's `O_DIRECT` mandate is for *data pages*; the
+//! WAL is fsync'd sequential I/O, exactly PostgreSQL's model.
 
 pub mod format;
 mod io;
@@ -42,30 +47,53 @@ pub use io::{
 pub use recycle::{recycle_decision, RecycleDecision, RECYCLE_SEGMENT_BYTES};
 pub use writer::{Reservation, WalWriter};
 
-use cascade_types::{DatabaseId, Lsn};
+use cascade_types::{DatabaseId, Hlc, Lsn};
 
-/// A decoded WAL record. The debug slice uses `BeginTxn`/`CommitTxn`/
-/// `AbortTxn`/`Insert` (full row image, I8); new types extend the `type`
-/// byte without touching the layout (see [`format`]-reserved version field
-/// for format changes).
+/// A decoded WAL record — WP1 F3's type table. `BeginTxn`/`CommitTxn`/
+/// `AbortTxn`/`LegacyInsert` are the debug slice's records; the reserved
+/// families (heartbeat, high-water, bulk load, unlogged) decode today and
+/// gain producers when their features land. Type bytes are stable forever:
+/// new records extend the `type` byte, never renumber (see [`format`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WalRecord {
     BeginTxn {
         xid: u64,
     },
+    /// §6: the commit record carries txn_id (header `xid`) + commit_ts
+    /// (payload, the packed [`Hlc`]). Commit ordering comes from
+    /// commit_ts, never from LSN adjacency.
     CommitTxn {
         xid: u64,
+        commit_ts: Hlc,
     },
     AbortTxn {
         xid: u64,
     },
-    Insert {
+    /// Type 4 (LEGACY_INSERT): the v1 debug row image — retained so
+    /// existing logs replay verbatim. New code moves to HEAP_INSERT
+    /// (type 5) when its producer lands (T1.3); this variant is on its
+    /// way out.
+    LegacyInsert {
         xid: u64,
         /// The table's storage segment — where the row image lives.
         table: cascade_types::SegmentId,
         id: i32,
         val: String,
     },
+    /// §7 idle-scope advance (reserved): the scope's closed_ts moved to
+    /// `closed_ts` with no txn activity. Nothing emits it yet.
+    ClosedTsHeartbeat {
+        closed_ts: u64,
+    },
+    /// §6 primary restart (reserved): the scope's HLC had issued up to
+    /// `max_issued`. Nothing emits it yet.
+    HlcHighWater {
+        max_issued: u64,
+    },
+    /// §17 bulk load (reserved): payload shape lands with the bulk era.
+    BulkLoad,
+    /// §17 non-logged path (reserved).
+    UnloggedMarker,
 }
 
 #[derive(Debug)]
@@ -79,6 +107,22 @@ pub enum WalError {
     /// crash artifact, never fsynced (FR-25's filled-watermark twin on
     /// the read side). Recovery treats this as end-of-log.
     TornTail(Lsn),
+    /// A record whose header-declared LSN contradicts the position it was
+    /// read from: transplanted or hand-stomped bytes. The record may be
+    /// internally consistent (its CRC can still hold) — it is simply not
+    /// the record this log position promised. This check exists because
+    /// v2 records are self-describing (F3).
+    LsnMismatch {
+        at: Lsn,
+        declared: Lsn,
+    },
+    /// A complete-length record whose type byte this decoder does not
+    /// know — written by a newer producer. "Extend, never renumber" (F3)
+    /// means old decoders refuse loudly, named, instead of misreading.
+    UnknownRecordType {
+        at: Lsn,
+        type_byte: u8,
+    },
     UnknownRecordVersion(u32),
 }
 
@@ -92,6 +136,15 @@ impl std::fmt::Display for WalError {
             WalError::TornTail(lsn) => {
                 write!(f, "wal record at {lsn:?} is torn past end-of-file (incomplete write)")
             }
+            WalError::LsnMismatch { at, declared } => {
+                write!(
+                    f,
+                    "wal record at {at:?} declares LSN {declared:?} — transplanted bytes"
+                )
+            }
+            WalError::UnknownRecordType { at, type_byte } => {
+                write!(f, "wal record at {at:?} has unknown record type {type_byte}")
+            }
             WalError::UnknownRecordVersion(v) => write!(f, "wal record version {v} is unknown"),
         }
     }
@@ -100,8 +153,13 @@ impl std::fmt::Display for WalError {
 /// One decoded record and where to continue — the unit recovery walks by.
 #[derive(Debug)]
 pub struct WalEntry {
-    /// The record's LSN (its first byte).
+    /// The record's LSN (its first byte) — cross-checked against the
+    /// record's own declared LSN by the reader.
     pub lsn: Lsn,
+    /// The owner epoch the writing scope stamped into the header (§4
+    /// fencing; 0 until multi-owner). Recovery refuses records from
+    /// superseded epochs.
+    pub epoch: u64,
     pub record: WalRecord,
     /// One past the record's last byte: pass this as the next
     /// [`WalReader::read_record`] `start` to step through the log.

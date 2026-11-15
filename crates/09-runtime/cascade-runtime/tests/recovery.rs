@@ -67,13 +67,16 @@ fn write_txn(dir: &Path, id: i32, val: &str) -> Lsn {
     reactor().run(async {
         let h = WalHandle::open(dir, db()).await.expect("handle opens");
         let begin = w.append_wal(&WalRecord::BeginTxn { xid: id as u64 });
-        let insert = w.append_wal(&WalRecord::Insert {
+        let insert = w.append_wal(&WalRecord::LegacyInsert {
             xid: id as u64,
             table: SegmentId(1),
             id,
             val: val.to_owned(),
         });
-        let commit = w.append_wal(&WalRecord::CommitTxn { xid: id as u64 });
+        let commit = w.append_wal(&WalRecord::CommitTxn {
+            xid: id as u64,
+            commit_ts: cascade_types::Hlc(id as u64 + 1),
+        });
         let end = commit.end();
         let _ = begin.fill();
         let _ = insert.fill();
@@ -93,7 +96,7 @@ fn write_open_txn(dir: &Path, id: i32, val: &str) {
     reactor().run(async {
         let h = WalHandle::open(dir, db()).await.expect("handle opens");
         let begin = w.append_wal(&WalRecord::BeginTxn { xid: id as u64 });
-        let insert = w.append_wal(&WalRecord::Insert {
+        let insert = w.append_wal(&WalRecord::LegacyInsert {
             xid: id as u64,
             table: SegmentId(1),
             id,
@@ -114,7 +117,7 @@ fn wal_rows(dir: &Path) -> Vec<(i32, String)> {
         let mut rows = Vec::new();
         let mut cursor = Lsn(0);
         while let Some(entry) = r.read_record(cursor).await.expect("walks") {
-            if let WalRecord::Insert { id, val, .. } = entry.record {
+            if let WalRecord::LegacyInsert { id, val, .. } = entry.record {
                 rows.push((id, val));
             }
             cursor = entry.next;
@@ -172,7 +175,7 @@ fn torn_tail_truncates_and_boot_continues() {
         end_a.0,
         "the torn suffix is gone before any worker opens a handle"
     );
-    assert_eq!(end_b.0, end_a.0 + cascade_wal::format::encode(&WalRecord::BeginTxn { xid: 2 }).len() as u64 + cascade_wal::format::encode(&WalRecord::Insert { xid: 2, table: SegmentId(1), id: 2, val: "bb".into() }).len() as u64 + cascade_wal::format::encode(&WalRecord::CommitTxn { xid: 2 }).len() as u64, "test sanity: B was fully written before the cut");
+    assert_eq!(end_b.0, end_a.0 + cascade_wal::format::encode(&WalRecord::BeginTxn { xid: 2 }, Lsn(0), 0).len() as u64 + cascade_wal::format::encode(&WalRecord::LegacyInsert { xid: 2, table: SegmentId(1), id: 2, val: "bb".into() }, Lsn(0), 0).len() as u64 + cascade_wal::format::encode(&WalRecord::CommitTxn { xid: 2, commit_ts: cascade_types::Hlc(3) }, Lsn(0), 0).len() as u64, "test sanity: B was fully written before the cut");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

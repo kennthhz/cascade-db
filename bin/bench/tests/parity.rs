@@ -163,7 +163,7 @@ fn wal_shapes(wal_dir: &Path) -> Vec<String> {
             };
             shapes.push(match &entry.record {
                 WalRecord::BeginTxn { .. } => "begin".to_owned(),
-                WalRecord::Insert { id, val, .. } => format!("insert:({id},{val})"),
+                WalRecord::LegacyInsert { id, val, .. } => format!("insert:({id},{val})"),
                 WalRecord::CommitTxn { .. } => "commit".to_owned(),
                 other => format!("other:{other:?}"),
             });
