@@ -359,12 +359,23 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
     off += b.len() as u64;
     bytes.extend_from_slice(&b);
     for (id, val) in rows {
+        // The heap redo record (WP1 F3), the twin's shape of cascade's
+        // session::durable_commit: a fresh cascade-page cell (xmin tagged
+        // with this backend's xid) around the shared debug row image. The
+        // cell goes through cascade-page's encoder — the page format is
+        // that crate's one-way door, not the twin's to reinvent; the
+        // twin's independence lives in the wire protocol and the process
+        // model, exactly as it does for cascade_wal::format::encode.
+        let cell = cascade_page::encode_cell(
+            cascade_types::VersionWord::uncommitted(cascade_types::Xid(xid)),
+            &cascade_runtime::session::debug_row_image(*id, val),
+        )
+        .map_err(|e| ("54000".to_owned(), format!("row too large for a heap cell: {e}")))?;
         let b = format::encode(
-            &cascade_wal::WalRecord::LegacyInsert {
+            &cascade_wal::WalRecord::HeapInsert {
                 xid,
-                table: cascade_types::SegmentId(1),
-                id: *id,
-                val: val.clone(),
+                segment: cascade_types::SegmentId(1),
+                cell,
             },
             cascade_types::Lsn(off),
             0,

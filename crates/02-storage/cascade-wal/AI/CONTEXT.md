@@ -22,10 +22,13 @@ preceding bytes]` — `HEADER_LEN` 36.
 
 - **Type bytes are immutable forever** (F3's table in `format.rs`): 1
   BEGIN, 2 COMMIT (payload = packed `commit_ts` `Hlc`; header xid = the
-  txn), 3 ABORT, 4 LEGACY_INSERT (the v1 debug row image — retained so
-  existing logs replay; the runtime still emits it in the debug slice
-  until the HEAP_INSERT producer lands), 5 HEAP_INSERT (byte reserved;
-  variant/payload land with the heap redo producer), 6 CLOSED_TS_HEARTBEAT
+  txn), 3 ABORT, 4 LEGACY_INSERT (the v1 debug row image — decode
+  retained so logs written before T1.3 still replay; nothing emits it
+  anymore), 5 HEAP_INSERT (the heap redo record since T1.3 — payload
+  `[segment u32][cell bytes verbatim as cascade-page lays them down]`,
+  produced by the runtime and the pgmodel twin; the cell is opaque here
+  and parses only through cascade-page's `parse_cell`), 6
+  CLOSED_TS_HEARTBEAT
   (`closed_ts` u64), 7 HLC_HIGH_WATER (`max_issued` u64), 8 BULK_LOAD,
   9 UNLOGGED_MARKER (6–9 reserved, no producer yet; no-txn records stamp
   header xid 0). New types extend, never renumber — a decoder that meets a

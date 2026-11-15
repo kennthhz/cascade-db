@@ -147,6 +147,23 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
                         cascade_wal::WalRecord::LegacyInsert { xid, id, val, .. } => {
                             open.entry(xid).or_default().push((id, val));
                         }
+                        // The runtime's row image since T1.3: the row rides
+                        // in the cell's payload (session's debug row image);
+                        // the version words stay opaque to this walk —
+                        // buffering is keyed on the header xid, exactly as
+                        // it is for the legacy shape.
+                        cascade_wal::WalRecord::HeapInsert { xid, cell, .. } => {
+                            match cascade_page::parse_cell(&cell)
+                                .ok()
+                                .and_then(|c| crate::session::parse_debug_row(c.payload))
+                            {
+                                Some(row) => open.entry(xid).or_default().push(row),
+                                // A CRC-valid record whose cell won't parse
+                                // is a buggy encoder — refuse over it, never
+                                // serve a row nobody can vouch for.
+                                None => return Err(RecoveryError::Corrupt { lsn: cursor }),
+                            }
+                        }
                         // Commit order is replay order: the row vector is
                         // exactly what the acking boot served from its
                         // table.

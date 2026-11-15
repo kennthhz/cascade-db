@@ -10,6 +10,7 @@ description = "Thread-per-core async scheduler over io_uring. Pillar §3.2."
 
 [dependencies]
 cascade-types     = { workspace = true }
+cascade-page      = { workspace = true }
 cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-tenant    = { workspace = true }

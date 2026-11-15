@@ -164,6 +164,15 @@ fn wal_shapes(wal_dir: &Path) -> Vec<String> {
             shapes.push(match &entry.record {
                 WalRecord::BeginTxn { .. } => "begin".to_owned(),
                 WalRecord::LegacyInsert { id, val, .. } => format!("insert:({id},{val})"),
+                // The runtime's row image since T1.3: the row rides in the
+                // cell's payload — both architectures produce it, so the
+                // decoded shape stays the parity contract.
+                WalRecord::HeapInsert { cell, .. } => {
+                    let c = cascade_page::parse_cell(cell).expect("cell parses");
+                    let (id, val) = cascade_runtime::session::parse_debug_row(c.payload)
+                        .expect("row image parses");
+                    format!("insert:({id},{val})")
+                }
                 WalRecord::CommitTxn { .. } => "commit".to_owned(),
                 other => format!("other:{other:?}"),
             });

@@ -20,6 +20,7 @@ path = "src/bin/bench-harness.rs"
 cascade-types     = { workspace = true }
 cascade-runtime   = { workspace = true }
 cascade-wal       = { workspace = true }
+cascade-page      = { workspace = true }
 
 libc        = { workspace = true }
 

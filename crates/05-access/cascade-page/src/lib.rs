@@ -188,6 +188,57 @@ pub struct CellRef<'a> {
     pub payload: &'a [u8],
 }
 
+/// Encodes one standalone cell — `[len u16][xmin u64][xmax u64][next u64]
+/// [payload]` — byte-identical to what [`PageMut::append_cell`] lays down
+/// inside a page. This is the function the HEAP_INSERT redo record's
+/// "cell bytes verbatim as cascade-page lays them down" contract (WP1 F3)
+/// points at: WAL producers stamp cells through it, never by hand, so the
+/// log carries exactly the page format. Fresh cells are live and chain-end
+/// (`xmax`/`next` zero), same as [`PageMut::append_cell`]. Fails with
+/// [`PageError::CellTooLarge`] past the u16 cell-length ceiling.
+pub fn encode_cell(xmin: VersionWord, payload: &[u8]) -> Result<Vec<u8>, PageError> {
+    let cell_len = CELL_FIXED + payload.len();
+    if cell_len > u16::MAX as usize {
+        return Err(PageError::CellTooLarge);
+    }
+    let mut b = Vec::with_capacity(cell_len);
+    b.extend_from_slice(&(cell_len as u16).to_le_bytes());
+    b.extend_from_slice(&xmin.0.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes()); // xmax: live
+    b.extend_from_slice(&0u64.to_le_bytes()); // next: chain ends
+    b.extend_from_slice(payload);
+    Ok(b)
+}
+
+/// Parses a standalone cell (the [`encode_cell`] shape) into a [`CellRef`]
+/// borrowing `bytes`. Structural validation only — the same rules
+/// [`PageView::parse`] applies to cells: fixed-part minimum and length
+/// agreement. Version words stay opaque (invariant 3 — semantics are the
+/// visibility layer's).
+pub fn parse_cell(bytes: &[u8]) -> Result<CellRef<'_>, PageError> {
+    if bytes.len() < CELL_FIXED {
+        return Err(PageError::Malformed("cell shorter than its fixed part"));
+    }
+    let len = u16::from_le_bytes(bytes[..2].try_into().expect("2 bytes")) as usize;
+    if len != bytes.len() {
+        return Err(PageError::Malformed(
+            "cell length prefix disagrees with its byte count",
+        ));
+    }
+    Ok(CellRef {
+        xmin: VersionWord::from_raw(u64::from_le_bytes(
+            bytes[2..10].try_into().expect("8 bytes"),
+        )),
+        xmax: VersionWord::from_raw(u64::from_le_bytes(
+            bytes[10..18].try_into().expect("8 bytes"),
+        )),
+        next: NextWord::from_raw(u64::from_le_bytes(
+            bytes[18..26].try_into().expect("8 bytes"),
+        )),
+        payload: &bytes[CELL_FIXED..],
+    })
+}
+
 /// A validated, read-only page image.
 #[derive(Debug)]
 pub struct PageView<'a> {
@@ -672,5 +723,46 @@ mod tests {
         bad[0] = 1; // a real version, so we get past the initialization check
         bad[2] = 9; // wrong kind
         assert!(matches!(PageMut::wrap(&mut bad), Err(PageError::WrongKind(9))));
+    }
+
+    /// The HEAP_INSERT contract's "cell bytes verbatim as cascade-page lays
+    /// them down" (WP1 F3): the standalone encoder must produce exactly what
+    /// `append_cell` writes into a page — one code path, or the log and the
+    /// page drift. `parse_cell` inverts it, words and payload intact.
+    #[test]
+    fn standalone_cell_is_byte_identical_to_the_in_page_cell() {
+        let payload = b"the row image";
+        let cell = encode_cell(VersionWord::uncommitted(Xid(42)), payload).unwrap();
+
+        let mut img = [0u8; PAGE_SIZE];
+        PageMut::init(&mut img)
+            .append_cell(VersionWord::uncommitted(Xid(42)), payload)
+            .unwrap();
+        let off =
+            u16::from_le_bytes(img[SLOTS_BASE..SLOTS_BASE + 2].try_into().unwrap()) as usize;
+        let in_page = &img[off..off + cell.len()];
+        assert_eq!(cell, in_page, "verbatim means verbatim");
+
+        let r = parse_cell(&cell).unwrap();
+        assert_eq!(r.xmin, VersionWord::uncommitted(Xid(42)));
+        assert_eq!(r.xmax, VersionWord::EMPTY);
+        assert_eq!(r.next, NextWord::NONE);
+        assert_eq!(r.payload, payload);
+    }
+
+    /// Structural refusals: too-short, length-prefix disagreement, and the
+    /// u16 ceiling — parse and encode refuse before any caller can mistake
+    /// garbage for a cell.
+    #[test]
+    fn standalone_cell_refuses_structurally() {
+        assert!(matches!(parse_cell(&[0u8; 10]), Err(PageError::Malformed(_))));
+        let mut bad = encode_cell(VersionWord::EMPTY, b"ab").unwrap();
+        bad[..2].copy_from_slice(&99u16.to_le_bytes());
+        assert!(matches!(parse_cell(&bad), Err(PageError::Malformed(_))));
+        let big = vec![0u8; u16::MAX as usize - CELL_FIXED + 1];
+        assert!(matches!(
+            encode_cell(VersionWord::EMPTY, &big),
+            Err(PageError::CellTooLarge)
+        ));
     }
 }

@@ -27,10 +27,11 @@ use cascade_runtime::{
     config::{AuthConfig, NumaPool, NumaWorkers},
     pin,
     recovery::{self, RecoveryError, RecoveryPlan},
+    session,
     tenant,
     AcceptLoop, Runtime, RuntimeConfig,
 };
-use cascade_types::{DatabaseId, Lsn, SegmentId};
+use cascade_types::{DatabaseId, Lsn, SegmentId, VersionWord, Xid};
 use cascade_wal::{DebugWalReader, WalHandle, WalReader, WalRecord, WalWriter};
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -56,12 +57,49 @@ fn reactor() -> glommio::LocalExecutor {
         .expect("executor builds")
 }
 
+/// The record the runtime emits since T1.3: a fresh cascade-page cell
+/// (xmin tagged with the txn's xid, live, chain-end) around the session's
+/// debug row image, segment 1 = the debug table.
+fn heap_insert_record(xid: u64, id: i32, val: &str) -> WalRecord {
+    WalRecord::HeapInsert {
+        xid,
+        segment: SegmentId(1),
+        cell: cascade_page::encode_cell(
+            VersionWord::uncommitted(Xid(xid)),
+            &session::debug_row_image(id, val),
+        )
+        .expect("test rows fit in a cell"),
+    }
+}
+
 /// Appends one committed transaction (`begin, insert, commit`) to the log,
 /// resuming at the file's current end — the same watermarks a recovery
 /// boot hands its writer. Returns the commit record's end boundary. The
 /// protocol is `session::durable_commit`'s, built inline so crash shapes
 /// can be staged around it.
 fn write_txn(dir: &Path, id: i32, val: &str) -> Lsn {
+    let start = cascade_wal::log_len(dir, db()).expect("log length");
+    let w = Arc::new(WalWriter::new_at(Lsn(start)));
+    reactor().run(async {
+        let h = WalHandle::open(dir, db()).await.expect("handle opens");
+        let begin = w.append_wal(&WalRecord::BeginTxn { xid: id as u64 });
+        let insert = w.append_wal(&heap_insert_record(id as u64, id, val));
+        let commit = w.append_wal(&WalRecord::CommitTxn {
+            xid: id as u64,
+            commit_ts: cascade_types::Hlc(id as u64 + 1),
+        });
+        let end = commit.end();
+        let _ = begin.fill();
+        let _ = insert.fill();
+        let _ = commit.fill();
+        w.flush_wal(&h, end).await.expect("flush");
+        end
+    })
+}
+
+/// The pre-T1.3 write path, kept for staging legacy-shaped logs (F3's
+/// retention contract).
+fn write_legacy_txn(dir: &Path, id: i32, val: &str) -> Lsn {
     let start = cascade_wal::log_len(dir, db()).expect("log length");
     let w = Arc::new(WalWriter::new_at(Lsn(start)));
     reactor().run(async {
@@ -96,12 +134,7 @@ fn write_open_txn(dir: &Path, id: i32, val: &str) {
     reactor().run(async {
         let h = WalHandle::open(dir, db()).await.expect("handle opens");
         let begin = w.append_wal(&WalRecord::BeginTxn { xid: id as u64 });
-        let insert = w.append_wal(&WalRecord::LegacyInsert {
-            xid: id as u64,
-            table: SegmentId(1),
-            id,
-            val: val.to_owned(),
-        });
+        let insert = w.append_wal(&heap_insert_record(id as u64, id, val));
         let _ = begin.fill();
         let _ = insert.fill();
         let filled = w.filled();
@@ -109,16 +142,23 @@ fn write_open_txn(dir: &Path, id: i32, val: &str) {
     });
 }
 
-/// Every `Insert` record in the log, in log order — the read path a
-/// recovery walk uses, never raw file bytes.
+/// Every insert record in the log (either shape), in log order — the read
+/// path a recovery walk uses, never raw file bytes.
 fn wal_rows(dir: &Path) -> Vec<(i32, String)> {
     reactor().run(async {
         let r = DebugWalReader::open(dir, db()).await.expect("reader opens");
         let mut rows = Vec::new();
         let mut cursor = Lsn(0);
         while let Some(entry) = r.read_record(cursor).await.expect("walks") {
-            if let WalRecord::LegacyInsert { id, val, .. } = entry.record {
-                rows.push((id, val));
+            match entry.record {
+                WalRecord::LegacyInsert { id, val, .. } => rows.push((id, val)),
+                WalRecord::HeapInsert { cell, .. } => {
+                    let c = cascade_page::parse_cell(&cell).expect("cell parses");
+                    rows.push(
+                        session::parse_debug_row(c.payload).expect("row image parses"),
+                    );
+                }
+                _ => {}
             }
             cursor = entry.next;
         }
@@ -175,7 +215,7 @@ fn torn_tail_truncates_and_boot_continues() {
         end_a.0,
         "the torn suffix is gone before any worker opens a handle"
     );
-    assert_eq!(end_b.0, end_a.0 + cascade_wal::format::encode(&WalRecord::BeginTxn { xid: 2 }, Lsn(0), 0).len() as u64 + cascade_wal::format::encode(&WalRecord::LegacyInsert { xid: 2, table: SegmentId(1), id: 2, val: "bb".into() }, Lsn(0), 0).len() as u64 + cascade_wal::format::encode(&WalRecord::CommitTxn { xid: 2, commit_ts: cascade_types::Hlc(3) }, Lsn(0), 0).len() as u64, "test sanity: B was fully written before the cut");
+    assert_eq!(end_b.0, end_a.0 + cascade_wal::format::encode(&WalRecord::BeginTxn { xid: 2 }, Lsn(0), 0).len() as u64 + cascade_wal::format::encode(&heap_insert_record(2, 2, "bb"), Lsn(0), 0).len() as u64 + cascade_wal::format::encode(&WalRecord::CommitTxn { xid: 2, commit_ts: cascade_types::Hlc(3) }, Lsn(0), 0).len() as u64, "test sanity: B was fully written before the cut");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -365,4 +405,18 @@ fn transplanted_record_refuses_boot_by_name() {
         }
         other => panic!("expected named LsnMismatch, got {other:?}"),
     }
+}
+
+/// A log written before T1.3 carries LEGACY_INSERT (type 4) — F3 retains
+/// its decode so old logs keep replaying alongside HEAP_INSERT ones. This
+/// is the contract that lets the runtime switch its row image without a
+/// cut-over: until the last legacy log is gone, both shapes must replay.
+#[test]
+fn legacy_log_still_replays() {
+    let dir = temp_wal_dir();
+    write_legacy_txn(&dir, 1, "ancient");
+
+    let plan = recovery::prepare(&dir, db()).expect("prepares");
+    assert_eq!(plan.seed_rows, vec![(1, "ancient".to_owned())]);
+    let _ = std::fs::remove_dir_all(&dir);
 }

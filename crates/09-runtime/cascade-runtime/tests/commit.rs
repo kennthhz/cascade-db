@@ -16,7 +16,8 @@ use std::{
 
 use cascade_runtime::{
     config::{AuthConfig, NumaPool, NumaWorkers},
-    pin, AcceptLoop, Runtime, RuntimeConfig, SyntheticTopology,
+    pin, session,
+    AcceptLoop, Runtime, RuntimeConfig, SyntheticTopology,
 };
 use cascade_types::{DatabaseId, Lsn};
 use cascade_wal::{DebugWalReader, WalReader, WalRecord};
@@ -117,6 +118,22 @@ fn replay_committed_rows(dir: &Path) -> Vec<(i32, String)> {
             match entry.record {
                 WalRecord::BeginTxn { xid } => open.push((xid, Vec::new())),
                 WalRecord::LegacyInsert { xid, id, val, .. } => {
+                    open.iter_mut().for_each(|(x, r)| {
+                        if *x == xid {
+                            r.push((id, val.clone()));
+                        }
+                    });
+                }
+                // The runtime's row image since T1.3: the row rides in the
+                // cell's payload (the session's debug row image); a
+                // CRC-valid record whose cell won't parse is a bug this
+                // replay refuses loudly via expect.
+                WalRecord::HeapInsert { xid, cell, .. } => {
+                    let row = cascade_page::parse_cell(&cell)
+                        .expect("cell parses")
+                        .payload;
+                    let (id, val) =
+                        session::parse_debug_row(row).expect("row image parses");
                     open.iter_mut().for_each(|(x, r)| {
                         if *x == xid {
                             r.push((id, val.clone()));

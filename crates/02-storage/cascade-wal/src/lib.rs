@@ -30,9 +30,11 @@
 //! the DB's log file *and* the explicit header field, so records are
 //! self-describing (§5): the reader cross-checks the two and refuses a
 //! transplant. The epoch field reserves §4 scope fencing in the format (0
-//! until multi-owner). `LegacyInsert` (type 4) carries the v1 debug row
-//! image (I8); the heap redo record (HEAP_INSERT, type 5) lands with its
-//! producer (T1.3). The file is page-cache-backed (`BufferedFile` +
+//! until multi-owner). HEAP_INSERT (type 5) is the heap redo record —
+//! `[segment u32][cell bytes verbatim as cascade-page lays them down]` —
+//! the runtime's row image since T1.3. LEGACY_INSERT (type 4), the v1 debug
+//! row image, is decode-retained: logs written before the switch still
+//! replay, but nothing emits it anymore. The file is page-cache-backed (`BufferedFile` +
 //! `fdatasync`) — the spec's `O_DIRECT` mandate is for *data pages*; the
 //! WAL is fsync'd sequential I/O, exactly PostgreSQL's model.
 
@@ -50,8 +52,9 @@ pub use writer::{Reservation, WalWriter};
 use cascade_types::{DatabaseId, Hlc, Lsn};
 
 /// A decoded WAL record — WP1 F3's type table. `BeginTxn`/`CommitTxn`/
-/// `AbortTxn`/`LegacyInsert` are the debug slice's records; the reserved
-/// families (heartbeat, high-water, bulk load, unlogged) decode today and
+/// `AbortTxn`/`HeapInsert` are the debug slice's records; `LegacyInsert`
+/// (type 4) is retained for replay of pre-T1.3 logs; the reserved families
+/// (heartbeat, high-water, bulk load, unlogged) decode today and
 /// gain producers when their features land. Type bytes are stable forever:
 /// new records extend the `type` byte, never renumber (see [`format`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,16 +72,33 @@ pub enum WalRecord {
     AbortTxn {
         xid: u64,
     },
-    /// Type 4 (LEGACY_INSERT): the v1 debug row image — retained so
-    /// existing logs replay verbatim. New code moves to HEAP_INSERT
-    /// (type 5) when its producer lands (T1.3); this variant is on its
-    /// way out.
+    /// Type 4 (LEGACY_INSERT): the v1 debug row image — decode retained so
+    /// logs written before T1.3 still replay. Nothing emits it anymore;
+    /// the runtime's row image is [`WalRecord::HeapInsert`]. This variant
+    /// is on its way out.
     LegacyInsert {
         xid: u64,
         /// The table's storage segment — where the row image lives.
         table: cascade_types::SegmentId,
         id: i32,
         val: String,
+    },
+    /// Type 5 (HEAP_INSERT, §6): the heap redo record — payload
+    /// `[segment u32][cell bytes verbatim as cascade-page lays them down]`.
+    /// The cell is copied as-is from `cascade_page::encode_cell` (fresh:
+    /// live, chain-end); recovery and the future PageStore parse it with
+    /// `cascade_page::parse_cell`, never by hand. The header `xid` names
+    /// the inserting txn and the cell's `xmin` carries
+    /// `VersionWord::uncommitted(xid)` — visibility resolves through the
+    /// status table built from COMMIT/ABORT records (WP2), never by
+    /// rewriting cells.
+    HeapInsert {
+        xid: u64,
+        /// The storage segment the row image belongs to.
+        segment: cascade_types::SegmentId,
+        /// The cell bytes verbatim — opaque here; parsing is
+        /// cascade-page's.
+        cell: Vec<u8>,
     },
     /// §7 idle-scope advance (reserved): the scope's closed_ts moved to
     /// `closed_ts` with no txn activity. Nothing emits it yet.

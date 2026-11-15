@@ -22,7 +22,7 @@ use std::{
 
 use cascade_telemetry::Span;
 use cascade_tenant::TenantContext;
-use cascade_types::{Hlc, Lsn, SegmentId};
+use cascade_types::{Hlc, Lsn, SegmentId, VersionWord, Xid};
 use cascade_wal::{WalError, WalHandle, WalRecord, WalWriter};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use static_assertions::assert_not_impl_any;
@@ -47,6 +47,37 @@ type Row = (i32, String);
 /// The debug table's storage segment in WAL records (one logical table in
 /// the debug slice; the catalog assigns real segments in later milestones).
 const DEV_TABLE_SEG: SegmentId = SegmentId(1);
+
+/// The debug table's row image as it rides in a heap cell's payload:
+/// `[id i32][val_len u16][val bytes]`, LE (the segment lives in the
+/// HEAP_INSERT record, so the payload is just the row). Public because the
+/// format is a contract, not a secret: [`recovery`]'s replay and test
+/// fixtures stage the same bytes the session writes. The u16 value length
+/// is safe because [`cascade_page::encode_cell`] — which this payload
+/// always goes through — refuses a cell past `u16::MAX` before any bytes
+/// land.
+pub fn debug_row_image(id: i32, val: &str) -> Vec<u8> {
+    let mut p = Vec::with_capacity(6 + val.len());
+    p.extend_from_slice(&id.to_le_bytes());
+    p.extend_from_slice(&(val.len() as u16).to_le_bytes());
+    p.extend_from_slice(val.as_bytes());
+    p
+}
+
+/// The replay side of [`debug_row_image`]. `None` on a payload that
+/// disagrees with the shape — a CRC-valid record carrying one is a buggy
+/// encoder, and the caller refuses it as corruption.
+pub fn parse_debug_row(payload: &[u8]) -> Option<(i32, String)> {
+    if payload.len() < 6 {
+        return None;
+    }
+    let id = i32::from_le_bytes(payload[..4].try_into().expect("4 bytes"));
+    let val_len = u16::from_le_bytes(payload[4..6].try_into().expect("2 bytes")) as usize;
+    if payload.len() != 6 + val_len {
+        return None;
+    }
+    Some((id, String::from_utf8_lossy(&payload[6..]).into_owned()))
+}
 
 /// Process-wide transaction-id source for WAL records. The debug slice runs
 /// one process; per-DB xid generators come with the catalog.
@@ -1066,11 +1097,19 @@ async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
     let begin = writer.append_wal(&WalRecord::BeginTxn { xid });
     let mut inserts = Vec::with_capacity(rows.len());
     for (id, val) in rows {
-        inserts.push(writer.append_wal(&WalRecord::LegacyInsert {
+        // The heap redo record (WP1 F3): the cell is cascade-page's,
+        // verbatim — xmin tagged with this txn's Xid, live and chain-end.
+        // Visibility resolves through the commit's status-table entry
+        // (WP2); the cell itself is never rewritten.
+        let cell = cascade_page::encode_cell(
+            VersionWord::uncommitted(Xid(xid)),
+            &debug_row_image(*id, val),
+        )
+        .map_err(|e| PgError::new("54000", format!("row image too large for a heap cell: {e}")))?;
+        inserts.push(writer.append_wal(&WalRecord::HeapInsert {
             xid,
-            table: DEV_TABLE_SEG,
-            id: *id,
-            val: val.clone(),
+            segment: DEV_TABLE_SEG,
+            cell,
         }));
     }
     let commit = writer.append_wal(&WalRecord::CommitTxn {

@@ -44,9 +44,8 @@ pub const TYPE_ABORT: u8 = 3;
 /// producer lands (T1.3).
 pub const TYPE_LEGACY_INSERT: u8 = 4;
 /// §6 HEAP_INSERT (`[segment u32][cell bytes verbatim as cascade-page lays
-/// them down]`) — the type byte is reserved here; its variant and payload
-/// land with the heap redo producer (T1.3). Until then a decoder meeting
-/// byte 5 refuses it as *unknown* (version skew), never as corruption.
+/// them down]`) — the heap redo record, produced since T1.3; the cell is
+/// opaque here and parses only through cascade-page.
 pub const TYPE_HEAP_INSERT: u8 = 5;
 /// §7 idle-scope advance — payload `closed_ts` u64. Reserved: nothing
 /// emits it yet.
@@ -91,6 +90,11 @@ pub(crate) fn encoded_len(rec: &WalRecord) -> usize {
             | WalRecord::ClosedTsHeartbeat { .. }
             | WalRecord::HlcHighWater { .. } => 8,
             WalRecord::LegacyInsert { val, .. } => legacy_payload_len(val),
+            // `[segment u32][cell bytes verbatim]` — the cell is pre-built
+            // bytes, so the length is pure arithmetic with no failure path
+            // (the u16 ceiling is cascade-page's `encode_cell` gate, applied
+            // before a producer ever holds a cell).
+            WalRecord::HeapInsert { cell, .. } => 4 + cell.len(),
         }
 }
 
@@ -119,6 +123,12 @@ pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
             p.extend_from_slice(val.as_bytes());
             (TYPE_LEGACY_INSERT, p)
         }
+        WalRecord::HeapInsert { segment, cell, .. } => {
+            let mut p = Vec::with_capacity(4 + cell.len());
+            p.extend_from_slice(&segment.0.to_le_bytes());
+            p.extend_from_slice(cell);
+            (TYPE_HEAP_INSERT, p)
+        }
         WalRecord::ClosedTsHeartbeat { closed_ts } => (
             TYPE_CLOSED_TS_HEARTBEAT,
             closed_ts.to_le_bytes().to_vec(),
@@ -136,7 +146,8 @@ pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
         WalRecord::BeginTxn { xid }
         | WalRecord::CommitTxn { xid, .. }
         | WalRecord::AbortTxn { xid }
-        | WalRecord::LegacyInsert { xid, .. } => *xid,
+        | WalRecord::LegacyInsert { xid, .. }
+        | WalRecord::HeapInsert { xid, .. } => *xid,
         WalRecord::ClosedTsHeartbeat { .. }
         | WalRecord::HlcHighWater { .. }
         | WalRecord::BulkLoad
@@ -227,6 +238,21 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
                 val,
             }
         }
+        // `[segment u32][cell bytes verbatim]` — the cell is opaque at this
+        // boundary (cascade-page invariant): its structural validity is
+        // parse_cell's, at apply time. A CRC-valid record shorter than the
+        // segment field is a buggy encoder — the `_ => Corruption` arm
+        // below refuses it.
+        TYPE_HEAP_INSERT if payload.len() >= 4 => {
+            let segment = SegmentId(u32::from_le_bytes(
+                payload[..4].try_into().expect("4 bytes"),
+            ));
+            WalRecord::HeapInsert {
+                xid,
+                segment,
+                cell: payload[4..].to_vec(),
+            }
+        }
         TYPE_CLOSED_TS_HEARTBEAT if payload.len() == 8 => WalRecord::ClosedTsHeartbeat {
             closed_ts: u64::from_le_bytes(payload.try_into().expect("8 bytes")),
         },
@@ -246,12 +272,11 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
     })
 }
 
-/// The type bytes this decoder can actually decode. [`TYPE_HEAP_INSERT`]
-/// (5) is deliberately absent until its decode arm lands (T1.3): a byte
-/// this build cannot decode must refuse as
-/// [`DecodeError::UnknownRecordType`] — version skew, named — never as
-/// `Corruption`, which reads as bit rot and sends the operator chasing
-/// hardware.
+/// The type bytes this decoder can actually decode. A byte absent from
+/// this list must refuse as [`DecodeError::UnknownRecordType`] — version
+/// skew, named — never as `Corruption`, which reads as bit rot and sends
+/// the operator chasing hardware. All nine F3 bytes decode since T1.3
+/// (HEAP_INSERT's arm landed); the next addition is a *new* type byte.
 fn is_known_type(t: u8) -> bool {
     matches!(
         t,
@@ -259,6 +284,7 @@ fn is_known_type(t: u8) -> bool {
             | TYPE_COMMIT
             | TYPE_ABORT
             | TYPE_LEGACY_INSERT
+            | TYPE_HEAP_INSERT
             | TYPE_CLOSED_TS_HEARTBEAT
             | TYPE_HLC_HIGH_WATER
             | TYPE_BULK_LOAD
@@ -269,7 +295,7 @@ fn is_known_type(t: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cascade_types::SegmentId;
+    use cascade_types::{SegmentId, VersionWord, Xid};
 
     fn legacy_insert(xid: u64, id: i32, val: &str) -> WalRecord {
         WalRecord::LegacyInsert {
@@ -465,6 +491,11 @@ mod tests {
             },
             WalRecord::AbortTxn { xid: 4 },
             legacy_insert(5, 6, "row image"),
+            WalRecord::HeapInsert {
+                xid: 9,
+                segment: SegmentId(2),
+                cell: cascade_page::encode_cell(VersionWord::EMPTY, b"xyz").unwrap(),
+            },
             WalRecord::ClosedTsHeartbeat { closed_ts: 7 },
             WalRecord::HlcHighWater { max_issued: 8 },
             WalRecord::BulkLoad,
@@ -483,21 +514,108 @@ mod tests {
         let _ = encode(&legacy_insert(1, 2, &val), Lsn(0), 0);
     }
 
-    /// The reserved-but-undecodable type byte refuses *by name*: a
-    /// CRC-valid record of a type this build cannot decode is version
-    /// skew, and lumping it into Corruption misreads it as bit rot
-    /// (invariant 7). TYPE_HEAP_INSERT is the pinned case — reserved in
-    /// this build, decodable only once T1.3's arm lands.
+    /// The HEAP_INSERT golden literal — the type-5 one-way door, pinned
+    /// byte for byte: HeapInsert { xid: 5, segment: 7, cell = a fresh
+    /// 3-byte-payload cell } at LSN 0x1000, epoch 0. The cell bytes are
+    /// cascade-page's `[len][xmin = uncommitted(5)][xmax 0][next 0]
+    /// [payload]` verbatim; the CRC is verified algorithmically over the
+    /// pinned prefix.
     #[test]
-    fn reserved_type_5_refuses_by_name() {
+    fn heap_insert_bytes_are_pinned() {
+        let cell = cascade_page::encode_cell(VersionWord::uncommitted(Xid(5)), b"abc")
+            .expect("3-byte payload fits");
+        let bytes = encode(
+            &WalRecord::HeapInsert {
+                xid: 5,
+                segment: SegmentId(7),
+                cell: cell.clone(),
+            },
+            Lsn(0x1000),
+            0,
+        );
+        assert_eq!(cell.len(), 26 + 3, "test sanity: CELL_FIXED + payload");
+        let expected: [u8; 69] = [
+            // payload_len = 4 + 29 = 33; format_version = 2; type = 5; reserved
+            0x21, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            // xid = 5
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // lsn = 0x1000
+            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // epoch = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // payload: segment = 7
+            0x07, 0x00, 0x00, 0x00,
+            // cell: len = 29
+            0x1D, 0x00,
+            // xmin = uncommitted(5): xid with bit 63 set
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+            // xmax: live; next: chain ends
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+            // payload: "abc"
+            0x61, 0x62, 0x63,
+        ];
+        assert_eq!(bytes.len(), 69 + CRC_LEN);
+        assert_eq!(
+            bytes[..69],
+            expected[..],
+            "the HEAP_INSERT layout is a one-way door — this literal is its lock"
+        );
+        let crc = u32::from_le_bytes(bytes[69..].try_into().expect("4 bytes"));
+        assert_eq!(crc, crc32fast::hash(&bytes[..69]));
+    }
+
+    /// The HEAP_INSERT seam (WP1 F3 ↔ cascade-page): a cell built by
+    /// cascade-page rides through encode → decode byte-identical and
+    /// `parse_cell` reads it back, words and payload intact. "Verbatim"
+    /// pinned — the WAL never re-encodes a cell, so any drift here is a
+    /// bug, not a format decision.
+    #[test]
+    fn heap_insert_cell_is_verbatim_through_encode_decode() {
+        let payload = b"the debug row image";
+        let cell = cascade_page::encode_cell(VersionWord::uncommitted(Xid(77)), payload)
+            .expect("small payload fits");
+        let bytes = encode(
+            &WalRecord::HeapInsert {
+                xid: 77,
+                segment: SegmentId(3),
+                cell: cell.clone(),
+            },
+            Lsn(0x2000),
+            0,
+        );
+        let decoded = decode(&bytes).expect("decodes");
+        assert_eq!(decoded.total, bytes.len());
+        match decoded.record {
+            WalRecord::HeapInsert {
+                xid,
+                segment,
+                cell: out,
+            } => {
+                assert_eq!((xid, segment.0), (77, 3));
+                assert_eq!(out, cell, "cell bytes verbatim");
+                let r = cascade_page::parse_cell(&out).expect("parses");
+                assert_eq!(r.xmin, VersionWord::uncommitted(Xid(77)));
+                assert_eq!(r.xmax, VersionWord::EMPTY);
+                assert_eq!(r.next, cascade_page::NextWord::NONE);
+                assert_eq!(r.payload, payload);
+            }
+            other => panic!("wrong record: {other:?}"),
+        }
+    }
+
+    /// A CRC-valid HEAP_INSERT shorter than its segment field is corruption
+    /// — payload shape is part of the type contract, and the decoder
+    /// refuses rather than guess (only a buggy encoder produces one). The
+    /// pre-T1.3 twin of this test asserted byte 5 as *unknown*; the decode
+    /// arm landed, so the same byte now fails one step later, on shape.
+    #[test]
+    fn heap_insert_short_payload_is_corruption() {
         let mut bytes = encode(&WalRecord::BeginTxn { xid: 1 }, Lsn(0), 0);
         bytes[8] = TYPE_HEAP_INSERT;
         let n = bytes.len();
         let crc = crc32fast::hash(&bytes[..n - CRC_LEN]);
         bytes[n - CRC_LEN..].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(
-            decode(&bytes),
-            Err(DecodeError::UnknownRecordType(TYPE_HEAP_INSERT))
-        ));
+        assert!(matches!(decode(&bytes), Err(DecodeError::Corruption)));
     }
 }
