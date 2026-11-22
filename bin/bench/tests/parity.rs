@@ -168,8 +168,7 @@ fn wal_shapes(wal_dir: &Path) -> Vec<String> {
                 // cell's payload — both architectures produce it, so the
                 // decoded shape stays the parity contract.
                 WalRecord::HeapInsert { cell, .. } => {
-                    let c = cascade_page::parse_cell(cell).expect("cell parses");
-                    let (id, val) = cascade_runtime::session::parse_debug_row(c.payload)
+                    let (id, val) = cascade_runtime::session::parse_heap_insert_row(cell)
                         .expect("row image parses");
                     format!("insert:({id},{val})")
                 }

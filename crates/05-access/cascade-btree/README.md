@@ -1,6 +1,6 @@
 # cascade-btree
 
-B+Tree access method with Optimistic Lock Coupling (OLC).
+B+Tree access method.
 
 ## Role
 
@@ -14,7 +14,7 @@ Layer **05-access**. The primary index structure for Cascade DB. Used for primar
 
 ## Concurrency
 
-Optimistic Lock Coupling — readers proceed without latching, validating version counters; writers latch only the page being modified. Designed to scale linearly with cores under thread-per-core (§3.2).
+Per HLD v2 (docs/storage-subsystem-hld-v2.md): one writer per scope (§2 principle 1, §4) — all mutations to one tree are serialized on the owning core. Readers share pages through the page cache (§8); cross-core reader access is that section's open question. The concrete reader/writer protocol is pinned by the detailed design under `AI/`.
 
 ## Dependencies
 

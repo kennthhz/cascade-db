@@ -13,8 +13,11 @@ on — and the logical index-entry shape (`IndexEntry`/`Locator`).
   marker is what makes **NULLS LAST** (the global rule) hold bytewise, no
   per-type rule. Tags today: `0x01` INT (all widths canonicalized to i64,
   sign-flipped big-endian), `0x02` TEXT (bytewise/C collation, UTF-8 bytes
-  + `0x00` terminator), `0x03` BOOL. Tags are frozen bytes: extend, never
-  renumber — same law as the WAL's type bytes.
+  + `0x00` terminator; **NUL-bearing values refuse** — PG rejects 0x00 in
+  text, and an interior NUL would be byte-identical to the terminator,
+  breaking prefix-freeness and concatenated-key ordering), `0x03` BOOL.
+  Tags are frozen bytes: extend, never renumber — same law as the WAL's
+  type bytes.
 - Equality and ordering are defined **on the normalized bytes** (invariant
   7), never on decoded values. Multi-column keys are concatenations;
   prefix scans are ranges over the concatenation (`KeyRange::prefix_bytes`,

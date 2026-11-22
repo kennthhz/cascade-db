@@ -76,7 +76,20 @@ pub fn parse_debug_row(payload: &[u8]) -> Option<(i32, String)> {
     if payload.len() != 6 + val_len {
         return None;
     }
-    Some((id, String::from_utf8_lossy(&payload[6..]).into_owned()))
+    // Strict UTF-8: a shape-valid image with undecodable bytes is not a
+    // row — `None` refuses it (recovery maps None to Corrupt) instead of
+    // coercing to U+FFFD and serving a row nobody can vouch for.
+    String::from_utf8(payload[6..].to_vec()).ok().map(|val| (id, val))
+}
+
+/// The HEAP_INSERT record's cell, decoded to the debug row it carries —
+/// the one decode path for the row image (parse_cell + [`parse_debug_row`]
+/// composed). `None` on any shape disagreement; recovery maps `None` to a
+/// named `Corrupt` refusal, tests and the parity suite unwrap.
+pub fn parse_heap_insert_row(cell: &[u8]) -> Option<(i32, String)> {
+    cascade_page::parse_cell(cell)
+        .ok()
+        .and_then(|c| parse_debug_row(c.payload))
 }
 
 /// Process-wide transaction-id source for WAL records. The debug slice runs
@@ -1094,18 +1107,26 @@ async fn execute<W: AsyncWrite + Unpin>(
 async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
     let xid = next_xid();
     let writer = &wal.writer;
+    // Encode every cell BEFORE any reservation (the reserve-before-encode
+    // law, F3): the encode is pure arithmetic and can fail on a legitimate
+    // client value, and an error after `BeginTxn` reserved would drop the
+    // reservation unfilled — a torn log whose filled watermark never
+    // advances, wedging every later commit on the DB. The cell is
+    // cascade-page's, verbatim — xmin tagged with this txn's Xid, live and
+    // chain-end. Visibility resolves through the commit's status-table
+    // entry (WP2); the cell itself is never rewritten.
+    let mut cells = Vec::with_capacity(rows.len());
+    for (id, val) in rows {
+        cells.push(
+            cascade_page::encode_cell(VersionWord::uncommitted(Xid(xid)), &debug_row_image(*id, val))
+                .map_err(|e| {
+                    PgError::new("54000", format!("row image too large for a heap cell: {e}"))
+                })?,
+        );
+    }
     let begin = writer.append_wal(&WalRecord::BeginTxn { xid });
     let mut inserts = Vec::with_capacity(rows.len());
-    for (id, val) in rows {
-        // The heap redo record (WP1 F3): the cell is cascade-page's,
-        // verbatim — xmin tagged with this txn's Xid, live and chain-end.
-        // Visibility resolves through the commit's status-table entry
-        // (WP2); the cell itself is never rewritten.
-        let cell = cascade_page::encode_cell(
-            VersionWord::uncommitted(Xid(xid)),
-            &debug_row_image(*id, val),
-        )
-        .map_err(|e| PgError::new("54000", format!("row image too large for a heap cell: {e}")))?;
+    for cell in cells {
         inserts.push(writer.append_wal(&WalRecord::HeapInsert {
             xid,
             segment: DEV_TABLE_SEG,

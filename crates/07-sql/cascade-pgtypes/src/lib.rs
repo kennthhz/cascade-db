@@ -63,7 +63,10 @@ pub mod tag {
 /// Equality and ordering are defined *on these bytes* — bytewise, exactly
 /// what `Vec<u8>`'s derived `Ord` does — never on the decoded value
 /// (invariant 7). Non-null encodings are `[tag][payload]`; NULL is a bare
-/// `[0xFF]`. Multi-column keys are the concatenation of per-column
+/// `[0xFF]`. The encoders below define the legal encodings — a hand-built
+/// `KeyBytes` outside that domain (say, a text payload with an interior
+/// NUL) has no contract here. Multi-column keys are the concatenation of
+/// per-column
 /// encodings ([`concat`]); prefix scans are ranges over the concatenation
 /// ([`KeyRange::prefix_bytes`], [`KeyRange::text_prefix`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -91,32 +94,60 @@ pub fn decode_int8(k: &KeyBytes) -> Option<i64> {
     Some(raw ^ i64::MIN)
 }
 
+/// The refusal for a text value a key must not carry: a NUL byte.
+/// PostgreSQL rejects `0x00` in text at input, so no legal text value
+/// contains one — and an interior NUL would make the encoding
+/// non-prefix-free (it is byte-identical to the terminator mid-stream),
+/// breaking concatenated keys' ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NulInText;
+
+impl std::fmt::Display for NulInText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "text value contains a NUL byte: PostgreSQL rejects 0x00 in text, \
+             and a NUL would break the key encoding's prefix-freeness"
+        )
+    }
+}
+
+impl std::error::Error for NulInText {}
+
 /// UTF-8 text under **bytewise (C) collation**: `[TEXT][utf8 bytes][0x00]`.
 ///
-/// Order-preserving by two properties of the domain: UTF-8 byte order is
-/// code-point order, and interior `0x00` bytes compare exactly as
-/// themselves against payload bytes — the trailing `0x00` terminator only
-/// ever breaks a tie in favor of the shorter string, which is the correct
-/// lexicographic verdict (a strict prefix sorts first). The terminator
-/// also makes the encoding prefix-free, which [`KeyRange::text_prefix`]
-/// exploits. A non-C collation is *not* order-preserving under this
-/// encoding — invariant 7 gates its participation in an index until a
-/// collation-aware normalization lands here.
-pub fn encode_text(v: &str) -> KeyBytes {
+/// Order-preserving on the legal domain (a value without NULs): UTF-8 byte
+/// order is code-point order, and the trailing `0x00` terminator only ever
+/// breaks a tie in favor of the shorter string — the correct lexicographic
+/// verdict (a strict prefix sorts first). Because the domain excludes
+/// interior NULs ([`NulInText`]), no legal encoding has another legal
+/// encoding as a byte-prefix — the prefix-freeness [`concat`] and
+/// [`KeyRange::text_prefix`] rely on. A non-C collation is *not*
+/// order-preserving under this encoding — invariant 7 gates its
+/// participation in an index until a collation-aware normalization lands.
+pub fn encode_text(v: &str) -> Result<KeyBytes, NulInText> {
+    if v.as_bytes().contains(&0) {
+        return Err(NulInText);
+    }
     let mut b = Vec::with_capacity(2 + v.len());
     b.push(tag::TEXT);
     b.extend_from_slice(v.as_bytes());
     b.push(0);
-    KeyBytes(b)
+    Ok(KeyBytes(b))
 }
 
-/// The inverse of [`encode_text`] (`None` on a key that is not one).
+/// The inverse of [`encode_text`] (`None` on a key that is not one —
+/// including an interior-NUL payload, which no legal encoding carries).
 pub fn decode_text(k: &KeyBytes) -> Option<String> {
     let b = k.0.as_slice();
     if b.len() < 2 || b[0] != tag::TEXT || *b.last().expect("len >= 2 checked") != 0 {
         return None;
     }
-    String::from_utf8(b[1..b.len() - 1].to_vec()).ok()
+    let payload = &b[1..b.len() - 1];
+    if payload.contains(&0) {
+        return None;
+    }
+    String::from_utf8(payload.to_vec()).ok()
 }
 
 /// Boolean: `[BOOL][0x00]` for `false`, `[BOOL][0x01]` for `true`.
@@ -147,7 +178,9 @@ pub fn is_null(k: &KeyBytes) -> bool {
 /// Multi-column keys are the concatenation of per-column encodings (WP1
 /// F4): bytewise compare over the concatenation is lexicographic compare
 /// over the columns, because every per-column encoding is order-preserving
-/// and self-terminating (fixed-width, terminator, or the bare null marker).
+/// and self-terminating — fixed-width, an *unambiguous* terminator (the
+/// legal text domain excludes NULs, so no payload byte collides with it),
+/// or the bare null marker.
 pub fn concat(parts: &[KeyBytes]) -> KeyBytes {
     let mut b = Vec::with_capacity(parts.iter().map(|k| k.0.len()).sum());
     for k in parts {
@@ -197,19 +230,27 @@ impl KeyRange {
         }
     }
 
-    /// Every text value with prefix `p` — the string-scan shape. Lower is
-    /// `p`'s own encoding; the excluded upper appends `0xFF` to the payload
-    /// (no terminator), which every continuation byte of a UTF-8 payload
-    /// (`0x00..0xF4`, terminator included) sorts below, and no other valid
-    /// text key can reach.
+    /// Every text value with prefix `p` — the string-scan shape. The lower
+    /// bound is `p`'s own encoding; the excluded upper appends `0xFF` to
+    /// the payload (no terminator), which every continuation byte of a
+    /// UTF-8 payload (`0x00..0xF4`, terminator included) sorts below, and
+    /// no other valid text key can reach. A NUL-bearing `p` — illegal in a
+    /// *value* ([`NulInText`]) — builds a range no legal key falls into
+    /// (every legal payload is NUL-free), so the constructor stays
+    /// infallible: [`encode_text`] is the loud half of the refusal, this
+    /// the vacuous half.
     pub fn text_prefix(p: &str) -> Self {
-        let mut b = Vec::with_capacity(2 + p.len());
-        b.push(tag::TEXT);
-        b.extend_from_slice(p.as_bytes());
-        b.push(0xFF);
+        let mut lower = Vec::with_capacity(2 + p.len());
+        lower.push(tag::TEXT);
+        lower.extend_from_slice(p.as_bytes());
+        lower.push(0);
+        let mut upper = Vec::with_capacity(2 + p.len());
+        upper.push(tag::TEXT);
+        upper.extend_from_slice(p.as_bytes());
+        upper.push(0xFF);
         KeyRange {
-            lower: Bound::Included(encode_text(p)),
-            upper: Bound::Excluded(KeyBytes(b)),
+            lower: Bound::Included(KeyBytes(lower)),
+            upper: Bound::Excluded(KeyBytes(upper)),
         }
     }
 }
@@ -307,20 +348,26 @@ mod key_tests {
         );
     }
 
-    /// Text ordering is lexicographic, shorter-prefix first, interior
-    /// NULs included in the ordering (they are ordinary payload bytes).
+    /// Text ordering is lexicographic, shorter-prefix first. The legal
+    /// text domain excludes NULs (PG rejects 0x00 in text — an interior
+    /// NUL would collide with the terminator and break prefix-freeness),
+    /// so the encoder refuses them and the decoders agree.
     #[test]
     fn text_keys_order_like_the_strings() {
-        let vs = ["", "a", "a\0", "a\0b", "ab", "b", "é", "🦀"];
+        let vs = ["", "a", "ab", "b", "é", "🦀"];
         for w in vs.windows(2) {
-            assert!(
-                encode_text(w[0]) < encode_text(w[1]),
-                "{:?} must sort below {:?}",
-                w[0],
-                w[1]
-            );
+            let (k0, k1) = (encode_text(w[0]).expect("legal"), encode_text(w[1]).expect("legal"));
+            assert!(k0 < k1, "{:?} must sort below {:?}", w[0], w[1]);
         }
-        assert_eq!(encode_text("ab").0, vec![tag::TEXT, b'a', b'b', 0]);
+        assert_eq!(
+            encode_text("ab").expect("legal").0,
+            vec![tag::TEXT, b'a', b'b', 0]
+        );
+        // The refusal: any NUL anywhere in the value, and the decoders
+        // never manufacture a value for such a key.
+        assert_eq!(encode_text("a\0"), Err(NulInText));
+        assert_eq!(encode_text("\0"), Err(NulInText));
+        assert_eq!(decode_text(&KeyBytes(vec![tag::TEXT, b'a', 0, 0])), None);
     }
 
     /// NULLS LAST is bytewise and global: the bare 0xFF marker sorts above
@@ -329,7 +376,7 @@ mod key_tests {
     fn null_sorts_last_over_every_type() {
         let null = encode_null();
         assert!(null > encode_int8(i64::MAX));
-        assert!(null > encode_text("🦀🦀🦀"));
+        assert!(null > encode_text("🦀🦀🦀").expect("legal"));
         assert!(null > encode_bool(true));
         assert!(is_null(&null));
         assert!(!is_null(&encode_int8(0)));
@@ -342,13 +389,16 @@ mod key_tests {
         for v in [i64::MIN, -1, 0, 1, i64::MAX] {
             assert_eq!(decode_int8(&encode_int8(v)), Some(v));
         }
-        for v in ["", "ab", "a\0b", "é🦀"] {
-            assert_eq!(decode_text(&encode_text(v)), Some(v.to_owned()));
+        for v in ["", "ab", "é🦀"] {
+            assert_eq!(
+                decode_text(&encode_text(v).expect("legal")),
+                Some(v.to_owned())
+            );
         }
         for v in [false, true] {
             assert_eq!(decode_bool(&encode_bool(v)), Some(v));
         }
-        assert_eq!(decode_int8(&encode_text("not an int")), None);
+        assert_eq!(decode_int8(&encode_text("not an int").expect("legal")), None);
         assert_eq!(decode_text(&encode_int8(5)), None);
         assert_eq!(decode_bool(&encode_null()), None);
     }
@@ -358,10 +408,12 @@ mod key_tests {
     /// canonicalization lets int4-shaped values ride the int8 encoding.
     #[test]
     fn concatenated_keys_order_lexicographically() {
-        let k = |a: i64, b: &str| concat(&[encode_int8(a), encode_text(b)]);
+        let k = |a: i64, b: &str| {
+            concat(&[encode_int8(a), encode_text(b).expect("legal")])
+        };
         assert!(k(1, "a") < k(2, "a"), "first column dominates");
         assert!(k(1, "a") < k(1, "b"), "second column breaks ties");
-        assert!(k(1, "a") < k(1, "a\0b"), "ties extend lexicographically");
+        assert!(k(1, "a") < k(1, "aa"), "ties extend lexicographically");
         assert!(k(1, "z") < k(2, "a"), "second column never beats the first");
     }
 
@@ -371,18 +423,18 @@ mod key_tests {
     #[test]
     fn text_prefix_range_covers_exactly_the_prefix() {
         let r = KeyRange::text_prefix("ab");
-        let inside = ["ab", "ab\0", "ab\0b", "abc", "abé🦀"];
+        let inside = ["ab", "abc", "abé🦀", "abzzz"];
         for s in inside {
-            let k = encode_text(s);
+            let k = encode_text(s).expect("legal");
             assert!(
                 matches!(r.lower, Bound::Included(ref lo) if *lo <= k)
                     && matches!(r.upper, Bound::Excluded(ref hi) if k < *hi),
                 "{s:?} must be inside the ab-prefix range"
             );
         }
-        let outside = ["", "a", "a\0b", "ac", "b"];
+        let outside = ["", "a", "aab", "ac", "b"];
         for s in outside {
-            let k = encode_text(s);
+            let k = encode_text(s).expect("legal");
             let below = matches!(r.lower, Bound::Included(ref lo) if k < *lo);
             let above = matches!(r.upper, Bound::Excluded(ref hi) if k >= *hi);
             assert!(
@@ -396,17 +448,17 @@ mod key_tests {
     /// range (the excluded upper's second 0xFF outranks the bare marker).
     #[test]
     fn column_prefix_keeps_null_continuations() {
-        let fixed = concat(&[encode_int8(1), encode_text("a")]);
+        let fixed = concat(&[encode_int8(1), encode_text("a").expect("legal")]);
         let r = KeyRange::prefix_bytes(fixed);
-        let k = concat(&[encode_int8(1), encode_text("a"), encode_null()]);
+        let k = concat(&[encode_int8(1), encode_text("a").expect("legal"), encode_null()]);
         assert!(matches!(r.lower, Bound::Included(ref lo) if *lo <= k));
         assert!(matches!(r.upper, Bound::Excluded(ref hi) if k < *hi));
         // A different second column is above the range ('b' > 'a': the key
         // outruns the excluded upper at the differing column byte).
-        let above = concat(&[encode_int8(1), encode_text("b")]);
+        let above = concat(&[encode_int8(1), encode_text("b").expect("legal")]);
         assert!(matches!(r.upper, Bound::Excluded(ref hi) if above >= *hi));
         // A smaller first column is below it, never inside.
-        let below = concat(&[encode_int8(0), encode_text("zzzz")]);
+        let below = concat(&[encode_int8(0), encode_text("zzzz").expect("legal")]);
         assert!(matches!(r.lower, Bound::Included(ref lo) if below < *lo));
     }
 
@@ -419,7 +471,10 @@ mod key_tests {
             encode_int8(1).0,
             vec![tag::INT, 0x80, 0, 0, 0, 0, 0, 0, 1]
         );
-        assert_eq!(encode_text("ab").0, vec![tag::TEXT, b'a', b'b', 0]);
+        assert_eq!(
+            encode_text("ab").expect("legal").0,
+            vec![tag::TEXT, b'a', b'b', 0]
+        );
         assert_eq!(encode_null().0, vec![0xFF]);
         assert_eq!(encode_bool(false).0, vec![tag::BOOL, 0]);
         let e = IndexEntry {
@@ -442,9 +497,10 @@ mod key_tests {
                 0, 0, 0, 0, 0, 0, 0, 0, // delete: EMPTY (live)
             ]
         );
+        let k = encode_text("k").expect("legal");
         let e = IndexEntry {
-            key: encode_text("k"),
-            locator: Locator::Pk(encode_text("k")),
+            key: k.clone(),
+            locator: Locator::Pk(k),
             create: VersionWord::committed(cascade_types::Hlc(7)),
             delete: VersionWord::EMPTY,
         };

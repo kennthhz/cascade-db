@@ -153,9 +153,7 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
                         // buffering is keyed on the header xid, exactly as
                         // it is for the legacy shape.
                         cascade_wal::WalRecord::HeapInsert { xid, cell, .. } => {
-                            match cascade_page::parse_cell(&cell)
-                                .ok()
-                                .and_then(|c| crate::session::parse_debug_row(c.payload))
+                            match crate::session::parse_heap_insert_row(&cell)
                             {
                                 Some(row) => open.entry(xid).or_default().push(row),
                                 // A CRC-valid record whose cell won't parse

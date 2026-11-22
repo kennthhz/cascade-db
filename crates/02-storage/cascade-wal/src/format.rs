@@ -230,7 +230,13 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
             if payload.len() != 10 + val_len {
                 return Err(DecodeError::Corruption);
             }
-            let val = String::from_utf8_lossy(&payload[10..]).into_owned();
+            // Strict UTF-8: a CRC-valid record whose value bytes are not
+            // UTF-8 is a buggy encoder's output — corruption, never a
+            // coerced-to-U+FFFD row replay would serve.
+            let val = match String::from_utf8(payload[10..].to_vec()) {
+                Ok(val) => val,
+                Err(_) => return Err(DecodeError::Corruption),
+            };
             WalRecord::LegacyInsert {
                 xid,
                 table,
@@ -617,5 +623,150 @@ mod tests {
         let crc = crc32fast::hash(&bytes[..n - CRC_LEN]);
         bytes[n - CRC_LEN..].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(decode(&bytes), Err(DecodeError::Corruption)));
+    }
+
+    /// Decode law (T1.5): a CRC-valid LEGACY_INSERT whose value bytes are
+    /// not UTF-8 is corruption — the decoder refuses, it never coerces to
+    /// U+FFFD and hands replay a row nobody wrote. The CRC is restamped so
+    /// the value bytes are the *only* flaw.
+    #[test]
+    fn legacy_insert_decode_refuses_non_utf8_value() {
+        let rec = legacy_insert(1, 5, "victim");
+        let mut bytes = encode(&rec, Lsn(0x2000), 0);
+        // The value is the payload's last 6 bytes, ending right before the
+        // CRC — overwrite them with 0xFD, which is invalid in any UTF-8
+        // position, then re-stamp the CRC over the mutated prefix.
+        let crc_at = bytes.len() - CRC_LEN;
+        for b in &mut bytes[crc_at - 6..crc_at] {
+            *b = 0xFD;
+        }
+        let crc = crc32fast::hash(&bytes[..crc_at]);
+        bytes[crc_at..].copy_from_slice(&crc.to_le_bytes());
+        match decode(&bytes) {
+            Err(DecodeError::Corruption) => {}
+            other => panic!("non-UTF-8 value must refuse as Corruption, got {other:?}"),
+        }
+    }
+
+    /// T1.5 roundtrip law: decode inverts encode for EVERY variant — the
+    /// reserved families (6–9) included, sampled payloads (deterministic
+    /// xorshift, replayable from the seed) — and `encoded_len` agrees with
+    /// the encoded size throughout (the reserve-before-encode precondition).
+    #[test]
+    fn every_variant_roundtrips_with_sampled_payloads() {
+        let mut s = 0x57A1_C0DE_F00D_BEEFu64;
+        let mut next = move || {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            s.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut records = Vec::new();
+        for i in 0..4u64 {
+            let len = (next() % 96) as usize;
+            let cell = cascade_page::encode_cell(
+                VersionWord::uncommitted(Xid(100 + i)),
+                &next().to_le_bytes().repeat(len / 8 + 1)[..len],
+            )
+            .expect("small cells fit");
+            records.push(WalRecord::HeapInsert {
+                xid: 100 + i,
+                segment: SegmentId(next() as u32),
+                cell,
+            });
+        }
+        records.push(WalRecord::BeginTxn { xid: next() });
+        records.push(WalRecord::AbortTxn { xid: next() });
+        records.push(WalRecord::CommitTxn {
+            xid: next() % (1 << 63),
+            commit_ts: Hlc(next() % (1 << 63)),
+        });
+        records.push(legacy_insert(
+            next(),
+            next() as i32,
+            &"row image".repeat((next() % 8) as usize),
+        ));
+        records.push(WalRecord::ClosedTsHeartbeat {
+            closed_ts: next(),
+        });
+        records.push(WalRecord::HlcHighWater { max_issued: next() });
+        records.push(WalRecord::BulkLoad);
+        records.push(WalRecord::UnloggedMarker);
+
+        for rec in &records {
+            let (lsn, epoch) = (Lsn(next()), next());
+            let bytes = encode(rec, lsn, epoch);
+            assert_eq!(encoded_len(rec), bytes.len(), "{rec:?}: reserve == encode");
+            let d = decode(&bytes).expect("every variant decodes");
+            assert_eq!(d.record, *rec, "{rec:?}: roundtrip is exact");
+            assert_eq!(d.total, bytes.len());
+            assert_eq!(d.lsn, lsn.0, "self-describing lsn");
+            assert_eq!(d.epoch, epoch, "self-describing epoch");
+        }
+    }
+
+    /// Header-xid law (F3): the txn-carrying types (1–5) stamp the
+    /// variant's xid; the no-txn families (6–9) stamp 0 — a decoder can
+    /// tell them apart from the header alone.
+    #[test]
+    fn header_xid_is_variant_xid_or_zero_for_no_txn_families() {
+        let cell = cascade_page::encode_cell(VersionWord::EMPTY, b"c").expect("fits");
+        let cases: [(WalRecord, u64); 9] = [
+            (WalRecord::BeginTxn { xid: 7 }, 7),
+            (
+                WalRecord::CommitTxn {
+                    xid: 7,
+                    commit_ts: Hlc(1),
+                },
+                7,
+            ),
+            (WalRecord::AbortTxn { xid: 7 }, 7),
+            (legacy_insert(7, 1, "v"), 7),
+            (
+                WalRecord::HeapInsert {
+                    xid: 7,
+                    segment: SegmentId(1),
+                    cell: cell.clone(),
+                },
+                7,
+            ),
+            (WalRecord::ClosedTsHeartbeat { closed_ts: 1 }, 0),
+            (WalRecord::HlcHighWater { max_issued: 1 }, 0),
+            (WalRecord::BulkLoad, 0),
+            (WalRecord::UnloggedMarker, 0),
+        ];
+        for (rec, want) in cases {
+            let b = encode(&rec, Lsn(0), 0);
+            assert_eq!(
+                u64::from_le_bytes(b[12..20].try_into().expect("8 bytes")),
+                want,
+                "{rec:?}: header xid"
+            );
+        }
+    }
+
+    /// The three reserved header bytes stay zero in every encoding — they
+    /// are the §6.3 retrofit surface, not scratch space, and a producer
+    /// that dirties them would pin garbage into every future reader's
+    /// assumptions.
+    #[test]
+    fn reserved_header_bytes_stay_zero() {
+        let cell = cascade_page::encode_cell(VersionWord::EMPTY, b"c").expect("fits");
+        for rec in [
+            WalRecord::BeginTxn { xid: 1 },
+            WalRecord::CommitTxn {
+                xid: 2,
+                commit_ts: Hlc(3),
+            },
+            WalRecord::HeapInsert {
+                xid: 4,
+                segment: SegmentId(5),
+                cell,
+            },
+            WalRecord::BulkLoad,
+        ] {
+            let b = encode(&rec, Lsn(0), 0);
+            assert_eq!(&b[9..12], &[0u8; 3], "{rec:?}: reserved bytes");
+        }
     }
 }

@@ -129,11 +129,8 @@ fn replay_committed_rows(dir: &Path) -> Vec<(i32, String)> {
                 // CRC-valid record whose cell won't parse is a bug this
                 // replay refuses loudly via expect.
                 WalRecord::HeapInsert { xid, cell, .. } => {
-                    let row = cascade_page::parse_cell(&cell)
-                        .expect("cell parses")
-                        .payload;
                     let (id, val) =
-                        session::parse_debug_row(row).expect("row image parses");
+                        session::parse_heap_insert_row(&cell).expect("row image parses");
                     open.iter_mut().for_each(|(x, r)| {
                         if *x == xid {
                             r.push((id, val.clone()));
@@ -254,6 +251,52 @@ fn explicit_rollback_writes_nothing_to_the_wal() {
         replay_committed_rows(&fx.wal_dir),
         Vec::new(),
         "rollback leaves the log untouched"
+    );
+}
+
+/// T1.5 contract: a row too large for a heap cell refuses with SQLSTATE
+/// 54000 — and the refusal must leave the writer healthy, every later
+/// commit still reserving, filling, and becoming durable. This pins the
+/// reserve-before-encode discipline on the session's commit path: a failable
+/// encode *after* a reservation drops it unfilled, the filled watermark
+/// stops at the hole forever, and every later commit on the DB wedges.
+#[test]
+fn oversized_row_refuses_54000_and_the_writer_stays_healthy() {
+    let fx = boot();
+    let mut c = client(&fx);
+    // The cell ceiling: 26 fixed bytes + the row image (6 + val) must fit
+    // u16::MAX, so a 70_000-char value is far past it — reachable from a
+    // legitimate client (the wire allows megabyte messages).
+    let big = "x".repeat(70_000);
+    let err = c
+        .simple_query(&format!("INSERT INTO debug_table VALUES (1, '{big}')"))
+        .expect_err("the oversized insert must refuse");
+    let db_err = err.as_db_error().expect("a SQL-state error, not a disconnect");
+    assert_eq!(db_err.code().code(), "54000", "the refusal's SQLSTATE");
+
+    // The writer must be unharmed: a normal autocommit INSERT — one that
+    // traverses the same reservation path, past the refused position —
+    // must ack and land. (A hang here is the torn reservation: the
+    // bounded channel turns that wedge into the red.)
+    let url = fx.url.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = postgres::Client::connect(&url, postgres::NoTls).and_then(|mut c2| {
+            c2.simple_query("INSERT INTO debug_table VALUES (2, 'after')")
+                .map(|_| ())
+        });
+        let _ = tx.send(outcome);
+    });
+    let after = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("the post-refusal commit must resolve — a hang here is a torn \
+                 reservation wedging the writer");
+    after.expect("the post-refusal commit acks");
+
+    assert_eq!(
+        replay_committed_rows(&fx.wal_dir),
+        vec![(2, "after".into())],
+        "exactly the healthy transaction is in the log"
     );
 }
 

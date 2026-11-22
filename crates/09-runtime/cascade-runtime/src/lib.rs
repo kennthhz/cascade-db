@@ -33,6 +33,7 @@ pub mod sql;
 pub mod tenant;
 pub mod tierc;
 pub mod topology;
+pub mod txnmgr;
 pub mod walgate;
 pub mod walhome;
 

@@ -153,10 +153,7 @@ fn wal_rows(dir: &Path) -> Vec<(i32, String)> {
             match entry.record {
                 WalRecord::LegacyInsert { id, val, .. } => rows.push((id, val)),
                 WalRecord::HeapInsert { cell, .. } => {
-                    let c = cascade_page::parse_cell(&cell).expect("cell parses");
-                    rows.push(
-                        session::parse_debug_row(c.payload).expect("row image parses"),
-                    );
+                    rows.push(session::parse_heap_insert_row(&cell).expect("row image parses"));
                 }
                 _ => {}
             }
@@ -418,5 +415,48 @@ fn legacy_log_still_replays() {
 
     let plan = recovery::prepare(&dir, db()).expect("prepares");
     assert_eq!(plan.seed_rows, vec![(1, "ancient".to_owned())]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// T1.5 decode law: a HEAP_INSERT whose row image is *shape-valid* but
+/// carries a non-UTF-8 value is corruption — recovery refuses by name, it
+/// never coerces to U+FFFD and seeds a row nobody can vouch for ("refuse
+/// over it, never serve").
+#[test]
+fn replay_refuses_a_non_utf8_row_image() {
+    let dir = temp_wal_dir();
+    // The session's debug row image, hand-built with bytes that are not
+    // UTF-8 in any position: [id i32][val_len u16][val bytes].
+    let mut image = Vec::new();
+    image.extend_from_slice(&77i32.to_le_bytes());
+    image.extend_from_slice(&3u16.to_le_bytes());
+    image.extend_from_slice(&[0xFF, 0xFE, 0xFA]);
+    let insert = WalRecord::HeapInsert {
+        xid: 77,
+        segment: SegmentId(1),
+        cell: cascade_page::encode_cell(VersionWord::uncommitted(Xid(77)), &image)
+            .expect("fits in a cell"),
+    };
+    // Stage a committed txn around it, exactly like write_txn.
+    let w = Arc::new(WalWriter::new_at(Lsn(0)));
+    reactor().run(async {
+        let h = WalHandle::open(&dir, db()).await.expect("handle opens");
+        let begin = w.append_wal(&WalRecord::BeginTxn { xid: 77 });
+        let ins = w.append_wal(&insert);
+        let commit = w.append_wal(&WalRecord::CommitTxn {
+            xid: 77,
+            commit_ts: cascade_types::Hlc(78),
+        });
+        let end = commit.end();
+        let _ = begin.fill();
+        let _ = ins.fill();
+        let _ = commit.fill();
+        w.flush_wal(&h, end).await.expect("flush");
+    });
+
+    match recovery::prepare(&dir, db()) {
+        Err(RecoveryError::Corrupt { .. }) => {}
+        other => panic!("a non-UTF-8 row image must refuse as Corrupt, got {other:?}"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

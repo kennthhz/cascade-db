@@ -75,7 +75,11 @@ goldens moved exactly one byte per cell (the creator word's tag MSB).
 `PageError` (Uninitialized / WrongVersion / WrongKind / CellTooLarge / Full /
 Malformed), `is_initialized`, `PageView` (parse / cell / iter / free_bytes /
 page_lsn), `PageMut` (init / wrap / append_cell / set_page_lsn / free_bytes /
-view). Append-only pages — no delete/compact yet (the MVCC milestone owns
+view), and the standalone-cell half of the format since T1.3: `encode_cell`
+/ `parse_cell` — byte-identical to what `append_cell` lays down (pinned by
+test); every WAL producer stamps cells through them (the HEAP_INSERT
+"verbatim" seam, WP1 F3), never by hand. Append-only pages — no
+delete/compact yet (the MVCC milestone owns
 that). Six tests: golden byte literals (header + slots + two cells, whole
 bytes), roundtrip readback, exact full-boundary (291 zero-payload cells, 12
 free bytes left, the 292nd append refused and the page stays consistent),

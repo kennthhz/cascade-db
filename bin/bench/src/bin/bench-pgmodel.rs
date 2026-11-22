@@ -339,6 +339,22 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
         l_len: 0, // to infinity: covers every byte we are about to append
         l_pid: 0, // only F_GETLK reports it
     };
+    // Encode every cell BEFORE taking the write lock — the failable encode
+    // (a row past the cell ceiling, 54000) must never early-return from
+    // under the lock: this backend would keep serving its connection while
+    // holding the whole-file WAL write lock, deadlocking every peer in
+    // F_SETLKW. Same discipline as the reserve-before-encode law on the
+    // cascade side: nothing failable sits between lock and unlock.
+    let cells: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|(id, val)| {
+            cascade_page::encode_cell(
+                cascade_types::VersionWord::uncommitted(cascade_types::Xid(xid)),
+                &cascade_runtime::session::debug_row_image(*id, val),
+            )
+            .map_err(|e| ("54000".to_owned(), format!("row too large for a heap cell: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     if unsafe { libc::fcntl(wal_fd, libc::F_SETLKW, &whole_file(libc::F_WRLCK as libc::c_short)) }
         < 0
     {
@@ -358,19 +374,13 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
     );
     off += b.len() as u64;
     bytes.extend_from_slice(&b);
-    for (id, val) in rows {
+    for cell in cells {
         // The heap redo record (WP1 F3), the twin's shape of cascade's
-        // session::durable_commit: a fresh cascade-page cell (xmin tagged
-        // with this backend's xid) around the shared debug row image. The
-        // cell goes through cascade-page's encoder — the page format is
-        // that crate's one-way door, not the twin's to reinvent; the
-        // twin's independence lives in the wire protocol and the process
-        // model, exactly as it does for cascade_wal::format::encode.
-        let cell = cascade_page::encode_cell(
-            cascade_types::VersionWord::uncommitted(cascade_types::Xid(xid)),
-            &cascade_runtime::session::debug_row_image(*id, val),
-        )
-        .map_err(|e| ("54000".to_owned(), format!("row too large for a heap cell: {e}")))?;
+        // session::durable_commit: the pre-built cascade-page cell (the
+        // page format is that crate's one-way door, not the twin's to
+        // reinvent; the twin's independence lives in the wire protocol and
+        // the process model, exactly as it does for
+        // cascade_wal::format::encode).
         let b = format::encode(
             &cascade_wal::WalRecord::HeapInsert {
                 xid,

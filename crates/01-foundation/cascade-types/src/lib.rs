@@ -55,6 +55,48 @@ pub struct Hlc(pub u64);
 /// Milliseconds between the Unix epoch and the HLC epoch (2026-01-01Z).
 pub const HLC_EPOCH_UNIX_MS: u64 = 1_767_225_600_000;
 
+// -----------------------------------------------------------------------------
+// HLC packing (WP2 — the clock machinery itself is cascade-runtime's
+// `txnmgr`; this crate stays data-only per its hard invariant 1)
+// -----------------------------------------------------------------------------
+
+impl Hlc {
+    /// Width of the logical counter (the low bits).
+    pub const LOGICAL_BITS: u32 = 16;
+
+    /// The largest legal physical component: 2^47 ms past the HLC epoch
+    /// (≈ year 6488) — beyond it a packed ts would set bit 63, the exact
+    /// boundary [`VersionWord::committed`] guards.
+    pub const PHYSICAL_MAX_MS: u64 = (1 << 47) - 1;
+
+    /// Packs `physical_ms` and `logical` into the F1 encoding.
+    ///
+    /// Panics on a physical part past [`Hlc::PHYSICAL_MAX_MS`] — the same
+    /// constructor-guard class as [`VersionWord::committed`]: a ts that
+    /// would set version-word bit 63 must never exist, and the callers
+    /// here (replay decode, clock internals) have no recovery path.
+    pub fn from_parts(physical_ms: u64, logical: u16) -> Self {
+        assert!(
+            physical_ms <= Self::PHYSICAL_MAX_MS,
+            "HLC physical ms {physical_ms} past PHYSICAL_MAX_MS ({}) — \
+             would set version-word bit 63 (WP1 F1 epoch contract)",
+            Self::PHYSICAL_MAX_MS
+        );
+        Hlc((physical_ms << Self::LOGICAL_BITS) | logical as u64)
+    }
+
+    /// The physical component: milliseconds since the HLC epoch.
+    pub const fn physical_ms(self) -> u64 {
+        self.0 >> Self::LOGICAL_BITS
+    }
+
+    /// The logical counter within the physical millisecond.
+    pub const fn logical(self) -> u64 {
+        self.0 & ((1 << Self::LOGICAL_BITS) - 1)
+    }
+}
+
+
 /// 64-bit MVCC version word (HLD v2 §6, WP1 F1) — the field that sits in
 /// every row header and index entry.
 ///
