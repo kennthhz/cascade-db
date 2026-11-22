@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use cascade_types::{Epoch, Hlc, Lsn, ScopeId, SegmentId};
 use cascade_wal_format::{encode, encode_with_flags, FLAG_GROUP_END};
-use futures_lite::future::block_on;
 
 use crate::block_device::BlockDevice;
 use crate::error::StoreError;
@@ -61,7 +60,7 @@ fn meta(ts: u64) -> AppendMeta {
     }
 }
 
-fn append_group<S: LogSink + LogSource + LogScopes>(
+async fn append_group<S: LogSink + LogSource + LogScopes>(
     store: &S,
     span: &cascade_telemetry::Span,
     start: u64,
@@ -72,8 +71,8 @@ fn append_group<S: LogSink + LogSource + LogScopes>(
 ) -> Result<Lsn, StoreError> {
     let ctx = test_ctx(span, 1);
     let bytes = group_at(start, epoch.0, xid, ts, body);
-    block_on(store.append(&ctx, SCOPE, epoch, Lsn(start), &bytes, meta(ts)))?;
-    block_on(store.wait_durable(&ctx, SCOPE, Lsn(start + bytes.len() as u64)))
+    (store.append(&ctx, SCOPE, epoch, Lsn(start), &bytes, meta(ts))).await?;
+    (store.wait_durable(&ctx, SCOPE, Lsn(start + bytes.len() as u64))).await
 }
 
 /// The log store harness (§4.10): create, crash, restart, inject.
@@ -106,63 +105,63 @@ impl LogStoreHarness for MemLogStoreHarness {
 }
 
 /// §4.3, promises 1–7, against any log store.
-pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
+pub async fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
     let store = h.create();
 
-    block_on(store.create_scope(&ctx, SCOPE, E1, KeyRef { key_id: 1 }))
+    (store.create_scope(&ctx, SCOPE, E1, KeyRef { key_id: 1 })).await
         .expect("scope creates");
 
     // Promise 1 — fencing, retry, discard of unflushed older-epoch bytes.
-    let d = block_on(store.open_writer(&ctx, SCOPE, E1)).expect("first open");
+    let d = (store.open_writer(&ctx, SCOPE, E1)).await.expect("first open");
     assert_eq!(d, Lsn(0), "a fresh scope's durable LSN starts at 0");
-    let again = block_on(store.open_writer(&ctx, SCOPE, E1)).expect("same epoch is a retry");
+    let again = (store.open_writer(&ctx, SCOPE, E1)).await.expect("same epoch is a retry");
     assert_eq!(again, d, "a retried open returns the durable LSN again");
 
     // Accepted but never flushed: the fence discards it (§4.3 promise 1 —
     // only *acknowledged* bytes survive an epoch change).
     let raw = group_at(0, 1, 1, 10, b"one");
-    block_on(store.append(&ctx, SCOPE, E1, Lsn(0), &raw, meta(10)))
+    (store.append(&ctx, SCOPE, E1, Lsn(0), &raw, meta(10))).await
         .expect("accepted, not flushed");
     // A newer epoch fences the old one and discards its unflushed bytes.
-    let d2 = block_on(store.open_writer(&ctx, SCOPE, Epoch(2))).expect("upgrade epoch");
+    let d2 = (store.open_writer(&ctx, SCOPE, Epoch(2))).await.expect("upgrade epoch");
     assert_eq!(d2, Lsn(0), "epoch 1's bytes were never acknowledged: discarded");
-    let fenced = block_on(store.append(
+    let fenced = (store.append(
         &ctx,
         SCOPE,
         E1,
         Lsn(0),
         &group_at(0, 1, 1, 10, b"one"),
         meta(10),
-    ));
+    )).await;
     assert!(
         matches!(fenced, Err(StoreError::Fenced { current }) if current == Epoch(2)),
         "a fenced epoch fails Fenced — even an identical re-send"
     );
     assert!(matches!(
-        block_on(store.open_writer(&ctx, SCOPE, E1)),
+        (store.open_writer(&ctx, SCOPE, E1)).await,
         Err(StoreError::Fenced { current }) if current == Epoch(2)
     ));
 
     // Promise 2 — contiguity.
     let e2 = Epoch(2);
-    let end2 = append_group(&*store, &span, 0, e2, 2, 20, b"two").expect("append at 0");
+    let end2 = append_group(&*store, &span, 0, e2, 2, 20, b"two").await.expect("append at 0");
     assert_eq!(end2, end_of(1, b"two"));
-    let gap = block_on(store.append(
+    let gap = (store.append(
         &ctx,
         SCOPE,
         e2,
         Lsn(end2.0 + 8),
         &group_at(end2.0 + 8, 2, 3, 30, b"three"),
         meta(30),
-    ));
+    )).await;
     assert!(matches!(gap, Err(StoreError::Gap { expected }) if expected == end2));
 
     // Promise 3 — idempotence: identical overlap succeeds, has no effect;
     // differing overlap conflicts at the first differing byte.
     let bytes = group_at(0, 2, 2, 20, b"two");
-    block_on(store.append(&ctx, SCOPE, e2, Lsn(0), &bytes, meta(20)))
+    (store.append(&ctx, SCOPE, e2, Lsn(0), &bytes, meta(20))).await
         .expect("identical re-send succeeds");
     assert_eq!(
         store.durable_lsn(SCOPE).expect("durable"),
@@ -178,13 +177,13 @@ pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     let r1_crc_at = 43usize; // record 1: header 36 + payload (4 seg + 3 cell) = CRC at 43
     let r1_crc = crc32(&lie[..r1_crc_at]);
     lie[r1_crc_at..r1_crc_at + 4].copy_from_slice(&r1_crc.to_le_bytes());
-    let conflict = block_on(store.append(&ctx, SCOPE, e2, Lsn(0), &lie, meta(20)));
+    let conflict = (store.append(&ctx, SCOPE, e2, Lsn(0), &lie, meta(20))).await;
     assert!(matches!(conflict, Err(StoreError::Conflict { .. })), "conflict case returned {conflict:?}");
 
     // Promise 4 — framing. (Payload-blindness: arbitrary cell bytes pass.)
     // a. empty bytes
     assert!(matches!(
-        block_on(store.append(&ctx, SCOPE, e2, Lsn(end2.0), &[], meta(0))),
+        (store.append(&ctx, SCOPE, e2, Lsn(end2.0), &[], meta(0))).await,
         Err(StoreError::BadFrame { reason: crate::FrameError::BadLength, .. })
     ));
     // b. last record without the group-end flag (S16)
@@ -194,7 +193,7 @@ pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
         2,
     );
     assert!(matches!(
-        block_on(store.append(&ctx, SCOPE, e2, Lsn(end2.0), &interior, meta(0))),
+        (store.append(&ctx, SCOPE, e2, Lsn(end2.0), &interior, meta(0))).await,
         Err(StoreError::BadFrame { reason: crate::FrameError::NotGroupEnd, .. })
     ));
     // c. corrupted CRC — flipped inside record 2's commit_ts payload (a
@@ -203,7 +202,7 @@ pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     let payload_byte = bad.len() - 8 - 4; // commit_ts's first byte, before the CRC
     bad[payload_byte] ^= 0xFF;
     assert!(matches!(
-        block_on(store.append(&ctx, SCOPE, e2, Lsn(end2.0), &bad, meta(50))),
+        (store.append(&ctx, SCOPE, e2, Lsn(end2.0), &bad, meta(50))).await,
         Err(StoreError::BadFrame { reason: crate::FrameError::BadCrc, .. })
     ));
     // d. header LSN not equal to position (record 1's CRC restamped: the
@@ -215,7 +214,7 @@ pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     let r1_crc = crc32(&lsn_lie[..r1_end]);
     lsn_lie[r1_end..r1_end + 4].copy_from_slice(&r1_crc.to_le_bytes());
     assert!(matches!(
-        block_on(store.append(&ctx, SCOPE, e2, Lsn(end2.0), &lsn_lie, meta(60))),
+        (store.append(&ctx, SCOPE, e2, Lsn(end2.0), &lsn_lie, meta(60))).await,
         Err(StoreError::BadFrame { reason: crate::FrameError::BadLsn, .. })
     ));
     // e. header epoch not equal to the append's epoch
@@ -224,24 +223,24 @@ pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     let r1_crc = crc32(&epoch_lie[..r1_end]);
     epoch_lie[r1_end..r1_end + 4].copy_from_slice(&r1_crc.to_le_bytes());
     assert!(matches!(
-        block_on(store.append(&ctx, SCOPE, e2, Lsn(end2.0), &epoch_lie, meta(70))),
+        (store.append(&ctx, SCOPE, e2, Lsn(end2.0), &epoch_lie, meta(70))).await,
         Err(StoreError::BadFrame { reason: crate::FrameError::BadEpoch, .. })
     ));
 
     // Promise 5 — durability is monotonic and lands on a group end.
     let before = store.durable_lsn(SCOPE).expect("durable");
-    let d3 = append_group(&*store, &span, end2.0, e2, 8, 80, b"eight").expect("append");
+    let d3 = append_group(&*store, &span, end2.0, e2, 8, 80, b"eight").await.expect("append");
     assert!(d3 >= before, "durable never moves backwards");
-    let last_end = walk_last_group_end(&*store, d3);
+    let last_end = walk_last_group_end(&*store, d3).await;
     assert_eq!(d3, last_end, "the durable LSN falls on a group end (S16)");
 
     // Promise 6 — acknowledged means durable: a crash loses nothing below
     // the durable LSN.
     let acked = store.durable_lsn(SCOPE).expect("durable");
-    let acknowledged = read_all(&*store, acked);
+    let acknowledged = read_all(&*store, acked).await;
     h.crash(&store);
     let revived = h.restart(&store);
-    let after = read_all(&*revived, acked);
+    let after = read_all(&*revived, acked).await;
     assert_eq!(
         acknowledged, after,
         "every acknowledged record survives a crash"
@@ -250,46 +249,47 @@ pub fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     // Promise 7 — a flush failure fails the epoch until reopen (S19's
     // blast radius at store scale; §8.1 step 1).
     h.inject_flush_failure(&revived);
-    let failed = block_on(revived.wait_durable(&ctx, SCOPE, Lsn(1 << 40)));
+    let failed = (revived.wait_durable(&ctx, SCOPE, Lsn(1 << 40))).await;
     assert!(matches!(failed, Err(StoreError::Failed { .. })));
     assert!(matches!(
-        block_on(revived.append(&ctx, SCOPE, e2, Lsn(d3.0), &group_at(d3.0, 2, 9, 90, b"nine"), meta(90))),
+        (revived.append(&ctx, SCOPE, e2, Lsn(d3.0), &group_at(d3.0, 2, 9, 90, b"nine"), meta(90))).await,
         Err(StoreError::Failed { .. })
     ));
-    let reopened = block_on(revived.open_writer(&ctx, SCOPE, Epoch(3))).expect("reopen recovers");
+    let reopened = (revived.open_writer(&ctx, SCOPE, Epoch(3))).await.expect("reopen recovers");
     assert_eq!(reopened, d3, "reopen resumes at the durable LSN");
     append_group(&*revived, &span, d3.0, Epoch(3), 10, 100, b"ten")
+        .await
         .expect("appends work again after reopen");
 }
 
 /// §4.4 promises 1–6 (the caller-side halves — persist-before-report —
 /// are the holders' obligations, pinned in M4's integration).
-pub fn log_source_suite<H: LogStoreHarness>(h: &mut H) {
+pub async fn log_source_suite<H: LogStoreHarness>(h: &mut H) {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
     let store = h.create();
-    block_on(store.create_scope(&ctx, SCOPE, E1, KeyRef { key_id: 1 })).expect("creates");
-    block_on(store.open_writer(&ctx, SCOPE, E1)).expect("opens");
+    (store.create_scope(&ctx, SCOPE, E1, KeyRef { key_id: 1 })).await.expect("creates");
+    (store.open_writer(&ctx, SCOPE, E1)).await.expect("opens");
 
     // Promise 1 — only durable records: an accepted-but-unflushed append
     // is never served.
     let g1 = group_at(0, 1, 1, 10, b"alpha");
-    block_on(store.append(&ctx, SCOPE, E1, Lsn(0), &g1, meta(10))).expect("accepted");
-    let early = block_on(store.read_log(&ctx, SCOPE, Lsn(0), 1 << 20)).expect("reads");
+    (store.append(&ctx, SCOPE, E1, Lsn(0), &g1, meta(10))).await.expect("accepted");
+    let early = (store.read_log(&ctx, SCOPE, Lsn(0), 1 << 20)).await.expect("reads");
     assert!(
         early.bytes.is_empty(),
         "nothing above the durable LSN is ever returned"
     );
-    block_on(store.wait_durable(&ctx, SCOPE, Lsn(g1.len() as u64))).expect("flushes");
+    (store.wait_durable(&ctx, SCOPE, Lsn(g1.len() as u64))).await.expect("flushes");
 
     // Promises 2 + subscription contiguity — chunks chain with no gaps or
     // duplicates, and an empty chunk marks the durable point.
-    let e1_end = append_group(&*store, &span, g1.len() as u64, E1, 2, 20, b"beta")
+    let e1_end = append_group(&*store, &span, g1.len() as u64, E1, 2, 20, b"beta").await
         .expect("append 2");
     let mut pos = Lsn(0);
     let mut seen = Vec::new();
     loop {
-        let chunk = block_on(store.read_log(&ctx, SCOPE, pos, 1)).expect("chunk");
+        let chunk = (store.read_log(&ctx, SCOPE, pos, 1)).await.expect("chunk");
         assert_eq!(chunk.start, pos, "chunks start where the last ended");
         assert_eq!(chunk.end.0, chunk.start.0 + chunk.bytes.len() as u64);
         assert_eq!(chunk.durable, e1_end, "chunk.durable is the scope's durable LSN");
@@ -300,71 +300,70 @@ pub fn log_source_suite<H: LogStoreHarness>(h: &mut H) {
         }
     }
     assert_eq!(seen.len(), e1_end.0 as usize, "the whole log, no gaps, no duplicates");
-    let tail = block_on(store.read_log(&ctx, SCOPE, e1_end, 1 << 20)).expect("tail");
+    let tail = (store.read_log(&ctx, SCOPE, e1_end, 1 << 20)).await.expect("tail");
     assert!(tail.bytes.is_empty(), "from == durable is an empty chunk");
 
     let mut sub = store.subscribe(&ctx, SCOPE, Lsn(0));
     let mut streamed = Vec::new();
     while streamed.len() < e1_end.0 as usize {
-        let chunk = block_on(sub.next()).expect("sub chunk");
+        let chunk = (sub.next()).await.expect("sub chunk");
         assert_eq!(chunk.start.0, streamed.len() as u64, "subscription is contiguous");
         streamed.extend_from_slice(&chunk.bytes);
     }
     assert_eq!(streamed, seen, "the subscription sees the same durable log");
 
     // Promise 3 — record boundaries.
-    let inside = block_on(store.read_log(&ctx, SCOPE, Lsn(3), 1 << 20));
+    let inside = (store.read_log(&ctx, SCOPE, Lsn(3), 1 << 20)).await;
     assert!(matches!(inside, Err(StoreError::NotRecordBoundary { .. })));
 
     // Promise 4 — retention: the floor moves only forward, reads below it
     // truncate, and with no holder nothing is discardable.
     assert_eq!(store.retained_floor(SCOPE).expect("floor"), Lsn(0));
-    block_on(store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, Lsn(0)))
+    (store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, Lsn(0))).await
         .expect("archive registers");
-    block_on(store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, e1_end))
+    (store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, e1_end)).await
         .expect("archive advances");
     assert_eq!(store.retained_floor(SCOPE).expect("floor"), e1_end);
-    let below = block_on(store.read_log(&ctx, SCOPE, Lsn(0), 1 << 20));
+    let below = (store.read_log(&ctx, SCOPE, Lsn(0), 1 << 20)).await;
     assert!(matches!(below, Err(StoreError::Truncated { floor }) if floor == e1_end));
     // A new holder must register at or above the current floor; a lower
     // value clamps — the floor never regresses.
-    block_on(
-        store.set_retained_from(
-            &ctx,
-            SCOPE,
-            RetentionHolder::PageStore { instance: 1 },
-            Lsn(0),
-        ),
-    )
+    (store.set_retained_from(
+        &ctx,
+        SCOPE,
+        RetentionHolder::PageStore { instance: 1 },
+        Lsn(0),
+    ))
+    .await
     .expect("clamped registration");
     assert_eq!(store.retained_floor(SCOPE).expect("floor"), e1_end);
-    block_on(store.release_holder(&ctx, SCOPE, RetentionHolder::Archive)).expect("release");
+    (store.release_holder(&ctx, SCOPE, RetentionHolder::Archive)).await.expect("release");
     assert_eq!(
         store.retained_floor(SCOPE).expect("floor"),
         e1_end,
         "the surviving holder keeps the floor"
     );
-    block_on(store.release_holder(&ctx, SCOPE, RetentionHolder::PageStore { instance: 1 }))
+    (store.release_holder(&ctx, SCOPE, RetentionHolder::PageStore { instance: 1 })).await
         .expect("release");
     assert_eq!(store.retained_floor(SCOPE).expect("floor"), Lsn(0));
 
     // Point-in-time lookup: the earliest append whose highest commit
     // timestamp is above `ts`; below the floor it truncates.
-    let boundary = block_on(store.append_before_time(&ctx, SCOPE, Hlc(15))).expect("lookup");
+    let boundary = (store.append_before_time(&ctx, SCOPE, Hlc(15))).await.expect("lookup");
     assert_eq!(boundary, Lsn(g1.len() as u64), "beta (ts 20) is the first append above 15");
-    let boundary = block_on(store.append_before_time(&ctx, SCOPE, Hlc(5))).expect("lookup");
+    let boundary = (store.append_before_time(&ctx, SCOPE, Hlc(5))).await.expect("lookup");
     assert_eq!(boundary, Lsn(0), "alpha (ts 10) is the first append above 5");
-    let boundary = block_on(store.append_before_time(&ctx, SCOPE, Hlc(25))).expect("lookup");
+    let boundary = (store.append_before_time(&ctx, SCOPE, Hlc(25))).await.expect("lookup");
     assert_eq!(
         boundary, e1_end,
         "no append is above 25: the log end is the boundary"
     );
-    let boundary = block_on(store.append_before_time(&ctx, SCOPE, Hlc(u64::MAX >> 2)))
+    let boundary = (store.append_before_time(&ctx, SCOPE, Hlc(u64::MAX >> 2))).await
         .expect("lookup");
     assert_eq!(boundary, e1_end, "no append is above: the log end is the boundary");
-    block_on(store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, e1_end))
+    (store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, e1_end)).await
         .expect("raise floor");
-    let gone = block_on(store.append_before_time(&ctx, SCOPE, Hlc(15)));
+    let gone = (store.append_before_time(&ctx, SCOPE, Hlc(15))).await;
     assert!(matches!(gone, Err(StoreError::Truncated { .. })));
 }
 
@@ -389,10 +388,10 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-fn walk_last_group_end<S: LogSource>(store: &S, _durable: Lsn) -> Lsn {
+async fn walk_last_group_end<S: LogSource>(store: &S, _durable: Lsn) -> Lsn {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
-    let chunk = block_on(store.read_log(&ctx, SCOPE, Lsn(0), usize::MAX)).expect("read all");
+    let chunk = (store.read_log(&ctx, SCOPE, Lsn(0), usize::MAX)).await.expect("read all");
     let mut at = 0usize;
     let mut last_end = Lsn(0);
     let mut last_group = false;
@@ -406,13 +405,13 @@ fn walk_last_group_end<S: LogSource>(store: &S, _durable: Lsn) -> Lsn {
     last_end
 }
 
-fn read_all<S: LogSource>(store: &S, durable: Lsn) -> Vec<u8> {
+async fn read_all<S: LogSource>(store: &S, durable: Lsn) -> Vec<u8> {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
     let mut pos = Lsn(0);
     let mut out = Vec::new();
     while pos < durable {
-        let chunk = block_on(store.read_log(&ctx, SCOPE, pos, 64)).expect("chunk");
+        let chunk = (store.read_log(&ctx, SCOPE, pos, 64)).await.expect("chunk");
         assert_eq!(chunk.start, pos);
         if chunk.bytes.is_empty() {
             break;
@@ -425,12 +424,18 @@ fn read_all<S: LogSource>(store: &S, durable: Lsn) -> Vec<u8> {
 
 /// The block device harness (§4.8): a device plus its crash and sync-
 /// failure injectors — the fake models them (§4.10); a real device's
-/// harness injects via fault machinery instead.
+/// harness cannot inject, so it opts out honestly and the S19 section
+/// skips (the impl's poisoning-on-genuine-failure is its own duty).
 pub trait BlockDeviceHarness {
     type Dev: BlockDevice;
     fn create(&mut self) -> Arc<Self::Dev>;
     fn crash(&mut self, dev: &Arc<Self::Dev>, seed: u64);
     fn inject_sync_failure(&mut self, dev: &Arc<Self::Dev>);
+    /// Whether `inject_sync_failure` actually arms a failure. Default:
+    /// no — a real device's harness reports false and skips S19.
+    fn supports_sync_injection(&self) -> bool {
+        false
+    }
 }
 
 pub struct MemBlockDeviceHarness;
@@ -449,41 +454,41 @@ impl BlockDeviceHarness for MemBlockDeviceHarness {
 }
 
 /// §4.8 promises, against any block device.
-pub fn block_device_suite<H: BlockDeviceHarness>(h: &mut H) {
+pub async fn block_device_suite<H: BlockDeviceHarness>(h: &mut H) {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
     let dev = h.create();
     let handle = dev.local();
 
     let name = FileName("seg-0-0".to_string());
-    let f = block_on(handle.open(&ctx, &name, true)).expect("creates");
+    let f = (handle.open(&ctx, &name, true)).await.expect("creates");
     let mut a = cascade_types::AlignedBuf::zeroed(4096);
     a.as_mut_slice().fill(0xAA);
-    block_on(handle.write_at(&ctx, f, 0, a)).expect("writes");
+    (handle.write_at(&ctx, f, 0, a)).await.expect("writes");
 
     // Alignment is a rule on callers; the device enforces it.
     let junk = cascade_types::AlignedBuf::zeroed(4096);
     assert!(
-        block_on(handle.write_at(&ctx, f, 1, junk)).is_err(),
+        (handle.write_at(&ctx, f, 1, junk)).await.is_err(),
         "offsets are multiples of 4 KiB"
     );
 
     // Unsynced writes are readable on the same device instance.
-    let back = block_on(handle.read_at(&ctx, f, 0, cascade_types::AlignedBuf::zeroed(4096)))
+    let back = (handle.read_at(&ctx, f, 0, cascade_types::AlignedBuf::zeroed(4096))).await
         .expect("reads back");
     assert!(back.as_slice().iter().all(|&b| b == 0xAA));
 
     // A synced write survives any crash; an unsynced block at a cut point
     // is either fully there or fully gone — never torn.
-    block_on(handle.sync(&ctx, f)).expect("syncs");
+    (handle.sync(&ctx, f)).await.expect("syncs");
     let mut b = cascade_types::AlignedBuf::zeroed(4096);
     b.as_mut_slice().fill(0xBB);
-    block_on(handle.write_at(&ctx, f, 4096, b)).expect("writes unsynced");
+    (handle.write_at(&ctx, f, 4096, b)).await.expect("writes unsynced");
     h.crash(&dev, 0xC0FFEE);
-    let back = block_on(handle.read_at(&ctx, f, 0, cascade_types::AlignedBuf::zeroed(4096)))
+    let back = (handle.read_at(&ctx, f, 0, cascade_types::AlignedBuf::zeroed(4096))).await
         .expect("synced block survives");
     assert!(back.as_slice().iter().all(|&b| b == 0xAA), "synced survives");
-    let cut = block_on(handle.read_at(&ctx, f, 4096, cascade_types::AlignedBuf::zeroed(4096)))
+    let cut = (handle.read_at(&ctx, f, 4096, cascade_types::AlignedBuf::zeroed(4096))).await
         .expect("reads");
     let all_bb = cut.as_slice().iter().all(|&b| b == 0xBB);
     let all_zero = cut.as_slice().iter().all(|&b| b == 0);
@@ -493,38 +498,42 @@ pub fn block_device_suite<H: BlockDeviceHarness>(h: &mut H) {
     );
 
     // S19 — a failed sync is permanent: the file refuses everything after.
+    // Only harnesses that can genuinely inject run this section.
+    if !h.supports_sync_injection() {
+        return;
+    }
     h.inject_sync_failure(&dev);
     let mut c = cascade_types::AlignedBuf::zeroed(4096);
     c.as_mut_slice().fill(0xCC);
-    block_on(handle.write_at(&ctx, f, 8192, c)).expect("writes before the doomed sync");
-    assert!(block_on(handle.sync(&ctx, f)).is_err(), "the injected sync fails");
+    (handle.write_at(&ctx, f, 8192, c)).await.expect("writes before the doomed sync");
+    assert!((handle.sync(&ctx, f)).await.is_err(), "the injected sync fails");
     assert!(
-        block_on(handle.sync(&ctx, f)).is_err(),
+        (handle.sync(&ctx, f)).await.is_err(),
         "retrying the sync proves nothing — it keeps failing"
     );
     assert!(
-        block_on(handle.read_at(&ctx, f, 0, cascade_types::AlignedBuf::zeroed(4096))).is_err(),
+        (handle.read_at(&ctx, f, 0, cascade_types::AlignedBuf::zeroed(4096))).await.is_err(),
         "every later operation on the failed file reports failure"
     );
 
     // Names, not paths: rename is atomic and lands in the namespace.
     let tmp = FileName("MANIFEST.tmp".to_string());
     let dst = FileName("MANIFEST".to_string());
-    let m = block_on(handle.open(&ctx, &tmp, true)).expect("creates manifest");
+    let m = (handle.open(&ctx, &tmp, true)).await.expect("creates manifest");
     let mut mbuf = cascade_types::AlignedBuf::zeroed(4096);
     mbuf.as_mut_slice()[0] = 0x5A;
-    block_on(handle.write_at(&ctx, m, 0, mbuf)).expect("writes");
-    block_on(handle.sync(&ctx, m)).expect("syncs");
-    block_on(handle.rename(&ctx, &tmp, &dst)).expect("renames atomically");
-    block_on(handle.sync_namespace()).expect("namespace durable");
-    let names = block_on(handle.list()).expect("lists");
+    (handle.write_at(&ctx, m, 0, mbuf)).await.expect("writes");
+    (handle.sync(&ctx, m)).await.expect("syncs");
+    (handle.rename(&ctx, &tmp, &dst)).await.expect("renames atomically");
+    (handle.sync_namespace()).await.expect("namespace durable");
+    let names = (handle.list()).await.expect("lists");
     assert!(names.contains(&dst) && !names.contains(&tmp));
     assert!(
-        block_on(handle.remove(&ctx, &tmp)).is_err(),
+        (handle.remove(&ctx, &tmp)).await.is_err(),
         "the old name is gone"
     );
-    block_on(handle.remove(&ctx, &dst)).expect("remove");
-    assert!(!block_on(handle.list()).expect("lists").contains(&dst));
+    (handle.remove(&ctx, &dst)).await.expect("remove");
+    assert!(!(handle.list()).await.expect("lists").contains(&dst));
 }
 
 /// The key provider harness: create plus a rotation hook — key management
@@ -549,27 +558,27 @@ impl KeyProviderHarness for MemKeyProviderHarness {
 }
 
 /// §4.7 promises: versions, rotation readability, material hygiene.
-pub fn key_provider_suite<H: KeyProviderHarness>(h: &mut H) {
+pub async fn key_provider_suite<H: KeyProviderHarness>(h: &mut H) {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
     let p = h.create();
     let key = KeyRef { key_id: 9 };
 
     assert!(matches!(
-        block_on(p.current(&ctx, key)),
+        (p.current(&ctx, key)).await,
         Err(crate::error::KeyError::UnknownKey)
     ));
     let v1 = h.rotate(&p, key);
-    let (cur, mat1) = block_on(p.current(&ctx, key)).expect("current after rotate");
+    let (cur, mat1) = (p.current(&ctx, key)).await.expect("current after rotate");
     assert_eq!(cur, v1);
     assert_eq!(mat1.material().len(), 32);
     let v2 = h.rotate(&p, key);
-    let (cur, _) = block_on(p.current(&ctx, key)).expect("current after second rotate");
+    let (cur, _) = (p.current(&ctx, key)).await.expect("current after second rotate");
     assert_eq!(cur, v2, "new writes seal with the current version");
-    let old = block_on(p.get(&ctx, key, v1)).expect("old version stays readable");
+    let old = (p.get(&ctx, key, v1)).await.expect("old version stays readable");
     assert_eq!(old.material(), mat1.material(), "old data keeps its material");
     assert!(matches!(
-        block_on(p.get(&ctx, key, KeyVersion(999))),
+        (p.get(&ctx, key, KeyVersion(999))).await,
         Err(crate::error::KeyError::UnknownVersion)
     ));
 
@@ -643,13 +652,13 @@ impl PageStoreHarness for MemPageStoreHarness {
 }
 
 /// §4.5 promises, against any page store over its log.
-pub fn page_source_suite<H: PageStoreHarness>(h: &mut H) {
+pub async fn page_source_suite<H: PageStoreHarness>(h: &mut H) {
     let span = cascade_telemetry::Span::noop();
     let ctx = test_ctx(&span, 1);
     let (log, store) = h.create();
-    block_on(store.attach(&ctx, SCOPE, None, KeyRef { key_id: 1 })).expect("attaches");
-    block_on(log.create_scope(&ctx, SCOPE, E1, KeyRef { key_id: 1 })).expect("log scope");
-    block_on(log.open_writer(&ctx, SCOPE, E1)).expect("opens");
+    (store.attach(&ctx, SCOPE, None, KeyRef { key_id: 1 })).await.expect("attaches");
+    (log.create_scope(&ctx, SCOPE, E1, KeyRef { key_id: 1 })).await.expect("log scope");
+    (log.open_writer(&ctx, SCOPE, E1)).await.expect("opens");
 
     fn page_body(page_no: u32, content: &[u8]) -> Vec<u8> {
         let mut cell = page_no.to_le_bytes().to_vec();
@@ -659,20 +668,20 @@ pub fn page_source_suite<H: PageStoreHarness>(h: &mut H) {
     let page5 = crate::types::PageKey { segment: SegmentId(1), page_no: 5 };
 
     // Promise 4 — an unwritten page is zeros with page LSN 0.
-    let empty = block_on(store.get_page(
+    let empty = (store.get_page(
         &ctx,
         SCOPE,
         crate::types::PageKey { segment: SegmentId(1), page_no: 6 },
         Lsn(0),
-    ))
+    )).await
     .expect("unwritten page");
     assert!(empty.buf.as_slice().iter().all(|&b| b == 0));
     assert_eq!(empty.page_lsn, Lsn(0));
 
     // Promise 1 — exact as of an LSN, across time; promise 3 — catch-up
     // on demand: the second get_page applies records it never ingested.
-    let end1 = append_page_group(&*log, &span, 0, 1, 10, &page_body(5, b"one"));
-    let img = block_on(store.get_page(&ctx, SCOPE, page5, end1)).expect("page as of end1");
+    let end1 = append_page_group(&*log, &span, 0, 1, 10, &page_body(5, b"one")).await;
+    let img = (store.get_page(&ctx, SCOPE, page5, end1)).await.expect("page as of end1");
     assert_eq!(&img.buf.as_slice()[..3], b"one");
     // S17: the page LSN is the END of the last record *applied to it* —
     // the heap-insert record, not the commit that closes its group.
@@ -682,44 +691,44 @@ pub fn page_source_suite<H: PageStoreHarness>(h: &mut H) {
         cell: page_body(5, b"one"),
     }) as u64;
     assert_eq!(img.page_lsn, Lsn(ins_len), "page LSN = the heap-insert record's end");
-    let end2 = append_page_group(&*log, &span, end1.0, 2, 20, &page_body(5, b"two"));
-    let img = block_on(store.get_page(&ctx, SCOPE, page5, end2)).expect("page as of end2");
+    let end2 = append_page_group(&*log, &span, end1.0, 2, 20, &page_body(5, b"two")).await;
+    let img = (store.get_page(&ctx, SCOPE, page5, end2)).await.expect("page as of end2");
     assert_eq!(&img.buf.as_slice()[..3], b"two", "the missing records were applied, not failed");
     assert_eq!(store.materialized_lsn(SCOPE).expect("materialized"), end2);
     assert_eq!(store.oldest_readable_lsn(SCOPE).expect("oldest"), end2);
 
     // Promise 5 — never a newer-than-requested answer: without page
     // versions an older point is TooOld.
-    let stale = block_on(store.get_page(&ctx, SCOPE, page5, end1));
+    let stale = (store.get_page(&ctx, SCOPE, page5, end1)).await;
     assert!(matches!(stale, Err(StoreError::TooOld { .. })));
 
     // Promise 2 — nothing non-durable is ever applied.
-    let beyond = block_on(store.get_page(&ctx, SCOPE, page5, Lsn(end2.0 + 1)));
+    let beyond = (store.get_page(&ctx, SCOPE, page5, Lsn(end2.0 + 1))).await;
     assert!(matches!(beyond, Err(StoreError::BeyondDurable { .. })));
 
     // Read floors register (page versions arrive with the managed service).
-    block_on(store.set_read_floor(&ctx, SCOPE, crate::types::ReaderId(1), end2))
+    (store.set_read_floor(&ctx, SCOPE, crate::types::ReaderId(1), end2)).await
         .expect("floor registers");
 
     // §4.6 — lineage is the branch hook; v1 refuses it loudly, and a
     // double attach is a ScopeExists.
     let lineage = crate::types::Lineage { parent: SCOPE, fork_lsn: end2 };
     assert!(matches!(
-        block_on(store.attach(&ctx, SCOPE, Some(lineage), KeyRef { key_id: 1 })),
+        (store.attach(&ctx, SCOPE, Some(lineage), KeyRef { key_id: 1 })).await,
         Err(StoreError::Unsupported(_))
     ));
     assert!(matches!(
-        block_on(store.attach(&ctx, SCOPE, None, KeyRef { key_id: 1 })),
+        (store.attach(&ctx, SCOPE, None, KeyRef { key_id: 1 })).await,
         Err(StoreError::ScopeExists(_))
     ));
-    block_on(store.detach(&ctx, SCOPE)).expect("detaches");
+    (store.detach(&ctx, SCOPE)).await.expect("detaches");
     assert!(matches!(
-        block_on(store.get_page(&ctx, SCOPE, page5, end2)),
+        (store.get_page(&ctx, SCOPE, page5, end2)).await,
         Err(StoreError::UnknownScope(_))
     ));
 }
 
-fn append_page_group<L: LogSink>(
+async fn append_page_group<L: LogSink>(
     log: &L,
     span: &cascade_telemetry::Span,
     start: u64,
@@ -745,6 +754,6 @@ fn append_page_group<L: LogSink>(
     );
     let mut bytes = ins;
     bytes.extend(com);
-    block_on(log.append(&ctx, SCOPE, E1, Lsn(start), &bytes, meta(ts))).expect("appends");
-    block_on(log.wait_durable(&ctx, SCOPE, Lsn(start + bytes.len() as u64))).expect("durable")
+    (log.append(&ctx, SCOPE, E1, Lsn(start), &bytes, meta(ts))).await.expect("appends");
+    (log.wait_durable(&ctx, SCOPE, Lsn(start + bytes.len() as u64))).await.expect("durable")
 }

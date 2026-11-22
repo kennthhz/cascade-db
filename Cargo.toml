@@ -11,6 +11,7 @@ members = [
     "crates/02-storage/cascade-wal-format",
     "crates/02-storage/cascade-storage-api",
     "crates/02-storage/cascade-rt-api",
+    "crates/02-storage/cascade-blockdev",
     # 03-memory
     "crates/03-memory/cascade-bpm",
     # 04-txn
@@ -98,6 +99,7 @@ cascade-storage   = { path = "crates/02-storage/cascade-storage" }
 cascade-wal       = { path = "crates/02-storage/cascade-wal" }
 cascade-wal-format = { path = "crates/02-storage/cascade-wal-format" }
 cascade-storage-api = { path = "crates/02-storage/cascade-storage-api" }
+cascade-blockdev    = { path = "crates/02-storage/cascade-blockdev" }
 cascade-bpm       = { path = "crates/03-memory/cascade-bpm" }
 cascade-mvcc      = { path = "crates/04-txn/cascade-mvcc" }
 cascade-undo      = { path = "crates/04-txn/cascade-undo" }

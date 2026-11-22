@@ -155,6 +155,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "981520c98f422fcc584dc1a95c334e6953900b9106bc47a9839b81790009eb21"
 
 [[package]]
+name = "cascade-blockdev"
+version = "0.1.0"
+dependencies = [
+ "cascade-storage-api",
+ "cascade-types",
+ "futures-lite",
+ "glommio",
+ "libc",
+]
+
+[[package]]
 name = "cascade-bpm"
 version = "0.1.0"
 dependencies = [

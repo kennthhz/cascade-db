@@ -1,0 +1,19 @@
+[package]
+name        = "cascade-blockdev"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The glommio O_DIRECT BlockDevice (storage-layer-design.md §4.8, M3): DmaFile I/O with WalHandle's watchdog, S19 sync poisoning, flat names."
+
+[dependencies]
+cascade-storage-api = { workspace = true }
+cascade-types       = { workspace = true }
+glommio             = { workspace = true }
+futures-lite        = { workspace = true }
+libc                = { workspace = true }
+
+[dev-dependencies]
+futures-lite = { workspace = true }
