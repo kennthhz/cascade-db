@@ -19,7 +19,7 @@ futures-lite = { workspace = true }
 static_assertions = { workspace = true }
 
 [features]
-default = ["fake"]
+default = ["fake", "conformance"]
 # The in-memory fakes (MemLogStore, MemPageStore, MemBlockDevice,
 # MemKeyProvider) — §4.10. On by default so the workspace gate exercises
 # them; implementations opt out by disabling default features.

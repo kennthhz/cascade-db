@@ -34,6 +34,9 @@ pub mod types;
 #[cfg(feature = "fake")]
 pub mod fake;
 
+#[cfg(feature = "conformance")]
+pub mod conformance;
+
 pub use block_device::{BlockDevice, BlockHandle};
 pub use error::{CorruptionSite, FrameError, IoError, KeyError, StoreError};
 pub use key_provider::{KeyProvider, KeyRef, KeyVersion, ScopeKey};

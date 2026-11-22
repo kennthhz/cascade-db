@@ -19,7 +19,7 @@ mod page_store;
 pub use block_device::MemBlockDevice;
 pub use key_provider::MemKeyProvider;
 pub use log_store::MemLogStore;
-pub use page_store::MemPageStore;
+pub use page_store::{MemPageStore, PageApply, PageRouter};
 
 use crate::OpCtx;
 

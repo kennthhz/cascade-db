@@ -68,12 +68,17 @@ impl<S: LogSource + ?Sized> MemPageStore<S> {
         }
     }
 
-    /// Pulls durable log through the subscription until `ingested >=
-    /// up_to` (§4.5 promise 3: catch-up on demand). Durability is learned
+    /// Pulls durable log until `ingested >= up_to` (§4.5 promise 3:
+    /// catch-up on demand). Catch-up pulls with `read_log`, not a
+    /// subscription — the subscription *waits* at the durable LSN (§4.4),
+    /// while an on-demand miss must fail fast: an empty chunk means the
+    /// request reached past the durable LSN, i.e. `BeyondDurable` (§4.5
+    /// promise 2: nothing non-durable is applied). Durability is learned
     /// only from the chunks themselves (`LogChunk::durable`) — the page
-    /// store never sees a sink; reaching the durable LSN below `up_to` is
-    /// `BeyondDurable` (§4.5 promise 2: nothing non-durable is applied).
+    /// store never sees a sink.
     fn catch_up(&self, scope: ScopeId, up_to: Lsn) -> Result<(), StoreError> {
+        let span = cascade_telemetry::Span::noop();
+        let ctx = crate::fake::test_ctx(&span, 0);
         loop {
             let ingested = {
                 let st = self.state.lock().expect("page store lock");
@@ -83,12 +88,9 @@ impl<S: LogSource + ?Sized> MemPageStore<S> {
             if ingested >= up_to {
                 return Ok(());
             }
-            let mut sub = self.source.subscribe(
-                &crate::fake::test_ctx(&cascade_telemetry::Span::noop(), 0),
-                scope,
-                ingested,
-            );
-            let chunk = futures_lite::future::block_on(sub.next())?;
+            let chunk = futures_lite::future::block_on(
+                self.source.read_log(&ctx, scope, ingested, 1024 * 1024),
+            )?;
             let mut st = self.state.lock().expect("page store lock");
             let scope_state = st.get_mut(&scope).ok_or(StoreError::UnknownScope(scope))?;
             scope_state.durable_view = chunk.durable;
@@ -110,7 +112,6 @@ impl<S: LogSource + ?Sized> MemPageStore<S> {
                 at += d.total;
                 scope_state.ingested = Lsn(record_lsn.0 + d.total as u64);
             }
-            drop(sub);
         }
     }
 }
