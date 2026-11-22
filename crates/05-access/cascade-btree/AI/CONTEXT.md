@@ -6,7 +6,7 @@ B+Tree access method — the IOT primary tree (HLD v2 §11: newest row version i
 
 ## Pillar Reservations
 
-- **HLD v2 (docs/storage-subsystem-hld-v2.md) is the source of truth** for this crate: one writer per scope (§2 principle 1, §4), page cache and cross-core reader access (§8), the redo contract (§9), leaf rows (§11), index entries (§13).
+- **Storage foundations (crates/02-storage/AI/storage-layer-design.md §12) are the source of truth** for this crate: one writer per scope (§12.1 principle 1, §12.2), the redo contract (§12.4), page cache and cross-core reader access (§12.5); leaf rows and index entries are the per-component designs (docs/components/, pending).
 
 ## Hard Invariants
 

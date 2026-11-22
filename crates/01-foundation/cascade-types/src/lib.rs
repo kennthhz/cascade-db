@@ -2,6 +2,10 @@
 //!
 //! See `README.md` and `AI/CONTEXT.md` for the design contract.
 
+use std::time::Instant;
+
+use cascade_telemetry::Span;
+
 // -----------------------------------------------------------------------------
 // Identifiers
 // -----------------------------------------------------------------------------
@@ -29,6 +33,49 @@ pub struct PageId {
     pub page_no: PageNo,
 }
 
+/// A writing scope (storage-layer-design.md §4.2): the unit of log order,
+/// durability and ownership — a database in v1 (architecture D10). Scope
+/// IDs are never reused (S18): a dropped scope's ID is retired for good and
+/// new ones come from counters that survive restarts. Reuse would let stale
+/// data come back — a truncated table's old page served where the new table
+/// expects zeros, or a dropped scope's old log frames attached to a new
+/// scope that was handed the recycled ID (§4.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ScopeId(pub u64);
+
+/// Ownership epoch over a scope (§12.2): every record of a scope belongs to
+/// exactly one epoch, epochs only increase along the LSN, and an
+/// `open_writer` fences every older epoch (`LogSink` promise 1). Zero is
+/// never issued — [`Epoch::FIRST`] is the first — so an all-zero record
+/// field is distinguishable from a real epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Epoch(pub u64);
+
+impl Epoch {
+    /// The first epoch ever issued for a scope. Zero itself is reserved.
+    pub const FIRST: Epoch = Epoch(1);
+
+    /// The epoch for `raw`, refusing the reserved zero. Panics — issuing 0
+    /// would defeat the fencing invariants; a programmer error, not a
+    /// runtime condition (the same constructor-guard class as
+    /// [`VersionWord::committed`]).
+    pub fn issued(raw: u64) -> Self {
+        assert!(raw != 0, "epoch 0 is reserved and never issued (§4.2)");
+        Epoch(raw)
+    }
+
+    /// The next epoch after this one — the ownership bump a reopen or
+    /// handoff takes (§12.2).
+    pub fn next(self) -> Self {
+        Epoch(self.0 + 1)
+    }
+}
+
+/// A storage node in the managed service (§4.2). The v1 single server has
+/// exactly one; `cascade-storage-remote` names replicas with it later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub u32);
+
 // -----------------------------------------------------------------------------
 // Sequence numbers
 // -----------------------------------------------------------------------------
@@ -37,9 +84,17 @@ pub struct PageId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(pub u64);
 
-/// Transaction ID. Per-database.
+/// Transaction ID, per database (storage-layer-design.md §9, M0: the
+/// storage contracts name it `TxnId`; the pre-M0 name stays available as
+/// the [`Xid`] alias).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Xid(pub u64);
+pub struct TxnId(pub u64);
+
+/// The pre-M0 name of [`TxnId`], kept until existing call sites migrate.
+/// Deliberately not yet `#[deprecated]`: the attribute would put a warning
+/// into every crate that still names `Xid`, and the workspace gate is
+/// clippy-zero-warning. It lands together with that migration.
+pub type Xid = TxnId;
 
 /// Hybrid logical clock timestamp (HLD v2 §6): `48-bit ms << 16 | 16-bit
 /// logical counter`.
@@ -114,11 +169,11 @@ impl VersionWord {
 
     const UNCOMMITTED_TAG: u64 = 1 << 63;
 
-    /// The word an in-flight txn stamps: tagged with its Xid.
+    /// The word an in-flight txn stamps: tagged with its TxnId.
     ///
     /// Panics on `xid ≥ 2^63` — the top bit is the tag and must stay free
     /// (a programmer error, not a runtime condition).
-    pub fn uncommitted(xid: Xid) -> Self {
+    pub fn uncommitted(xid: TxnId) -> Self {
         assert!(
             xid.0 < Self::UNCOMMITTED_TAG,
             "xid {} overflows 63 bits — the top bit is the uncommitted tag",
@@ -159,9 +214,9 @@ impl VersionWord {
     /// The owning txn of an uncommitted word. Panics on a committed or
     /// empty word — call sites branch on [`is_uncommitted`] first (misuse
     /// is a bug, not a runtime condition).
-    pub fn xid(&self) -> Xid {
+    pub fn xid(&self) -> TxnId {
         assert!(self.is_uncommitted(), "xid() on a non-uncommitted word");
-        Xid(self.0 & !Self::UNCOMMITTED_TAG)
+        TxnId(self.0 & !Self::UNCOMMITTED_TAG)
     }
 
     /// The commit_ts of a committed word. Panics on an uncommitted or
@@ -172,6 +227,63 @@ impl VersionWord {
             "commit_ts() on a committed word only"
         );
         Hlc(self.0)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Operation context (storage-layer-design.md §4.2, step M0)
+// -----------------------------------------------------------------------------
+
+/// Which tenant and database an operation acts on. Every storage-contract
+/// call carries one (S4 / Rule 8), and every I/O submission is tagged with
+/// it for per-database accounting (§4.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TenantContext {
+    /// The database the operation touches. In v1 every database is one
+    /// scope, which also holds its catalog (§12.2).
+    pub database: DatabaseId,
+    /// The governing tenant, when one exists. In v1 a tenant typically is
+    /// one database, so single-server use leaves this `None`.
+    pub tenant: Option<TenantId>,
+}
+
+impl TenantContext {
+    /// The context for a lone database with no governing tenant — the v1
+    /// single-server shape.
+    pub const fn for_database(database: DatabaseId) -> Self {
+        TenantContext {
+            database,
+            tenant: None,
+        }
+    }
+}
+
+/// The context every storage-contract call takes explicitly (S4): who the
+/// caller acts for, under which tracing span, by when it must finish. Cheap
+/// to construct and copy — hot-path functions forward it unchanged.
+#[derive(Debug, Clone, Copy)]
+pub struct OpCtx<'a> {
+    pub tenant: TenantContext,
+    pub span: &'a Span,
+    /// `None` means no caller deadline; components check it at their
+    /// natural await points (Rule 8).
+    pub deadline: Option<Instant>,
+}
+
+impl<'a> OpCtx<'a> {
+    /// A context with no deadline.
+    pub fn new(tenant: TenantContext, span: &'a Span) -> Self {
+        OpCtx {
+            tenant,
+            span,
+            deadline: None,
+        }
+    }
+
+    /// Builder: sets the caller deadline (Rule 8).
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 }
 
@@ -258,6 +370,16 @@ impl std::fmt::Debug for AlignedBuf {
 /// Size of an `AlignedBuf` and the storage page.
 pub const PAGE_SIZE: usize = 8192;
 
+// -----------------------------------------------------------------------------
+// Futures (storage-layer-design.md §4.1)
+// -----------------------------------------------------------------------------
+
+/// A boxed future that stays on the calling core (S3): storage-contract
+/// futures are polled to completion where they were created, so the trait
+/// object carries no `Send` bound. The contracts' async methods return this
+/// shape — one heap allocation per call, on paths where I/O dominates.
+pub type LocalBoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,10 +412,10 @@ mod tests {
 
     #[test]
     fn version_word_roundtrips_both_states() {
-        let uncommitted = VersionWord::uncommitted(Xid(u64::MAX >> 1)); // max 63-bit
+        let uncommitted = VersionWord::uncommitted(TxnId(u64::MAX >> 1)); // max 63-bit
         assert!(uncommitted.is_uncommitted());
         assert!(!uncommitted.is_empty());
-        assert_eq!(uncommitted.xid(), Xid(u64::MAX >> 1));
+        assert_eq!(uncommitted.xid(), TxnId(u64::MAX >> 1));
         assert_eq!(uncommitted.0, u64::MAX, "tag bit | all-ones xid");
 
         let committed = VersionWord::committed(Hlc(0x0123_4567_89AB_CDEF));
@@ -307,7 +429,7 @@ mod tests {
         // The tag must survive any xid low bits — including all-ones low bits
         // — and committed words must keep bit 63 clear for any legal ts.
         for xid in [1u64, 2, 0x1234_5678, u64::MAX >> 1, (u64::MAX >> 1) - 1] {
-            assert!(VersionWord::uncommitted(Xid(xid)).is_uncommitted());
+            assert!(VersionWord::uncommitted(TxnId(xid)).is_uncommitted());
         }
         for ts in [1u64, 2, 0x0F0F_0F0F_0F0F_0F0F, u64::MAX >> 1] {
             assert!(!VersionWord::committed(Hlc(ts)).is_uncommitted());
@@ -331,7 +453,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "overflows 63 bits")]
     fn xid_overflow_is_refused() {
-        VersionWord::uncommitted(Xid(1u64 << 63));
+        VersionWord::uncommitted(TxnId(1u64 << 63));
     }
 
     #[test]
@@ -349,6 +471,85 @@ mod tests {
     #[test]
     #[should_panic(expected = "committed word only")]
     fn commit_ts_accessor_refused_on_uncommitted_word() {
-        let _ = VersionWord::uncommitted(Xid(7)).commit_ts();
+        let _ = VersionWord::uncommitted(TxnId(7)).commit_ts();
+    }
+
+    // ---- scopes, epochs and the operation context (storage M0) ----
+
+    #[test]
+    fn scope_ids_order_hash_and_copy() {
+        let a = ScopeId(1);
+        let b = ScopeId(2);
+        assert!(b > a, "scope IDs order: counters that survive restarts (S18)");
+        let copied = a; // Copy — every core holds the scope by value
+        assert_eq!(copied, a);
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        set.insert(ScopeId(1));
+        assert_eq!(set.len(), 2, "ScopeId hashes by value");
+    }
+
+    #[test]
+    fn epochs_start_at_one_and_increase() {
+        assert_eq!(Epoch::FIRST, Epoch(1), "epoch 0 is reserved, never issued");
+        assert_eq!(Epoch::issued(41).next(), Epoch(42));
+        assert!(Epoch::issued(7) > Epoch::FIRST);
+    }
+
+    #[test]
+    #[should_panic(expected = "epoch 0 is reserved")]
+    fn epoch_issued_refuses_the_reserved_zero() {
+        let _ = Epoch::issued(0);
+    }
+
+    #[test]
+    fn node_ids_are_plain_u32_handles() {
+        assert_eq!(NodeId(3), NodeId(3));
+        assert_ne!(NodeId(3), NodeId(4));
+    }
+
+    #[test]
+    fn txnid_is_the_new_name_and_xid_still_compiles() {
+        let t = TxnId(9);
+        let x: Xid = t; // same type through the alias — old call sites keep working
+        assert_eq!(x, TxnId(9));
+        let legacy = TxnId(5); // the old construction form, unchanged
+        assert_eq!(VersionWord::uncommitted(legacy).xid(), TxnId(5));
+        assert_eq!(VersionWord::uncommitted(TxnId(3)).xid(), TxnId(3));
+    }
+
+    #[test]
+    fn op_ctx_carries_tenant_span_and_deadline() {
+        use std::time::{Duration, Instant};
+
+        let span = cascade_telemetry::Span::noop();
+        let ctx = OpCtx::new(TenantContext::for_database(DatabaseId(1)), &span);
+        assert_eq!(ctx.tenant, TenantContext::for_database(DatabaseId(1)));
+        assert_eq!(ctx.tenant.tenant, None);
+        assert!(ctx.deadline.is_none());
+
+        let ctx = ctx.with_deadline(Instant::now() + Duration::from_secs(1));
+        assert!(ctx.deadline.is_some());
+
+        let forwarded = ctx; // Copy — hot-path functions forward it unchanged
+        assert_eq!(forwarded.tenant, ctx.tenant);
+    }
+
+    #[test]
+    fn tenant_context_can_carry_a_governing_tenant() {
+        let ctx = TenantContext {
+            database: DatabaseId(2),
+            tenant: Some(TenantId(7)),
+        };
+        assert_eq!(ctx.tenant, Some(TenantId(7)));
+    }
+
+    #[test]
+    fn local_box_future_is_not_send() {
+        // S3: storage-contract futures stay on the calling core. If this
+        // assertion fails to compile, LocalBoxFuture grew a Send bound.
+        static_assertions::assert_not_impl_any!(LocalBoxFuture<'static, ()>: Send);
     }
 }

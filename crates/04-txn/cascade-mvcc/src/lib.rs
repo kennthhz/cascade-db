@@ -4,7 +4,7 @@
 
 #![allow(dead_code)]
 
-use cascade_types::{DatabaseId, Xid};
+use cascade_types::{DatabaseId, TxnId};
 
 /// Per-database, monotonic XID allocator. 64-bit; no wraparound.
 pub struct XidAllocator {
@@ -15,13 +15,13 @@ pub struct XidAllocator {
 /// Snapshot — the set of committed XIDs visible to a reader.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    pub xmin: Xid,
-    pub xmax: Xid,
-    // pub running: Vec<Xid>, // XIDs concurrent at snapshot time
+    pub xmin: TxnId,
+    pub xmax: TxnId,
+    // pub running: Vec<TxnId>, // XIDs concurrent at snapshot time
 }
 
 /// Visibility predicate.
-pub fn visible_to(_row_xmin: Xid, _row_xmax: Option<Xid>, _snapshot: &Snapshot) -> bool {
+pub fn visible_to(_row_xmin: TxnId, _row_xmax: Option<TxnId>, _snapshot: &Snapshot) -> bool {
     // Implementation lands in Phase 3.
     todo!()
 }

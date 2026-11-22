@@ -95,17 +95,26 @@ fn decodes_invert_the_encodings_everywhere_sampled() {
     }
     assert_eq!(decode_bool(&encode_bool(false)), Some(false));
     assert_eq!(decode_bool(&encode_bool(true)), Some(true));
-    // Shape refusals: each decoder refuses every other encoding.
-    for k in [
-        encode_int8(-9),
-        encode_text("nope").expect("legal"),
-        encode_bool(true),
-        encode_null(),
-    ] {
-        assert_eq!(decode_int8(&k), None, "decode_int8 refuses {k:?}");
-        assert_eq!(decode_text(&k), None, "decode_text refuses {k:?}");
-        assert_eq!(decode_bool(&k), None, "decode_bool refuses {k:?}");
-    }
+    // Shape refusals: each decoder accepts exactly its own encoding and
+    // refuses every other shape (None, never garbage). NULL is no type's
+    // value at all.
+    let int_key = encode_int8(-9);
+    let text_key = encode_text("nope").expect("legal");
+    let bool_key = encode_bool(true);
+    let null_key = encode_null();
+    assert_eq!(decode_int8(&int_key), Some(-9), "own type decodes");
+    assert_eq!(decode_text(&int_key), None);
+    assert_eq!(decode_bool(&int_key), None);
+    assert_eq!(decode_text(&text_key), Some("nope".to_string()));
+    assert_eq!(decode_int8(&text_key), None);
+    assert_eq!(decode_bool(&text_key), None);
+    assert_eq!(decode_bool(&bool_key), Some(true), "own type decodes");
+    assert_eq!(decode_int8(&bool_key), None);
+    assert_eq!(decode_text(&bool_key), None);
+    assert_eq!(decode_int8(&null_key), None);
+    assert_eq!(decode_text(&null_key), None);
+    assert_eq!(decode_bool(&null_key), None);
+    assert!(is_null(&null_key));
 }
 
 /// Ordering law: bytewise order agrees with value order, transitively,
@@ -142,7 +151,7 @@ fn text_keys_order_exactly_like_the_strings() {
             encode_text(&w[0]).expect("legal"),
             encode_text(&w[1]).expect("legal"),
         );
-        assert!(k0 < k1, "{w[0]:?} must sort below {w[1]:?}");
+        assert!(k0 < k1, "{:?} must sort below {:?}", w[0], w[1]);
     }
 }
 
@@ -211,8 +220,8 @@ fn text_prefix_covers_exactly_its_strings() {
         };
         let range = KeyRange::text_prefix(&p);
         let inside = |k: &KeyBytes| {
-            matches!(range.lower, Bound::Included(ref lo) if *lo <= k)
-                && matches!(range.upper, Bound::Excluded(ref hi) if k < *hi)
+            matches!(range.lower, Bound::Included(ref lo) if *lo <= *k)
+                && matches!(range.upper, Bound::Excluded(ref hi) if *k < *hi)
         };
         for t in &strings {
             assert_eq!(
@@ -240,8 +249,16 @@ fn text_prefix_covers_exactly_its_strings() {
 fn text_keys_refuse_nuls_in_every_position() {
     for s in ["\0", "a\0", "\0a", "ab\0cd", "é\0🦀"] {
         assert_eq!(encode_text(s), Err(NulInText), "{s:?} must refuse");
-        assert_eq!(decode_text(&KeyBytes(vec![tag::TEXT, 0])), None);
     }
+    // [TEXT, 0] is not NUL-bearing: its single 0x00 is the terminator, so it
+    // is exactly the encoding of "" and decodes as such.
+    assert_eq!(
+        decode_text(&KeyBytes(vec![tag::TEXT, 0])),
+        Some(String::new()),
+        "the terminator alone is the empty string, not a NUL payload"
+    );
+    // Payload NULs never decode, even when the shape is valid:
+    assert_eq!(decode_text(&KeyBytes(vec![tag::TEXT, 0, b'a'])), None);
     let illegal = KeyBytes(vec![tag::TEXT, b'a', 0, 0]);
     assert_eq!(decode_text(&illegal), None, "shape-valid, domain-illegal");
     // The clean boundary: the byte above every legal payload still encodes.
@@ -275,8 +292,8 @@ fn interior_nul_would_break_concat_order_the_refusal_prevents_it() {
 #[test]
 fn column_prefix_is_exact_column_equality() {
     let in_range = |r: &KeyRange, k: &KeyBytes| {
-        matches!(r.lower, Bound::Included(ref lo) if *lo <= k)
-            && matches!(r.upper, Bound::Excluded(ref hi) if k < *hi)
+        matches!(r.lower, Bound::Included(ref lo) if *lo <= *k)
+            && matches!(r.upper, Bound::Excluded(ref hi) if *k < *hi)
     };
     let mut r = Rng::new(0xA00D);
     let ints = sampled_i64s(0xA00E, 0);

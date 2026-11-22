@@ -20,6 +20,7 @@ pub mod pg;
 pub mod pin;
 pub mod recovery;
 pub mod pools;
+pub mod rt;
 pub mod reaper;
 pub mod recycler;
 pub mod router;

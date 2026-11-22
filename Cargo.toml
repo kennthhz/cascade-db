@@ -30,6 +30,7 @@ members = [
     "crates/08-wire/cascade-pgwire",
     # 09-runtime
     "crates/09-runtime/cascade-runtime",
+    "crates/09-runtime/cascade-rt-api",
     "crates/09-runtime/cascade-tenant",
     # 10-columnar
     "crates/10-columnar/cascade-columnar",
@@ -108,6 +109,7 @@ cascade-pgtypes       = { path = "crates/07-sql/cascade-pgtypes" }
 cascade-plpgsql       = { path = "crates/07-sql/cascade-plpgsql" }
 cascade-pgwire        = { path = "crates/08-wire/cascade-pgwire" }
 cascade-runtime       = { path = "crates/09-runtime/cascade-runtime" }
+cascade-rt-api        = { path = "crates/09-runtime/cascade-rt-api" }
 cascade-tenant        = { path = "crates/09-runtime/cascade-tenant" }
 cascade-columnar      = { path = "crates/10-columnar/cascade-columnar" }
 cascade-ext-abi       = { path = "crates/11-extension/cascade-ext-abi" }

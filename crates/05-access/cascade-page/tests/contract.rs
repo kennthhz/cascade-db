@@ -8,9 +8,9 @@
 
 use cascade_page::{
     encode_cell, is_initialized, parse_cell, NextWord, PageError, PageMut, PageView, CELL_FIXED,
-    NEXT_HAS_NEXT, NEXT_HAS_TOAST, PAGE_SIZE,
+    NEXT_HAS_NEXT, NEXT_HAS_TOAST,
 };
-use cascade_types::{Hlc, VersionWord as VW, Xid};
+use cascade_types::{Hlc, PAGE_SIZE, VersionWord as VW, TxnId};
 
 /// Deterministic xorshift64\* — reproducible samples, no dependency.
 struct Rng(u64);
@@ -43,11 +43,11 @@ fn payload(seed: u64, len: usize) -> Vec<u8> {
 /// cell, xmax/next zero for a fresh cell.
 #[test]
 fn encode_cell_layout_is_pinned() {
-    let b = encode_cell(VW::uncommitted(Xid(7)), b"xy").expect("fits");
+    let b = encode_cell(VW::uncommitted(TxnId(7)), b"xy").expect("fits");
     assert_eq!(b.len(), CELL_FIXED + 2);
     let mut want = Vec::new();
     want.extend_from_slice(&((CELL_FIXED + 2) as u16).to_le_bytes());
-    want.extend_from_slice(&(Xid(7).0 | (1 << 63)).to_le_bytes());
+    want.extend_from_slice(&(TxnId(7).0 | (1 << 63)).to_le_bytes());
     want.extend_from_slice(&0u64.to_le_bytes());
     want.extend_from_slice(&0u64.to_le_bytes());
     want.extend_from_slice(b"xy");
@@ -64,9 +64,11 @@ fn the_u16_ceiling_is_exact() {
         encode_cell(VW::EMPTY, &payload(0xB01, max)).is_ok(),
         "{max}-byte payload is exactly at the ceiling"
     );
-    assert_eq!(
-        encode_cell(VW::EMPTY, &payload(0xB02, max + 1)),
-        Err(PageError::CellTooLarge),
+    assert!(
+        matches!(
+            encode_cell(VW::EMPTY, &payload(0xB02, max + 1)),
+            Err(PageError::CellTooLarge)
+        ),
         "one byte past the ceiling refuses"
     );
 }
@@ -79,8 +81,8 @@ fn parse_inverts_encode_everywhere_sampled() {
     let mut r = Rng::new(0xB03);
     let sizes = [0usize, 1, 25, 26, 27, 255, 4096, u16::MAX as usize - CELL_FIXED];
     let xmins = [
-        VW::uncommitted(Xid(1)),
-        VW::uncommitted(Xid((1 << 63) - 1)),
+        VW::uncommitted(TxnId(1)),
+        VW::uncommitted(TxnId((1 << 63) - 1)),
         VW::committed(Hlc(0x1234_5678_9ABC)),
     ];
     for (i, &len) in sizes.iter().enumerate() {
@@ -141,11 +143,11 @@ fn standalone_cells_match_the_in_page_cell() {
     let mut buf = [0u8; PAGE_SIZE];
     let mut page = PageMut::init(&mut buf);
     let p = payload(0xB06, 64);
-    let slot = page.append_cell(VW::uncommitted(Xid(9)), &p).expect("fits");
+    let slot = page.append_cell(VW::uncommitted(TxnId(9)), &p).expect("fits");
     let view: PageView<'_> = page.view().expect("initialized page views");
     let in_page = view.cell(slot as usize).expect("the appended cell");
-    let standalone = parse_cell(&encode_cell(VW::uncommitted(Xid(9)), &p).expect("fits"))
-        .expect("parses");
+    let encoded = encode_cell(VW::uncommitted(TxnId(9)), &p).expect("fits");
+    let standalone = parse_cell(&encoded).expect("parses");
     assert_eq!(in_page.xmin, standalone.xmin);
     assert_eq!(in_page.xmax, standalone.xmax);
     assert_eq!(in_page.next, standalone.next);
@@ -159,7 +161,7 @@ fn standalone_cells_match_the_in_page_cell() {
 fn mutators_stamp_through_the_page_and_read_back() {
     let mut buf = [0u8; PAGE_SIZE];
     let mut page = PageMut::init(&mut buf);
-    let slot = page.append_cell(VW::uncommitted(Xid(3)), b"row").expect("fits");
+    let slot = page.append_cell(VW::uncommitted(TxnId(3)), b"row").expect("fits");
 
     page.set_xmax(slot, VW::committed(Hlc(0x4242)));
     page.set_next(slot, NextWord::chain(5, 1, NEXT_HAS_TOAST));
@@ -169,7 +171,10 @@ fn mutators_stamp_through_the_page_and_read_back() {
     assert_eq!(c.next, NextWord::chain(5, 1, NEXT_HAS_TOAST));
     assert_eq!(c.next.page_no(), 5);
     assert_eq!(c.next.slot(), 1);
-    assert_eq!(c.next.flags(), NEXT_HAS_TOAST);
+    // chain() implies HAS_NEXT by construction — without that bit the whole
+    // word is ignored, so a chain constructor that left it clear would build
+    // words no reader would follow.
+    assert_eq!(c.next.flags(), NEXT_HAS_TOAST | NEXT_HAS_NEXT);
     assert!(c.next.has_next());
 
     // Back to chain-end: NONE is the encoded zero, and without HAS_NEXT
@@ -178,7 +183,16 @@ fn mutators_stamp_through_the_page_and_read_back() {
     let view = page.view().expect("views");
     assert_eq!(view.cell(slot as usize).expect("cell").next, NextWord::NONE);
     assert!(!NextWord::from_raw(0xABCD).has_next(), "no HAS_NEXT bit");
-    assert_eq!(NextWord::from_raw(NEXT_HAS_NEXT as u64).has_next(), true);
+    // Flags live in word bits 48..63 — a raw word must carry the flag
+    // inside the flags field, not in the slot bits below it.
+    assert!(
+        NextWord::from_raw((NEXT_HAS_NEXT as u64) << 48).has_next(),
+        "HAS_NEXT set in the flags field"
+    );
+    assert!(
+        !NextWord::from_raw(NEXT_HAS_NEXT as u64).has_next(),
+        "the same bit at the bottom of the word is a slot bit, not a flag"
+    );
 
     // The deleter word survives independent of the chain word.
     let view = page.view().expect("views");

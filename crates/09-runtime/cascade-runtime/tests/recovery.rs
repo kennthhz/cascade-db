@@ -31,7 +31,7 @@ use cascade_runtime::{
     tenant,
     AcceptLoop, Runtime, RuntimeConfig,
 };
-use cascade_types::{DatabaseId, Lsn, SegmentId, VersionWord, Xid};
+use cascade_types::{DatabaseId, Lsn, SegmentId, VersionWord, TxnId};
 use cascade_wal::{DebugWalReader, WalHandle, WalReader, WalRecord, WalWriter};
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -65,7 +65,7 @@ fn heap_insert_record(xid: u64, id: i32, val: &str) -> WalRecord {
         xid,
         segment: SegmentId(1),
         cell: cascade_page::encode_cell(
-            VersionWord::uncommitted(Xid(xid)),
+            VersionWord::uncommitted(TxnId(xid)),
             &session::debug_row_image(id, val),
         )
         .expect("test rows fit in a cell"),
@@ -434,7 +434,7 @@ fn replay_refuses_a_non_utf8_row_image() {
     let insert = WalRecord::HeapInsert {
         xid: 77,
         segment: SegmentId(1),
-        cell: cascade_page::encode_cell(VersionWord::uncommitted(Xid(77)), &image)
+        cell: cascade_page::encode_cell(VersionWord::uncommitted(TxnId(77)), &image)
             .expect("fits in a cell"),
     };
     // Stage a committed txn around it, exactly like write_txn.

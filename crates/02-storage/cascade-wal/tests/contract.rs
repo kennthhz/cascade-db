@@ -8,7 +8,7 @@
 
 use std::{io::Write, path::PathBuf, sync::atomic::{AtomicU32, Ordering}};
 
-use cascade_types::{DatabaseId, Lsn, SegmentId, VersionWord, Xid};
+use cascade_types::{DatabaseId, Lsn, SegmentId, VersionWord, TxnId};
 use cascade_wal::{
     DebugWalReader, WalError, WalHandle, WalReader, WalRecord, WalWriter,
 };
@@ -39,7 +39,7 @@ fn staged_record() -> WalRecord {
     WalRecord::HeapInsert {
         xid: 9,
         segment: SegmentId(3),
-        cell: cascade_page::encode_cell(VersionWord::uncommitted(Xid(9)), b"payload bytes")
+        cell: cascade_page::encode_cell(VersionWord::uncommitted(TxnId(9)), b"payload bytes")
             .expect("fits"),
     }
 }
@@ -85,8 +85,9 @@ fn no_single_byte_corruption_reads_as_a_record() {
                     WalError::Corruption(_)
                     | WalError::TornTail(_)
                     | WalError::LsnMismatch { .. }
-                    | WalError::UnknownRecordType(_)
-                    | WalError::UnknownRecordVersion(_),
+                    | WalError::UnknownRecordType { .. }
+                    | WalError::UnknownRecordVersion(_)
+                    | WalError::Io(_),
                 ) => {}
                 Ok(Some(entry)) => panic!(
                     "byte {pos} flipped and the record still decoded as {:?} — \

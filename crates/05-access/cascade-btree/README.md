@@ -14,7 +14,7 @@ Layer **05-access**. The primary index structure for Cascade DB. Used for primar
 
 ## Concurrency
 
-Per HLD v2 (docs/storage-subsystem-hld-v2.md): one writer per scope (§2 principle 1, §4) — all mutations to one tree are serialized on the owning core. Readers share pages through the page cache (§8); cross-core reader access is that section's open question. The concrete reader/writer protocol is pinned by the detailed design under `AI/`.
+Per the storage foundations (crates/02-storage/AI/storage-layer-design.md §12): one writer per scope (§12.1 principle 1, §12.2) — all mutations to one tree are serialized on the owning core. Readers share pages through the page cache (§8); cross-core reader access is that section's open question. The concrete reader/writer protocol is pinned by the detailed design under `AI/`.
 
 ## Dependencies
 

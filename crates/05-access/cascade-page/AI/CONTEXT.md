@@ -63,7 +63,7 @@ reserved `undo_ref` became `NextWord` (`chain(page_no, slot, flags)` forces
 `append_cell` takes the typed creator word; `set_xmax(slot, VersionWord)` and
 `set_next(slot, NextWord)` mutate cells in place (out-of-range slot = panic).
 `CELL_FIXED` stays 26; `FORMAT_VERSION` stays 1 (no persisted readers exist;
-the evolution is documented in docs/storage-wp1-formats.md). Parse remains
+the evolution is documented in crates/02-storage/AI/storage-layer-design.md (§12.7 WP table)). Parse remains
 structural — version-word semantics are the visibility layer's, never the
 page parser's. Tests grew: version-word bit matrix (cascade-types), chain
 word layout literal (`0x0003_0102_0304_0506` for `chain(0x01020304, 0x0506,

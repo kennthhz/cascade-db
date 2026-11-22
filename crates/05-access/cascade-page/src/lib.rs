@@ -178,7 +178,7 @@ fn rd_u64(buf: &[u8; PAGE_SIZE], off: usize) -> u64 {
 /// `(PageId, SlotId)`).
 #[derive(Debug)]
 pub struct CellRef<'a> {
-    /// The §12 creator word: uncommitted-tagged `Xid` until the commit
+    /// The §12 creator word: uncommitted-tagged `TxnId` until the commit
     /// stamps the `commit_ts`.
     pub xmin: VersionWord,
     /// The §12 deleter word — [`VersionWord::EMPTY`] while the tuple is live.
@@ -379,7 +379,7 @@ impl<'a> PageMut<'a> {
     /// index. Cells grow downward from the page tail; the slot array grows
     /// up from [`SLOTS_BASE`]; the append fails with [`PageError::Full`] the
     /// moment the two regions would touch. `xmin` is the §12 creator word
-    /// (tagged with the writer's `Xid`); `xmax`/`next` are written zero —
+    /// (tagged with the writer's `TxnId`); `xmax`/`next` are written zero —
     /// live, chain ends. `page_lsn` is NOT touched here — the access method
     /// stamps it via [`PageMut::set_page_lsn`] as part of the logged write.
     pub fn append_cell(&mut self, xmin: VersionWord, payload: &[u8]) -> Result<u16, PageError> {
@@ -449,7 +449,7 @@ impl<'a> PageMut<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cascade_types::{Hlc, Xid};
+    use cascade_types::{Hlc, TxnId};
 
     /// The whole layout, pinned byte-for-byte at the only version that will
     /// ever read these images: all 32 header bytes, the slot array, and both
@@ -460,11 +460,11 @@ mod tests {
         {
             let mut p = PageMut::init(&mut img);
             assert_eq!(
-                p.append_cell(VersionWord::uncommitted(Xid(7)), b"ab").unwrap(),
+                p.append_cell(VersionWord::uncommitted(TxnId(7)), b"ab").unwrap(),
                 0
             );
             assert_eq!(
-                p.append_cell(VersionWord::uncommitted(Xid(9)), b"cd").unwrap(),
+                p.append_cell(VersionWord::uncommitted(TxnId(9)), b"cd").unwrap(),
                 1
             );
             p.set_page_lsn(0x0102_0304_0506_0708);
@@ -531,7 +531,7 @@ mod tests {
             let slots: Vec<u16> = (0..100u64)
                 .map(|i| {
                     p.append_cell(
-                        VersionWord::uncommitted(Xid(1_000 + i)),
+                        VersionWord::uncommitted(TxnId(1_000 + i)),
                         &vec![b'x'; (i % 40) as usize],
                     )
                     .unwrap()
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(v.page_lsn(), lsn);
         assert_eq!(v.free_bytes(), free_after_append);
         for (i, cell) in v.iter().enumerate() {
-            assert_eq!(cell.xmin, VersionWord::uncommitted(Xid(1_000 + i as u64)));
+            assert_eq!(cell.xmin, VersionWord::uncommitted(TxnId(1_000 + i as u64)));
             assert_eq!(cell.xmax, VersionWord::EMPTY, "fresh cell is live");
             assert_eq!(cell.next, NextWord::NONE, "fresh cell ends its chain");
             assert_eq!(cell.payload, vec![b'x'; i % 40]);
@@ -563,7 +563,7 @@ mod tests {
         {
             let mut p = PageMut::init(&mut img);
             let s = p
-                .append_cell(VersionWord::uncommitted(Xid(5)), b"row")
+                .append_cell(VersionWord::uncommitted(TxnId(5)), b"row")
                 .unwrap();
             p.set_xmax(s, VersionWord::committed(commit_ts));
             p.set_next(
@@ -626,7 +626,7 @@ mod tests {
         let mut p = PageMut::init(&mut img);
         let mut n = 0;
         while p
-            .append_cell(VersionWord::uncommitted(Xid(1)), &[])
+            .append_cell(VersionWord::uncommitted(TxnId(1)), &[])
             .is_ok()
         {
             n += 1;
@@ -634,7 +634,7 @@ mod tests {
         assert_eq!(n, 291);
         assert_eq!(p.free_bytes(), 12);
         assert!(matches!(
-            p.append_cell(VersionWord::uncommitted(Xid(1)), &[]),
+            p.append_cell(VersionWord::uncommitted(TxnId(1)), &[]),
             Err(PageError::Full)
         ));
         // The refused append left the page consistent.
@@ -648,7 +648,7 @@ mod tests {
         let mut p = PageMut::init(&mut img);
         let huge = vec![0u8; u16::MAX as usize]; // > u16::MAX - 26
         assert!(matches!(
-            p.append_cell(VersionWord::uncommitted(Xid(1)), &huge),
+            p.append_cell(VersionWord::uncommitted(TxnId(1)), &huge),
             Err(PageError::CellTooLarge)
         ));
     }
@@ -660,7 +660,7 @@ mod tests {
         let mut img = [0u8; PAGE_SIZE];
         {
             let mut p = PageMut::init(&mut img);
-            p.append_cell(VersionWord::uncommitted(Xid(5)), b"row")
+            p.append_cell(VersionWord::uncommitted(TxnId(5)), b"row")
                 .unwrap();
         }
 
@@ -732,11 +732,11 @@ mod tests {
     #[test]
     fn standalone_cell_is_byte_identical_to_the_in_page_cell() {
         let payload = b"the row image";
-        let cell = encode_cell(VersionWord::uncommitted(Xid(42)), payload).unwrap();
+        let cell = encode_cell(VersionWord::uncommitted(TxnId(42)), payload).unwrap();
 
         let mut img = [0u8; PAGE_SIZE];
         PageMut::init(&mut img)
-            .append_cell(VersionWord::uncommitted(Xid(42)), payload)
+            .append_cell(VersionWord::uncommitted(TxnId(42)), payload)
             .unwrap();
         let off =
             u16::from_le_bytes(img[SLOTS_BASE..SLOTS_BASE + 2].try_into().unwrap()) as usize;
@@ -744,7 +744,7 @@ mod tests {
         assert_eq!(cell, in_page, "verbatim means verbatim");
 
         let r = parse_cell(&cell).unwrap();
-        assert_eq!(r.xmin, VersionWord::uncommitted(Xid(42)));
+        assert_eq!(r.xmin, VersionWord::uncommitted(TxnId(42)));
         assert_eq!(r.xmax, VersionWord::EMPTY);
         assert_eq!(r.next, NextWord::NONE);
         assert_eq!(r.payload, payload);

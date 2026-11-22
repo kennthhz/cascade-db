@@ -319,6 +319,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-rt-api"
+version = "0.1.0"
+dependencies = [
+ "cascade-types",
+ "futures-lite",
+ "static_assertions",
+]
+
+[[package]]
 name = "cascade-runtime"
 version = "0.1.0"
 dependencies = [
@@ -328,6 +337,7 @@ dependencies = [
  "cascade-error",
  "cascade-page",
  "cascade-pg-parser",
+ "cascade-rt-api",
  "cascade-storage",
  "cascade-telemetry",
  "cascade-tenant",
@@ -419,6 +429,10 @@ dependencies = [
 [[package]]
 name = "cascade-types"
 version = "0.1.0"
+dependencies = [
+ "cascade-telemetry",
+ "static_assertions",
+]
 
 [[package]]
 name = "cascade-undo"

@@ -483,7 +483,7 @@ mod key_tests {
                 page_no: 5,
                 slot: 2,
             },
-            create: VersionWord::uncommitted(cascade_types::Xid(9)),
+            create: VersionWord::uncommitted(cascade_types::TxnId(9)),
             delete: VersionWord::EMPTY,
         };
         assert_eq!(

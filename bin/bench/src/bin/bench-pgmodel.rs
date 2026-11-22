@@ -349,7 +349,7 @@ fn wal_commit(wal_fd: i32, rows: &[(i32, String)]) -> Result<(), (String, String
         .iter()
         .map(|(id, val)| {
             cascade_page::encode_cell(
-                cascade_types::VersionWord::uncommitted(cascade_types::Xid(xid)),
+                cascade_types::VersionWord::uncommitted(cascade_types::TxnId(xid)),
                 &cascade_runtime::session::debug_row_image(*id, val),
             )
             .map_err(|e| ("54000".to_owned(), format!("row too large for a heap cell: {e}")))

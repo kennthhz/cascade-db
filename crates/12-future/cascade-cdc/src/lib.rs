@@ -4,13 +4,13 @@
 
 #![allow(dead_code)]
 
-use cascade_types::{DatabaseId, Lsn, Xid};
+use cascade_types::{DatabaseId, Lsn, TxnId};
 
 /// A decoded logical change event. v1: placeholder shape.
 #[derive(Debug)]
 pub struct ChangeEvent {
     pub lsn: Lsn,
-    pub xid: Xid,
+    pub xid: TxnId,
     pub db: DatabaseId,
     // table, op, before, after — filled in Phase 7.
 }

@@ -1,0 +1,16 @@
+[package]
+name        = "cascade-rt-api"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "Minimal runtime contract for the storage components: spawn_local, now, sleep (M0)."
+
+[dependencies]
+cascade-types = { workspace = true }
+
+[dev-dependencies]
+static_assertions = { workspace = true }
+futures-lite      = { workspace = true }

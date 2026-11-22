@@ -5,7 +5,7 @@
 //! can never collide with the uncommitted tag (the HLC epoch's whole
 //! point), and the HLC orders by (ms, logical).
 
-use cascade_types::{Hlc, VersionWord, Xid, HLC_EPOCH_UNIX_MS};
+use cascade_types::{Hlc, VersionWord, TxnId, HLC_EPOCH_UNIX_MS};
 
 /// Deterministic xorshift64\* — reproducible samples, no dependency. Every
 /// assertion names its seed so a red is replayable by hand.
@@ -69,9 +69,9 @@ fn constructors_roundtrip_through_their_accessors() {
         tss.push(Hlc(r.next_u64() & ((1 << 63) - 1)));
     }
     for x in xids {
-        let w = VersionWord::uncommitted(Xid(x));
+        let w = VersionWord::uncommitted(TxnId(x));
         assert!(w.is_uncommitted());
-        assert_eq!(w.xid(), Xid(x), "xid {x} roundtrips");
+        assert_eq!(w.xid(), TxnId(x), "xid {x} roundtrips");
         assert_ne!(w, VersionWord::EMPTY, "uncommitted is never EMPTY");
     }
     for ts in tss {
@@ -91,7 +91,7 @@ fn committed_and_uncommitted_words_never_collide() {
     let mut r = Rng::new(0xB003);
     for _ in 0..300 {
         let x = r.next_u64() & ((1 << 63) - 1);
-        assert!(VersionWord::uncommitted(Xid(x)).0 >= 1 << 63);
+        assert!(VersionWord::uncommitted(TxnId(x)).0 >= 1 << 63);
         let ts = r.next_u64() & ((1 << 63) - 1);
         assert!(VersionWord::committed(Hlc(ts)).0 < 1 << 63);
     }
@@ -104,7 +104,7 @@ fn committed_and_uncommitted_words_never_collide() {
 #[test]
 #[should_panic(expected = "overflows 63 bits")]
 fn uncommitted_refuses_an_xid_into_the_tag_bit() {
-    VersionWord::uncommitted(Xid(1 << 63));
+    VersionWord::uncommitted(TxnId(1 << 63));
 }
 
 #[test]
@@ -118,7 +118,7 @@ fn committed_refuses_a_timestamp_with_the_tag_bit_set() {
 /// the HLC epoch keeps physical time strictly positive).
 #[test]
 fn empty_is_never_produced_by_a_constructor() {
-    assert_ne!(VersionWord::uncommitted(Xid(0)), VersionWord::EMPTY);
+    assert_ne!(VersionWord::uncommitted(TxnId(0)), VersionWord::EMPTY);
     assert_ne!(VersionWord::committed(Hlc(1)), VersionWord::EMPTY);
     assert!(VersionWord::EMPTY.is_empty());
     assert_eq!(VersionWord::from_raw(0), VersionWord::EMPTY);
@@ -133,14 +133,17 @@ fn hlc_orders_by_ms_then_logical() {
     let ms_hi = (HLC_EPOCH_UNIX_MS + 1_000) << 16;
     let ms_lo = HLC_EPOCH_UNIX_MS << 16;
     for _ in 0..300 {
-        let l1 = r.below(1 << 16) as u64;
-        let l2 = r.below(1 << 16) as u64;
+        let l1 = r.below(1 << 16);
+        let l2 = r.below(1 << 16);
         assert_eq!(
             Hlc(ms_lo | l1) < Hlc(ms_lo | l2),
             l1 < l2,
             "same ms: logical {l1} vs {l2} must decide"
         );
-        let stray = r.next_u64();
+        // A logical counter, not a full word: the logical field is 16 bits
+        // wide (Hlc::LOGICAL_BITS), and a stray with physical bits set would
+        // pollute the ms part it is supposed to sit under.
+        let stray = r.next_u64() & ((1 << 16) - 1);
         assert!(
             Hlc(ms_lo | stray) < Hlc(ms_hi | stray),
             "a later ms always dominates, whatever the logical counter"
@@ -160,7 +163,8 @@ fn the_hlc_epoch_keeps_the_tag_bit_free() {
     assert_eq!(HLC_EPOCH_UNIX_MS, 1_767_225_600_000, "2026-01-01T00:00:00Z");
     // Physical field: ms must stay under 2^47 for bit 63 of the packed
     // word to stay clear (bit 63 of the word = bit 47 of the ms part).
-    assert!(
+    // A const assertion — the epoch law is compile-time, not test-time.
+    const _: () = assert!(
         HLC_EPOCH_UNIX_MS < 1 << 47,
         "the epoch itself must sit inside the tag-free region"
     );
@@ -172,7 +176,7 @@ fn the_hlc_epoch_keeps_the_tag_bit_free() {
     );
     // End to end: the latest issuable timestamp inside the region packs to
     // a word `committed` accepts.
-    let last = ((1u64 << 47) - 1) << 16 | (1 << 16) - 1;
+    let last = (((1u64 << 47) - 1) << 16) | ((1 << 16) - 1);
     let _ = VersionWord::committed(Hlc(last));
     // And the first one past it is refused, not silently tagged.
     let overflow = (1u64 << 47) << 16;

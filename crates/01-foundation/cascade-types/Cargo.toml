@@ -9,4 +9,10 @@ authors.workspace      = true
 description = "Shared primitive types for Cascade DB (PageId, Lsn, Xid, DatabaseId, AlignedBuf, ...)."
 
 [dependencies]
-# Foundation layer — depends on nothing else in the workspace.
+# Foundation layer — depends on nothing above it: `Span` comes from the
+# sibling foundation telemetry crate (storage M0's `OpCtx` carries a `&Span`,
+# storage-layer-design.md §4.2).
+cascade-telemetry = { workspace = true }
+
+[dev-dependencies]
+static_assertions = { workspace = true }

@@ -181,6 +181,7 @@ pub(crate) enum DecodeError {
 
 /// One decoded record: the record itself plus the self-describing header
 /// fields ([`Decoded::lsn`], [`Decoded::epoch`]) the reader validates.
+#[derive(Debug)]
 pub(crate) struct Decoded {
     pub record: WalRecord,
     pub lsn: u64,
@@ -301,7 +302,7 @@ fn is_known_type(t: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cascade_types::{SegmentId, VersionWord, Xid};
+    use cascade_types::{SegmentId, VersionWord, TxnId};
 
     fn legacy_insert(xid: u64, id: i32, val: &str) -> WalRecord {
         WalRecord::LegacyInsert {
@@ -528,7 +529,7 @@ mod tests {
     /// pinned prefix.
     #[test]
     fn heap_insert_bytes_are_pinned() {
-        let cell = cascade_page::encode_cell(VersionWord::uncommitted(Xid(5)), b"abc")
+        let cell = cascade_page::encode_cell(VersionWord::uncommitted(TxnId(5)), b"abc")
             .expect("3-byte payload fits");
         let bytes = encode(
             &WalRecord::HeapInsert {
@@ -579,7 +580,7 @@ mod tests {
     #[test]
     fn heap_insert_cell_is_verbatim_through_encode_decode() {
         let payload = b"the debug row image";
-        let cell = cascade_page::encode_cell(VersionWord::uncommitted(Xid(77)), payload)
+        let cell = cascade_page::encode_cell(VersionWord::uncommitted(TxnId(77)), payload)
             .expect("small payload fits");
         let bytes = encode(
             &WalRecord::HeapInsert {
@@ -601,7 +602,7 @@ mod tests {
                 assert_eq!((xid, segment.0), (77, 3));
                 assert_eq!(out, cell, "cell bytes verbatim");
                 let r = cascade_page::parse_cell(&out).expect("parses");
-                assert_eq!(r.xmin, VersionWord::uncommitted(Xid(77)));
+                assert_eq!(r.xmin, VersionWord::uncommitted(TxnId(77)));
                 assert_eq!(r.xmax, VersionWord::EMPTY);
                 assert_eq!(r.next, cascade_page::NextWord::NONE);
                 assert_eq!(r.payload, payload);
@@ -665,7 +666,7 @@ mod tests {
         for i in 0..4u64 {
             let len = (next() % 96) as usize;
             let cell = cascade_page::encode_cell(
-                VersionWord::uncommitted(Xid(100 + i)),
+                VersionWord::uncommitted(TxnId(100 + i)),
                 &next().to_le_bytes().repeat(len / 8 + 1)[..len],
             )
             .expect("small cells fit");

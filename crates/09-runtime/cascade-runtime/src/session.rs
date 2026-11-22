@@ -22,7 +22,7 @@ use std::{
 
 use cascade_telemetry::Span;
 use cascade_tenant::TenantContext;
-use cascade_types::{Hlc, Lsn, SegmentId, VersionWord, Xid};
+use cascade_types::{Hlc, Lsn, SegmentId, VersionWord, TxnId};
 use cascade_wal::{WalError, WalHandle, WalRecord, WalWriter};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use static_assertions::assert_not_impl_any;
@@ -1112,13 +1112,13 @@ async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
     // client value, and an error after `BeginTxn` reserved would drop the
     // reservation unfilled — a torn log whose filled watermark never
     // advances, wedging every later commit on the DB. The cell is
-    // cascade-page's, verbatim — xmin tagged with this txn's Xid, live and
+    // cascade-page's, verbatim — xmin tagged with this txn's TxnId, live and
     // chain-end. Visibility resolves through the commit's status-table
     // entry (WP2); the cell itself is never rewritten.
     let mut cells = Vec::with_capacity(rows.len());
     for (id, val) in rows {
         cells.push(
-            cascade_page::encode_cell(VersionWord::uncommitted(Xid(xid)), &debug_row_image(*id, val))
+            cascade_page::encode_cell(VersionWord::uncommitted(TxnId(xid)), &debug_row_image(*id, val))
                 .map_err(|e| {
                     PgError::new("54000", format!("row image too large for a heap cell: {e}"))
                 })?,

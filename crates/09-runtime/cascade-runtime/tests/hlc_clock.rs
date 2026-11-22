@@ -105,7 +105,9 @@ fn wall_clock_respects_contract() {
     let p = clock.peek().physical_ms();
     assert!(p <= Hlc::PHYSICAL_MAX_MS);
     assert!(p > 10_000_000_000, "wall HLC ms implausibly small: {p}");
-    assert!(HLC_EPOCH_UNIX_MS > 1_000_000_000_000);
+    // The epoch itself is a compile-time constant of the contract — pin it
+    // at const-eval time, not test time.
+    const _: () = assert!(HLC_EPOCH_UNIX_MS > 1_000_000_000_000);
 }
 
 /// The F1 boundary: any ts the clock can ever issue stamps a committed
