@@ -1,0 +1,16 @@
+[package]
+name        = "cascade-wal-format"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The WAL record byte format (v3): framing, golden layout, payload-blind frame walker (WP1 F3, S16)."
+
+[dependencies]
+cascade-types = { workspace = true }
+crc32fast     = { workspace = true }
+
+[dev-dependencies]
+cascade-page = { workspace = true }

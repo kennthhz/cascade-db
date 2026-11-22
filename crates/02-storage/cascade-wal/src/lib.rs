@@ -23,10 +23,13 @@
 //! between reserve and fill means the record never landed — and the tests
 //! plant it deliberately. Recovery/abort handling arrives with T1.11.
 //!
-//! On-disk format (hand-rolled v2, invariant 3+4; WP1 F3): every record is
-//! `[u32 payload_len][u32 format_version = 2][u8 type][3 reserved]
+//! On-disk format (WP1 F3, format v3 since M1 — owned by
+//! `cascade-wal-format`, re-exported here as [`format`]): every record is
+//! `[u32 payload_len][u32 format_version][u8 type][u8 flags][2 reserved]
 //! [u64 xid][u64 lsn][u64 epoch][payload][u32 CRC32 of all preceding
-//! bytes]` — a 36-byte header. The LSN of a record is its byte offset in
+//! bytes]` — a 36-byte header; v3's flags byte carries the group-end bit
+//! (S16, the mini-transaction is the unit of durability) and v2 bytes
+//! still decode. The LSN of a record is its byte offset in
 //! the DB's log file *and* the explicit header field, so records are
 //! self-describing (§5): the reader cross-checks the two and refuses a
 //! transplant. The epoch field reserves §4 scope fencing in the format (0
@@ -38,7 +41,9 @@
 //! `fdatasync`) — the spec's `O_DIRECT` mandate is for *data pages*; the
 //! WAL is fsync'd sequential I/O, exactly PostgreSQL's model.
 
-pub mod format;
+pub use cascade_wal_format as format;
+pub use cascade_wal_format::WalRecord;
+
 mod io;
 mod recycle;
 mod writer;
@@ -49,72 +54,7 @@ pub use io::{
 pub use recycle::{recycle_decision, RecycleDecision, RECYCLE_SEGMENT_BYTES};
 pub use writer::{Reservation, WalWriter};
 
-use cascade_types::{DatabaseId, Hlc, Lsn};
-
-/// A decoded WAL record — WP1 F3's type table. `BeginTxn`/`CommitTxn`/
-/// `AbortTxn`/`HeapInsert` are the debug slice's records; `LegacyInsert`
-/// (type 4) is retained for replay of pre-T1.3 logs; the reserved families
-/// (heartbeat, high-water, bulk load, unlogged) decode today and
-/// gain producers when their features land. Type bytes are stable forever:
-/// new records extend the `type` byte, never renumber (see [`format`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WalRecord {
-    BeginTxn {
-        xid: u64,
-    },
-    /// §6: the commit record carries txn_id (header `xid`) + commit_ts
-    /// (payload, the packed [`Hlc`]). Commit ordering comes from
-    /// commit_ts, never from LSN adjacency.
-    CommitTxn {
-        xid: u64,
-        commit_ts: Hlc,
-    },
-    AbortTxn {
-        xid: u64,
-    },
-    /// Type 4 (LEGACY_INSERT): the v1 debug row image — decode retained so
-    /// logs written before T1.3 still replay. Nothing emits it anymore;
-    /// the runtime's row image is [`WalRecord::HeapInsert`]. This variant
-    /// is on its way out.
-    LegacyInsert {
-        xid: u64,
-        /// The table's storage segment — where the row image lives.
-        table: cascade_types::SegmentId,
-        id: i32,
-        val: String,
-    },
-    /// Type 5 (HEAP_INSERT, §6): the heap redo record — payload
-    /// `[segment u32][cell bytes verbatim as cascade-page lays them down]`.
-    /// The cell is copied as-is from `cascade_page::encode_cell` (fresh:
-    /// live, chain-end); recovery and the future PageStore parse it with
-    /// `cascade_page::parse_cell`, never by hand. The header `xid` names
-    /// the inserting txn and the cell's `xmin` carries
-    /// `VersionWord::uncommitted(xid)` — visibility resolves through the
-    /// status table built from COMMIT/ABORT records (WP2), never by
-    /// rewriting cells.
-    HeapInsert {
-        xid: u64,
-        /// The storage segment the row image belongs to.
-        segment: cascade_types::SegmentId,
-        /// The cell bytes verbatim — opaque here; parsing is
-        /// cascade-page's.
-        cell: Vec<u8>,
-    },
-    /// §7 idle-scope advance (reserved): the scope's closed_ts moved to
-    /// `closed_ts` with no txn activity. Nothing emits it yet.
-    ClosedTsHeartbeat {
-        closed_ts: u64,
-    },
-    /// §6 primary restart (reserved): the scope's HLC had issued up to
-    /// `max_issued`. Nothing emits it yet.
-    HlcHighWater {
-        max_issued: u64,
-    },
-    /// §17 bulk load (reserved): payload shape lands with the bulk era.
-    BulkLoad,
-    /// §17 non-logged path (reserved).
-    UnloggedMarker,
-}
+use cascade_types::{DatabaseId, Lsn};
 
 #[derive(Debug)]
 pub enum WalError {

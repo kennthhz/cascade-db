@@ -1,33 +1,51 @@
 //! Record encoding/decoding — the only code in the workspace that knows the
-//! on-disk WAL byte layout (v2, hand-rolled; WP1 F3).
+//! on-disk WAL byte layout (WP1 F3; format version 3 since M1).
 //!
-//! Layout: `[u32 LE payload_len][u32 LE format_version = 2][u8 type][3× u8
-//! reserved][u64 LE xid][u64 LE lsn][u64 LE epoch][payload][u32 LE CRC32 of
-//! all preceding bytes]` — a 36-byte header. The reserved bytes and the
-//! 32-bit version field are the retrofit surface §6.3 reserves: new record
-//! *types* extend `type` (type bytes are immutable forever, never
-//! renumbered); an incompatible *format* change bumps `format_version` so
-//! old decoders fail loudly instead of misreading.
+//! Layout: `[u32 LE payload_len][u32 LE format_version][u8 type][u8 flags]
+//! [2× u8 reserved][u64 LE xid][u64 LE lsn][u64 LE epoch][payload]
+//! [u32 LE CRC32 of all preceding bytes]` — a 36-byte header. v3's one
+//! change from v2: the first of the three reserved bytes became the *flags*
+//! byte, whose bit 0 is the **group-end flag** (S16 — the mini-transaction
+//! is the unit of durability: every append ends on a group end, so the
+//! durable LSN always falls on a mini-transaction boundary). The header
+//! length is unchanged. **v2 records still decode**, each treated as a
+//! group of one; the explicit `lsn` keeps records self-describing (§5) and
+//! the `epoch` field reserves scope fencing (0 until multi-owner). The
+//! reserved bytes and the 32-bit version field remain the retrofit surface
+//! §6.3 reserves: new record *types* extend `type` (type bytes are
+//! immutable forever, never renumbered); an incompatible *format* change
+//! bumps `format_version` so old decoders fail loudly instead of
+//! misreading. Unknown *flag* bits refuse on both decode and walk — a
+//! producer writing flags this decoder does not know cannot have its group
+//! semantics guessed.
 //!
-//! The explicit `lsn` (this record's first byte) makes records
-//! self-describing (§5): recovery and the PageStore can position without
-//! trusting the file offset they happened to read at — [`crate::WalReader`]
-//! cross-checks the declared LSN against the read position and refuses a
-//! transplant. The `epoch` field reserves §4 scope fencing in the format so
-//! the multi-owner era needs no format bump (0 until multi-owner). The CRC
-//! covers `header ++ payload` — the new header fields are protected exactly
-//! like the payload.
+//! Two read shapes live here. [`decode`] interprets payloads strictly
+//! (shape errors are corruption — only a buggy encoder produces them) and
+//! is what recovery and CDC use. [`walk`] is the payload-blind frame
+//! walker (M1): it validates framing — length, version, CRC, flags — and
+//! reports the self-describing header fields and the raw payload slice,
+//! never interpreting a byte of payload. The log store (S5) reasons about
+//! records through [`walk`] only: it checks framing and cuts extents at
+//! group ends without ever seeing what a record *means*.
+//!
+//! This crate depends on nothing but `cascade-types` — it is the byte
+//! contract every storage component shares, and the thing `cascade-wal`
+//! re-exports so pre-M1 callers keep their paths.
 
 use cascade_types::{Hlc, Lsn, SegmentId};
-
-use crate::WalRecord;
 
 /// Every record starts with this header and ends with a CRC over
 /// `header ++ payload`. Public: the on-disk layout is a contract —
 /// recovery tooling and tests reason about byte offsets in it.
 pub const HEADER_LEN: usize = 36;
 pub const CRC_LEN: usize = 4;
-pub(crate) const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+/// The version whose bytes predate the flags byte; still decodes.
+pub const V2_FORMAT_VERSION: u32 = 2;
+
+/// Header flags byte (v3, byte offset 9): bit 0 marks the **last record of
+/// a mini-transaction** (S16). Bits 1–7 are reserved and must be zero.
+pub const FLAG_GROUP_END: u8 = 1 << 0;
 
 // Record types (WP1 F3's table — bytes stable forever; new types extend,
 // never renumber). Header `xid` is 0 for the no-txn types (6–9).
@@ -58,6 +76,71 @@ pub const TYPE_BULK_LOAD: u8 = 8;
 /// §17 non-logged path — payload shape lands with that feature. Reserved.
 pub const TYPE_UNLOGGED_MARKER: u8 = 9;
 
+/// A decoded WAL record — WP1 F3's type table. `BeginTxn`/`CommitTxn`/
+/// `AbortTxn`/`HeapInsert` are the debug slice's records; `LegacyInsert`
+/// (type 4) is retained for replay of pre-T1.3 logs; the reserved families
+/// (heartbeat, high-water, bulk load, unlogged) decode today and
+/// gain producers when their features land. Type bytes are stable forever:
+/// new records extend the `type` byte, never renumber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalRecord {
+    BeginTxn {
+        xid: u64,
+    },
+    /// §6: the commit record carries txn_id (header `xid`) + commit_ts
+    /// (payload, the packed [`Hlc`]). Commit ordering comes from
+    /// commit_ts, never from LSN adjacency.
+    CommitTxn {
+        xid: u64,
+        commit_ts: Hlc,
+    },
+    AbortTxn {
+        xid: u64,
+    },
+    /// Type 4 (LEGACY_INSERT): the v1 debug row image — decode retained so
+    /// logs written before T1.3 still replay. Nothing emits it anymore;
+    /// the runtime's row image is [`WalRecord::HeapInsert`]. This variant
+    /// is on its way out.
+    LegacyInsert {
+        xid: u64,
+        /// The table's storage segment — where the row image lives.
+        table: SegmentId,
+        id: i32,
+        val: String,
+    },
+    /// Type 5 (HEAP_INSERT, §6): the heap redo record — payload
+    /// `[segment u32][cell bytes verbatim as cascade-page lays them down]`.
+    /// The cell is copied as-is from `cascade_page::encode_cell` (fresh:
+    /// live, chain-end); recovery and the future PageStore parse it with
+    /// `cascade_page::parse_cell`, never by hand. The header `xid` names
+    /// the inserting txn and the cell's `xmin` carries
+    /// `VersionWord::uncommitted(xid)` — visibility resolves through the
+    /// status table built from COMMIT/ABORT records (WP2), never by
+    /// rewriting cells.
+    HeapInsert {
+        xid: u64,
+        /// The storage segment the row image belongs to.
+        segment: SegmentId,
+        /// The cell bytes verbatim — opaque here; parsing is
+        /// cascade-page's.
+        cell: Vec<u8>,
+    },
+    /// §7 idle-scope advance (reserved): the scope's closed_ts moved to
+    /// `closed_ts` with no txn activity. Nothing emits it yet.
+    ClosedTsHeartbeat {
+        closed_ts: u64,
+    },
+    /// §6 primary restart (reserved): the scope's HLC had issued up to
+    /// `max_issued`. Nothing emits it yet.
+    HlcHighWater {
+        max_issued: u64,
+    },
+    /// §17 bulk load (reserved): payload shape lands with the bulk era.
+    BulkLoad,
+    /// §17 non-logged path (reserved).
+    UnloggedMarker,
+}
+
 /// The legacy insert's payload length, validating the u16 value-length
 /// field's ceiling. The one size gate both sides call: the writer, before
 /// it reserves an LSN (a record that cannot encode must refuse *before*
@@ -76,9 +159,10 @@ fn legacy_payload_len(val: &str) -> usize {
 
 /// A record's encoded length — the pure, header-only arithmetic the writer
 /// needs *before* it reserves an LSN ([`encode`] then stamps the real one;
-/// the length never depends on the LSN). Size validation happens here, so
-/// `append_wal` refuses an unencodable record before its `fetch_add`.
-pub(crate) fn encoded_len(rec: &WalRecord) -> usize {
+/// the length never depends on the LSN or the flags). Size validation
+/// happens here, so `append_wal` refuses an unencodable record before its
+/// `fetch_add`.
+pub fn encoded_len(rec: &WalRecord) -> usize {
     HEADER_LEN
         + CRC_LEN
         + match rec {
@@ -98,14 +182,26 @@ pub(crate) fn encoded_len(rec: &WalRecord) -> usize {
         }
 }
 
-/// Encode one record to the v2 wire/byte format at `lsn` (the record's
+/// Encode one record to the v3 wire/byte format at `lsn` (the record's
 /// first byte — the writer stamps the offset `append_wal` reserved; a tool
 /// appending to a log knows its own offsets) with the owning scope's
-/// `epoch` (0 until multi-owner, §4). Public for tools that *write or
-/// dump* WAL bytes outside this crate (benchmarks, `pg_waldump`
-/// equivalents); readers must go through [`crate::WalReader`], which is
-/// the only path that validates CRCs and cross-checks the declared LSN.
+/// `epoch` (0 until multi-owner, §4). No flags: the interior records of a
+/// mini-transaction — use [`encode_with_flags`] with [`FLAG_GROUP_END`]
+/// for the record that ends one (S16). Public for tools that *write or
+/// dump* WAL bytes outside this crate; readers must go through [`decode`]
+/// or [`walk`], which validate CRCs and cross-check the declared LSN.
 pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
+    encode_with_flags(rec, lsn, epoch, 0)
+}
+
+/// [`encode`] with header flags. The only defined flag is
+/// [`FLAG_GROUP_END`] (S16); unknown flag bits assert — the flags surface
+/// is a format contract, not scratch space.
+pub fn encode_with_flags(rec: &WalRecord, lsn: Lsn, epoch: u64, flags: u8) -> Vec<u8> {
+    assert!(
+        flags & !FLAG_GROUP_END == 0,
+        "unknown header flags {flags:#04x} — only FLAG_GROUP_END is defined in v3"
+    );
     let (type_byte, payload): (u8, Vec<u8>) = match rec {
         WalRecord::BeginTxn { .. } => (TYPE_BEGIN, Vec::new()),
         WalRecord::CommitTxn { commit_ts, .. } => {
@@ -129,19 +225,15 @@ pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
             p.extend_from_slice(cell);
             (TYPE_HEAP_INSERT, p)
         }
-        WalRecord::ClosedTsHeartbeat { closed_ts } => (
-            TYPE_CLOSED_TS_HEARTBEAT,
-            closed_ts.to_le_bytes().to_vec(),
-        ),
-        WalRecord::HlcHighWater { max_issued } => (
-            TYPE_HLC_HIGH_WATER,
-            max_issued.to_le_bytes().to_vec(),
-        ),
+        WalRecord::ClosedTsHeartbeat { closed_ts } => {
+            (TYPE_CLOSED_TS_HEARTBEAT, closed_ts.to_le_bytes().to_vec())
+        }
+        WalRecord::HlcHighWater { max_issued } => {
+            (TYPE_HLC_HIGH_WATER, max_issued.to_le_bytes().to_vec())
+        }
         WalRecord::BulkLoad => (TYPE_BULK_LOAD, Vec::new()),
         WalRecord::UnloggedMarker => (TYPE_UNLOGGED_MARKER, Vec::new()),
     };
-    // The txn-carrying types take the variant's xid; the no-txn families
-    // (6–9) stamp 0 (F3: "xid u64 (or 0 for no-txn records)").
     let xid = match rec {
         WalRecord::BeginTxn { xid }
         | WalRecord::CommitTxn { xid, .. }
@@ -158,7 +250,8 @@ pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
     buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf.push(type_byte);
-    buf.extend_from_slice(&[0u8; 3]);
+    buf.push(flags);
+    buf.extend_from_slice(&[0u8; 2]);
     buf.extend_from_slice(&xid.to_le_bytes());
     buf.extend_from_slice(&lsn.0.to_le_bytes());
     buf.extend_from_slice(&epoch.to_le_bytes());
@@ -173,32 +266,39 @@ pub fn encode(rec: &WalRecord, lsn: Lsn, epoch: u64) -> Vec<u8> {
 /// do not know (`UnknownRecordType` — the loud refusal half of "extend,
 /// never renumber").
 #[derive(Debug)]
-pub(crate) enum DecodeError {
+pub enum DecodeError {
     Corruption,
     UnknownRecordVersion(u32),
     UnknownRecordType(u8),
 }
 
 /// One decoded record: the record itself plus the self-describing header
-/// fields ([`Decoded::lsn`], [`Decoded::epoch`]) the reader validates.
+/// fields ([`Decoded::lsn`], [`Decoded::epoch`]) the reader validates, the
+/// format version it arrived in, and whether it ends a mini-transaction
+/// (S16 — v2 records decode as groups of one).
 #[derive(Debug)]
-pub(crate) struct Decoded {
+pub struct Decoded {
     pub record: WalRecord,
     pub lsn: u64,
     pub epoch: u64,
+    pub format_version: u32,
+    pub group_end: bool,
     /// Total encoded length so the caller can step to the next record.
     pub total: usize,
 }
 
 /// Decodes the record starting at `buf[0]`. Payload shapes are validated
 /// strictly (a CRC-valid record with a payload that disagrees with its type
-/// is corruption — only a buggy encoder can produce one).
-pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
+/// is corruption — only a buggy encoder can produce one). Accepts v2 (the
+/// flags byte was reserved zero there; each record is a group of one) and
+/// v3; unknown flag bits in v3 refuse as [`DecodeError::Corruption`] —
+/// group semantics must never be guessed (S16).
+pub fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
     if buf.len() < HEADER_LEN + CRC_LEN {
         return Err(DecodeError::Corruption);
     }
     let version = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != V2_FORMAT_VERSION {
         return Err(DecodeError::UnknownRecordVersion(version));
     }
     let payload_len = u32::from_le_bytes(buf[..4].try_into().expect("4 bytes")) as usize;
@@ -210,6 +310,11 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
     if crc32fast::hash(&buf[..total - CRC_LEN]) != stored_crc {
         return Err(DecodeError::Corruption);
     }
+    let flags = buf[9];
+    if version == FORMAT_VERSION && flags & !FLAG_GROUP_END != 0 {
+        return Err(DecodeError::Corruption);
+    }
+    let group_end = version == FORMAT_VERSION && flags & FLAG_GROUP_END != 0;
     let type_byte = buf[8];
     let xid = u64::from_le_bytes(buf[12..20].try_into().expect("8 bytes"));
     let lsn = u64::from_le_bytes(buf[20..28].try_into().expect("8 bytes"));
@@ -275,6 +380,8 @@ pub(crate) fn decode(buf: &[u8]) -> Result<Decoded, DecodeError> {
         record,
         lsn,
         epoch,
+        format_version: version,
+        group_end,
         total,
     })
 }
@@ -297,6 +404,73 @@ fn is_known_type(t: u8) -> bool {
             | TYPE_BULK_LOAD
             | TYPE_UNLOGGED_MARKER
     )
+}
+
+/// What stopped a walk. [`WalkError::Truncated`] covers both "shorter than
+/// a header" and "declared length runs past the buffer" — framing cannot
+/// tell a torn write from a short buffer, and neither is corruption.
+#[derive(Debug)]
+pub enum WalkError {
+    Truncated,
+    UnknownVersion(u32),
+    /// A v3 flags byte with bits this version does not define.
+    UnknownFlags(u8),
+    BadCrc,
+}
+
+/// One walked frame: the self-describing header fields and the raw payload
+/// slice. Nothing here interprets a payload byte — that is [`decode`]'s
+/// job, and the log store must never need it (S5). `total` steps to the
+/// next record; an extent boundary in the log store is a boundary this
+/// walker drew at a group end (S16).
+#[derive(Debug)]
+pub struct Frame<'a> {
+    pub type_byte: u8,
+    pub lsn: u64,
+    pub epoch: u64,
+    pub xid: u64,
+    pub format_version: u32,
+    pub group_end: bool,
+    pub total: usize,
+    pub payload: &'a [u8],
+}
+
+/// Validates framing and reports the header — no payload interpretation.
+/// Accepts the same versions as [`decode`] (v2 bytes walk too; their flags
+/// byte was a reserved zero). Checks, in order: length, version, CRC,
+/// flags — so a caller holding a `Frame` knows the bytes under `payload`
+/// are exactly what a complete, checksummed record declared.
+pub fn walk(buf: &[u8]) -> Result<Frame<'_>, WalkError> {
+    if buf.len() < HEADER_LEN + CRC_LEN {
+        return Err(WalkError::Truncated);
+    }
+    let payload_len = u32::from_le_bytes(buf[..4].try_into().expect("4 bytes")) as usize;
+    let total = HEADER_LEN + payload_len + CRC_LEN;
+    if buf.len() < total {
+        return Err(WalkError::Truncated);
+    }
+    let version = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+    if version != FORMAT_VERSION && version != V2_FORMAT_VERSION {
+        return Err(WalkError::UnknownVersion(version));
+    }
+    let stored_crc = u32::from_le_bytes(buf[total - CRC_LEN..total].try_into().expect("4 bytes"));
+    if crc32fast::hash(&buf[..total - CRC_LEN]) != stored_crc {
+        return Err(WalkError::BadCrc);
+    }
+    let flags = buf[9];
+    if version == FORMAT_VERSION && flags & !FLAG_GROUP_END != 0 {
+        return Err(WalkError::UnknownFlags(flags));
+    }
+    Ok(Frame {
+        type_byte: buf[8],
+        lsn: u64::from_le_bytes(buf[20..28].try_into().expect("8 bytes")),
+        epoch: u64::from_le_bytes(buf[28..HEADER_LEN].try_into().expect("8 bytes")),
+        xid: u64::from_le_bytes(buf[12..20].try_into().expect("8 bytes")),
+        format_version: version,
+        group_end: version == FORMAT_VERSION && flags & FLAG_GROUP_END != 0,
+        total,
+        payload: &buf[HEADER_LEN..HEADER_LEN + payload_len],
+    })
 }
 
 #[cfg(test)]
@@ -381,48 +555,10 @@ mod tests {
         }
     }
 
-    /// The v2 one-way door, pinned byte for byte: COMMIT at LSN 0x1000,
-    /// epoch 0 — payload_len, format_version, type, reserved, xid, lsn,
-    /// epoch, packed commit_ts, in exactly these offsets (WP1 F3). The CRC
-    /// is verified algorithmically over the pinned prefix.
-    #[test]
-    fn v2_header_bytes_are_pinned() {
-        let bytes = encode(
-            &WalRecord::CommitTxn {
-                xid: 5,
-                commit_ts: Hlc(0x1122_3344_5566_7788),
-            },
-            Lsn(0x1000),
-            0,
-        );
-        let expected: [u8; 44] = [
-            // payload_len = 8; format_version = 2; type = COMMIT; reserved
-            0x08, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
-            // xid = 5
-            0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            // lsn = 0x1000
-            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            // epoch = 0
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            // commit_ts LE
-            0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
-        ];
-        assert_eq!(bytes.len(), HEADER_LEN + 8 + CRC_LEN);
-        assert_eq!(
-            bytes[..HEADER_LEN + 8],
-            expected[..],
-            "the v2 header layout is a one-way door — this literal is its lock"
-        );
-        let crc = u32::from_le_bytes(
-            bytes[HEADER_LEN + 8..]
-                .try_into()
-                .expect("4 bytes"),
-        );
-        assert_eq!(crc, crc32fast::hash(&bytes[..HEADER_LEN + 8]));
-    }
-
-    /// The self-describing fields survive the roundtrip: whatever `lsn` and
-    /// `epoch` the encoder was given come back out of the decoder.
+    /// The v3 encode output is pinned by `tests/golden.rs` (the one-way
+    /// door moved with the crate); here the self-describing fields
+    /// roundtrip: whatever `lsn` and `epoch` the encoder was given come
+    /// back out of the decoder.
     #[test]
     fn declared_lsn_and_epoch_roundtrip() {
         let rec = WalRecord::ClosedTsHeartbeat { closed_ts: 42 };
@@ -522,11 +658,11 @@ mod tests {
     }
 
     /// The HEAP_INSERT golden literal — the type-5 one-way door, pinned
-    /// byte for byte: HeapInsert { xid: 5, segment: 7, cell = a fresh
-    /// 3-byte-payload cell } at LSN 0x1000, epoch 0. The cell bytes are
-    /// cascade-page's `[len][xmin = uncommitted(5)][xmax 0][next 0]
-    /// [payload]` verbatim; the CRC is verified algorithmically over the
-    /// pinned prefix.
+    /// byte for byte in the v3 layout: HeapInsert { xid: 5, segment: 7,
+    /// cell = a fresh 3-byte-payload cell } at LSN 0x1000, epoch 0. The
+    /// cell bytes are cascade-page's `[len][xmin = uncommitted(5)][xmax 0]
+    /// [next 0][payload]` verbatim; the CRC is verified algorithmically
+    /// over the pinned prefix.
     #[test]
     fn heap_insert_bytes_are_pinned() {
         let cell = cascade_page::encode_cell(VersionWord::uncommitted(TxnId(5)), b"abc")
@@ -542,8 +678,8 @@ mod tests {
         );
         assert_eq!(cell.len(), 26 + 3, "test sanity: CELL_FIXED + payload");
         let expected: [u8; 69] = [
-            // payload_len = 4 + 29 = 33; format_version = 2; type = 5; reserved
-            0x21, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            // payload_len = 4 + 29 = 33; format_version = 3; type = 5; flags 0; reserved
+            0x21, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
             // xid = 5
             0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             // lsn = 0x1000
@@ -746,12 +882,12 @@ mod tests {
         }
     }
 
-    /// The three reserved header bytes stay zero in every encoding — they
-    /// are the §6.3 retrofit surface, not scratch space, and a producer
-    /// that dirties them would pin garbage into every future reader's
-    /// assumptions.
+    /// The flags byte carries only defined bits, and the two bytes behind
+    /// it stay reserved-zero in every encoding — they are the §6.3 retrofit
+    /// surface, not scratch space. The group-end bit appears exactly where
+    /// the caller put it (S16).
     #[test]
-    fn reserved_header_bytes_stay_zero() {
+    fn flags_byte_and_reserved_bytes_are_pinned() {
         let cell = cascade_page::encode_cell(VersionWord::EMPTY, b"c").expect("fits");
         for rec in [
             WalRecord::BeginTxn { xid: 1 },
@@ -762,12 +898,39 @@ mod tests {
             WalRecord::HeapInsert {
                 xid: 4,
                 segment: SegmentId(5),
-                cell,
+                cell: cell.clone(),
             },
             WalRecord::BulkLoad,
         ] {
             let b = encode(&rec, Lsn(0), 0);
-            assert_eq!(&b[9..12], &[0u8; 3], "{rec:?}: reserved bytes");
+            assert_eq!(&b[9..12], &[0u8; 3], "{rec:?}: flags 0, reserved zero");
+            let g = encode_with_flags(&rec, Lsn(0), 0, FLAG_GROUP_END);
+            assert_eq!(g[9], FLAG_GROUP_END, "{rec:?}: group-end set");
+            assert_eq!(&g[10..12], &[0u8; 2], "{rec:?}: reserved still zero");
         }
+    }
+
+    /// v2 bytes hand-built (pre-flags layout) decode as groups of one
+    /// through the same `decode` — the compat half of the v3 transition.
+    /// The full literal lives in `tests/golden.rs`; this pins the decoder's
+    /// version dispatch on a second shape.
+    #[test]
+    fn v2_dispatch_on_a_second_shape() {
+        let mut bytes: Vec<u8> = [
+            // payload_len = 0; format_version = 2; type = BEGIN; reserved (3)
+            0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            // xid = 11
+            0x0B, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // lsn = 0; epoch = 3
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]
+        .into();
+        let crc = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        let d = decode(&bytes).expect("v2 BEGIN decodes");
+        assert_eq!(d.format_version, 2);
+        assert!(!d.group_end, "v2: group of one");
+        assert_eq!(d.record, WalRecord::BeginTxn { xid: 11 });
     }
 }

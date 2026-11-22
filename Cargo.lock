@@ -453,9 +453,19 @@ dependencies = [
  "cascade-page",
  "cascade-telemetry",
  "cascade-types",
+ "cascade-wal-format",
  "crc32fast",
  "futures-lite",
  "glommio",
+]
+
+[[package]]
+name = "cascade-wal-format"
+version = "0.1.0"
+dependencies = [
+ "cascade-page",
+ "cascade-types",
+ "crc32fast",
 ]
 
 [[package]]

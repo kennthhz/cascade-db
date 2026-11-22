@@ -9,9 +9,10 @@ authors.workspace      = true
 description = "Per-database Write-Ahead Log. Pillars §3.4, §6.3. Logical-decoding-ready record format."
 
 [dependencies]
-cascade-types     = { workspace = true }
-cascade-error     = { workspace = true }
-cascade-telemetry = { workspace = true }
+cascade-types       = { workspace = true }
+cascade-error       = { workspace = true }
+cascade-telemetry   = { workspace = true }
+cascade-wal-format  = { workspace = true }
 
 glommio      = { workspace = true }
 crc32fast    = { workspace = true }
