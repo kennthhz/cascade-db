@@ -416,6 +416,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-storage-api"
+version = "0.1.0"
+dependencies = [
+ "cascade-telemetry",
+ "cascade-types",
+ "cascade-wal-format",
+ "futures-lite",
+ "static_assertions",
+]
+
+[[package]]
 name = "cascade-telemetry"
 version = "0.1.0"
 

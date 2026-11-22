@@ -1,0 +1,29 @@
+[package]
+name        = "cascade-storage-api"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The L2 storage contracts (storage-layer-design.md §4): LogSink, LogSource, PageSource, admin and device contracts, with in-memory fakes and conformance suites."
+
+[dependencies]
+cascade-types       = { workspace = true }
+cascade-wal-format  = { workspace = true }
+cascade-telemetry   = { workspace = true }
+futures-lite        = { workspace = true, optional = true }
+
+[dev-dependencies]
+futures-lite = { workspace = true }
+static_assertions = { workspace = true }
+
+[features]
+default = ["fake"]
+# The in-memory fakes (MemLogStore, MemPageStore, MemBlockDevice,
+# MemKeyProvider) — §4.10. On by default so the workspace gate exercises
+# them; implementations opt out by disabling default features.
+fake = ["dep:futures-lite"]
+# The conformance suites (§4.10): one suite per contract, generic over a
+# create/crash/restart harness — they land with the suites themselves.
+conformance = ["fake"]
