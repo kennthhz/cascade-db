@@ -262,6 +262,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-logstore"
+version = "0.1.0"
+dependencies = [
+ "cascade-rt-api",
+ "cascade-storage-api",
+ "cascade-types",
+ "cascade-wal-format",
+ "crc32fast",
+ "futures-lite",
+ "static_assertions",
+]
+
+[[package]]
 name = "cascade-mvcc"
 version = "0.1.0"
 dependencies = [

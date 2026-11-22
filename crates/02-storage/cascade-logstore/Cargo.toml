@@ -1,0 +1,20 @@
+[package]
+name        = "cascade-logstore"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The log store (storage-layer-design.md §5): shared segment files, 4 KiB flush frames, deficit-round-robin flushing, retention holders, torn-tail recovery."
+
+[dependencies]
+cascade-storage-api = { workspace = true }
+cascade-types       = { workspace = true }
+cascade-wal-format  = { workspace = true }
+cascade-rt-api      = { workspace = true }
+crc32fast           = { workspace = true }
+
+[dev-dependencies]
+futures-lite = { workspace = true }
+static_assertions = { workspace = true }
