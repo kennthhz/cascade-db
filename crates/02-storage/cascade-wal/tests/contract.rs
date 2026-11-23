@@ -87,7 +87,8 @@ fn no_single_byte_corruption_reads_as_a_record() {
                     | WalError::LsnMismatch { .. }
                     | WalError::UnknownRecordType { .. }
                     | WalError::UnknownRecordVersion(_)
-                    | WalError::Io(_),
+                    | WalError::Io(_)
+                    | WalError::Sink(_),
                 ) => {}
                 Ok(Some(entry)) => panic!(
                     "byte {pos} flipped and the record still decoded as {:?} — \

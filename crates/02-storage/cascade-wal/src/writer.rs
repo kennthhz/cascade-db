@@ -5,13 +5,16 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
     task::{Poll, Waker},
     time::Duration,
 };
 
-use cascade_types::Lsn;
+use cascade_storage_api::{AppendMeta, LogSink, OpCtx, StoreError, TenantContext};
+use cascade_telemetry::Span;
+use cascade_types::{Epoch, Lsn, ScopeId};
+use cascade_wal_format::FLAG_GROUP_END;
 
 use crate::{format, io::WalHandle, WalError, WalRecord};
 
@@ -30,6 +33,18 @@ const COMMIT_DELAY: Duration = Duration::from_micros(300);
 /// flush leader borrows the caller's [`WalHandle`], on the caller's own
 /// ring.
 pub struct WalWriter {
+    /// The durability sink (M5, storage §9): when set, the flush leader
+    /// sends its staged batch with [`LogSink::append`] and waits with
+    /// [`LogSink::wait_durable`] instead of writing a file through a
+    /// [`WalHandle`]. `None` is the pre-M5 file mode — boot keeps it until
+    /// M6 swaps it to the local log store.
+    sink: Option<Arc<dyn LogSink>>,
+    /// The scope this writer owns, in sink mode.
+    scope: ScopeId,
+    /// The operation context stamps every sink call (S4); the span is
+    /// owned so the `Arc`-shared writer stays `'static`.
+    tenant: TenantContext,
+    span: Span,
     /// Reserved watermark: the next byte offset [`WalWriter::append_wal`]
     /// will hand out. LSNs exist before their records do (FR-25).
     reserved: AtomicU64,
@@ -94,6 +109,10 @@ impl WalWriter {
     /// never mutates a live writer's.
     pub fn new_in_epoch(start: Lsn, epoch: u64) -> Self {
         WalWriter {
+            sink: None,
+            scope: ScopeId(0),
+            tenant: TenantContext::for_database(cascade_types::DatabaseId(0)),
+            span: Span::noop(),
             reserved: AtomicU64::new(start.0),
             filled: AtomicU64::new(start.0),
             durable: AtomicU64::new(start.0),
@@ -103,6 +122,38 @@ impl WalWriter {
             leader: AtomicBool::new(false),
             wake: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The M5 constructor (storage §9): a writer whose durability is a
+    /// [`LogSink`]. The epoch comes from `open_writer` — not from
+    /// `new_in_epoch` — and so does the start: the sink's durable LSN is
+    /// where this writer's first append must begin (§4.3 promise 1).
+    /// The file mode's constructors (`new`, `new_at`, `new_in_epoch`)
+    /// stay until M6 swaps boot to the local log store.
+    pub async fn open_with_sink(
+        sink: Arc<dyn LogSink>,
+        ctx: &OpCtx<'_>,
+        scope: ScopeId,
+        epoch: Epoch,
+    ) -> Result<Self, WalError> {
+        let start = sink
+            .open_writer(ctx, scope, epoch)
+            .await
+            .map_err(WalError::Sink)?;
+        Ok(WalWriter {
+            sink: Some(sink),
+            scope,
+            tenant: ctx.tenant,
+            span: *ctx.span,
+            reserved: AtomicU64::new(start.0),
+            filled: AtomicU64::new(start.0),
+            durable: AtomicU64::new(start.0),
+            epoch: epoch.0,
+            syncs: AtomicU64::new(0),
+            pending: Mutex::new(BTreeMap::new()),
+            leader: AtomicBool::new(false),
+            wake: Mutex::new(Vec::new()),
+        })
     }
 
     /// The epoch stamped into records this writer emits (§4; 0 until
@@ -146,11 +197,104 @@ impl WalWriter {
     pub fn append_wal(&self, record: &WalRecord) -> Reservation<'_> {
         let len = format::encoded_len(record);
         let start = self.reserved.fetch_add(len as u64, Ordering::Relaxed);
-        let bytes = format::encode(record, Lsn(start), self.epoch);
+        // S16: a single record is a complete mini-transaction, so it
+        // carries the group-end flag itself — every append this writer
+        // can ever produce ends on a group end.
+        let bytes = format::encode_with_flags(record, Lsn(start), self.epoch, FLAG_GROUP_END);
         Reservation {
             writer: self,
             start,
             bytes,
+        }
+    }
+
+    /// M5/S16: a mini-transaction reserves its whole group as ONE range
+    /// and the group-end flag rides its last record — the interior
+    /// records stay unflagged. One reservation, one fill: the filled
+    /// watermark walks the group as a single entry, so a flush can never
+    /// cut between the records of one mini-transaction.
+    pub fn append_group(&self, records: &[WalRecord]) -> GroupReservation<'_> {
+        let lens: Vec<usize> = records.iter().map(format::encoded_len).collect();
+        let total: usize = lens.iter().sum();
+        let start = self.reserved.fetch_add(total as u64, Ordering::Relaxed);
+        let mut bytes = Vec::with_capacity(total);
+        let mut at = start;
+        for (i, rec) in records.iter().enumerate() {
+            let last = i + 1 == records.len();
+            let flags = if last { FLAG_GROUP_END } else { 0 };
+            bytes.extend_from_slice(&format::encode_with_flags(rec, Lsn(at), self.epoch, flags));
+            at += lens[i] as u64;
+        }
+        debug_assert_eq!(at, start + total as u64, "lengths are pure arithmetic (F3)");
+        GroupReservation {
+            writer: self,
+            start,
+            bytes,
+        }
+    }
+
+    /// M5: make everything up to `up_to` durable **through the sink** —
+    /// the flush leader sends its staged batch with [`LogSink::append`]
+    /// and waits with [`LogSink::wait_durable`]; the batch bytes are
+    /// identical on a re-send (idempotence, §4.3 promise 3), so the
+    /// [`StagedBatch`] re-stage story holds unchanged. The group-commit
+    /// window rides the log store's flusher (§5.4); the writer drains
+    /// immediately.
+    pub async fn flush_wal_sink(&self, up_to: Lsn) -> Result<Lsn, WalError> {
+        let Some(sink) = self.sink.as_ref() else {
+            // File mode: delegate to the file path via the shared engine.
+            return Err(WalError::Sink(StoreError::Unsupported(
+                "flush_wal_sink on a file-mode writer",
+            )));
+        };
+        let ctx = OpCtx::new(self.tenant, &self.span);
+        loop {
+            if self.durable() >= up_to {
+                return Ok(self.durable());
+            }
+            if self
+                .leader
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let progressed = {
+                    let _leader = LeaderGuard(self);
+                    let start = self.durable().0;
+                    let target = self.filled().0;
+                    if target > start {
+                        let batch = self.take_batch(start, target)?;
+                        let mut staged = StagedBatch {
+                            writer: self,
+                            start,
+                            bytes: batch,
+                            published: false,
+                        };
+                        // S20: every append carries the writer's current
+                        // durable LSN.
+                        let meta = AppendMeta {
+                            max_commit_ts: None,
+                            writer_durable: Lsn(start),
+                        };
+                        sink.append(&ctx, self.scope, Epoch(self.epoch), Lsn(start), &staged.bytes, meta)
+                            .await
+                            .map_err(WalError::Sink)?;
+                        sink.wait_durable(&ctx, self.scope, Lsn(target))
+                            .await
+                            .map_err(WalError::Sink)?;
+                        self.durable.store(target, Ordering::Release);
+                        self.syncs.fetch_add(1, Ordering::AcqRel);
+                        staged.published = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if !progressed {
+                    self.wait_durable(up_to).await?;
+                }
+            } else {
+                self.wait_durable(up_to).await?;
+            }
         }
     }
 
@@ -162,6 +306,12 @@ impl WalWriter {
     /// and `fdatasync`s through `io` (the caller's per-reactor handle, own
     /// ring) and publishes the durable LSN; losers wait for it.
     pub async fn flush_wal(&self, io: &WalHandle, up_to: Lsn) -> Result<Lsn, WalError> {
+        if self.sink.is_some() {
+            // M5: a sink-mode writer ignores the borrowed file handle —
+            // durability goes through the sink (M6 removes this shim with
+            // the file path).
+            return self.flush_wal_sink(up_to).await;
+        }
         loop {
             if self.durable() >= up_to {
                 return Ok(self.durable());
@@ -355,6 +505,40 @@ impl Drop for StagedBatch<'_> {
         // fired by [`LeaderGuard::drop`] — order the re-stage before that
         // wake by dropping here, which this type's position inside the
         // leader block guarantees.
+    }
+}
+
+/// A reserved LSN range carrying a WHOLE mini-transaction (M5/S16): the
+/// records were encoded at their consecutive LSNs and the last one
+/// carries the group-end flag. Fill publishes the group as one entry.
+#[must_use = "a dropped group reservation tears the log — call fill() or abort deliberately"]
+pub struct GroupReservation<'a> {
+    writer: &'a WalWriter,
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl GroupReservation<'_> {
+    /// LSN of the group's first byte.
+    pub fn start(&self) -> Lsn {
+        Lsn(self.start)
+    }
+
+    /// LSN one past the group's last byte — the flush/wait boundary.
+    pub fn end(&self) -> Lsn {
+        Lsn(self.start + self.bytes.len() as u64)
+    }
+
+    /// Publish the whole group at once (the filled watermark walks it as
+    /// a single entry). Returns the group's start LSN.
+    pub fn fill(self) -> Lsn {
+        let GroupReservation {
+            writer,
+            start,
+            bytes,
+        } = self;
+        writer.fill(start, bytes);
+        Lsn(start)
     }
 }
 

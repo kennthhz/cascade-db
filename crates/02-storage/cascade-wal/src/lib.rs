@@ -67,6 +67,10 @@ pub enum WalError {
     /// crash artifact, never fsynced (FR-25's filled-watermark twin on
     /// the read side). Recovery treats this as end-of-log.
     TornTail(Lsn),
+    /// M5: the durability sink refused — fenced, failed, gap, framing:
+    /// whatever the `LogSink` contract names (storage §4.9). The commit
+    /// path treats this as outcome-unknown (WP5 D9).
+    Sink(cascade_storage_api::StoreError),
     /// A record whose header-declared LSN contradicts the position it was
     /// read from: transplanted or hand-stomped bytes. The record may be
     /// internally consistent (its CRC can still hold) — it is simply not
@@ -96,6 +100,7 @@ impl std::fmt::Display for WalError {
             WalError::TornTail(lsn) => {
                 write!(f, "wal record at {lsn:?} is torn past end-of-file (incomplete write)")
             }
+            WalError::Sink(e) => write!(f, "wal sink refused: {e}"),
             WalError::LsnMismatch { at, declared } => {
                 write!(
                     f,

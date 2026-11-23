@@ -486,12 +486,14 @@ version = "0.1.0"
 dependencies = [
  "cascade-error",
  "cascade-page",
+ "cascade-storage-api",
  "cascade-telemetry",
  "cascade-types",
  "cascade-wal-format",
  "crc32fast",
  "futures-lite",
  "glommio",
+ "static_assertions",
 ]
 
 [[package]]

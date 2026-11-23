@@ -213,6 +213,13 @@ impl From<WalError> for PgError {
     fn from(e: WalError) -> Self {
         match e {
             WalError::Io(_) => PgError::new("58000", format!("wal flush failed: {e}")),
+            // M5: the durability sink refused — fenced, failed, gap: the
+            // commit path's outcome-unknown bucket (WP5 D9; §4.9 names
+            // Fenced/Failed/Io as outcome unknown, and a refused flush
+            // leaves the commit's durability undecided).
+            WalError::Sink(_) => {
+                PgError::new("58000", format!("wal sink refused: {e}"))
+            }
             // A torn tail at *flush* time means the watermarks let a flush
             // cover a torn record — impossible by protocol, so it lands in
             // the same integrity bucket as corruption (not a client's

@@ -230,6 +230,12 @@ fn wal_err(e: WalError, at: Lsn) -> RecoveryError {
         },
         WalError::UnknownRecordVersion(v) => RecoveryError::UnknownVersion { version: v },
         WalError::Io(io) => RecoveryError::Io(io),
+        // M5: a sink-backed writer's error surfaces on the flush path,
+        // never on the reader this function walks — but the match must
+        // exist. Report at the cursor, refusing beats guessing.
+        WalError::Sink(e) => RecoveryError::Io(std::io::Error::other(
+            format!("wal sink refused: {e}"),
+        )),
         // The walk handles torn tails itself; this arm is unreachable but
         // must exist — report it at the cursor, refusing beats guessing.
         WalError::TornTail(_) => RecoveryError::Corrupt { lsn: at },
