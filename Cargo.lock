@@ -267,6 +267,7 @@ version = "0.1.0"
 dependencies = [
  "cascade-rt-api",
  "cascade-storage-api",
+ "cascade-telemetry",
  "cascade-types",
  "cascade-wal-format",
  "crc32fast",

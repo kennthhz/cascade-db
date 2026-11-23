@@ -5,3 +5,6 @@
 pub mod drr;
 pub mod frame;
 pub mod manifest;
+pub mod store;
+
+pub use store::LogStore;

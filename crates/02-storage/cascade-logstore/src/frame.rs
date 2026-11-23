@@ -211,6 +211,34 @@ pub fn walk_payload(payload: &[u8]) -> Result<Vec<Extent>, FrameError> {
     Ok(out)
 }
 
+/// Decodes only the 64-byte header: magic, version, header CRC — the
+/// recovery scan's cheap probe before committing to a full-frame read.
+pub fn decode_header_only(b: &[u8]) -> Result<FrameHeader, FrameError> {
+    if b.len() < FRAME_HEADER_LEN {
+        return Err(FrameError::Truncated);
+    }
+    let magic = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+    if magic != FRAME_MAGIC {
+        return Err(FrameError::BadMagic);
+    }
+    let version = u16::from_le_bytes(b[4..6].try_into().expect("2 bytes"));
+    if version != FRAME_VERSION {
+        return Err(FrameError::BadVersion);
+    }
+    let stored_hcrc = u32::from_le_bytes(b[44..48].try_into().expect("4 bytes"));
+    if crc32(&b[..44]) != stored_hcrc {
+        return Err(FrameError::BadHeaderCrc);
+    }
+    Ok(FrameHeader {
+        stream: u32::from_le_bytes(b[8..12].try_into().expect("4 bytes")),
+        segment_seq: u64::from_le_bytes(b[12..20].try_into().expect("8 bytes")),
+        frame_seq: u64::from_le_bytes(b[20..28].try_into().expect("8 bytes")),
+        incarnation: u64::from_le_bytes(b[28..36].try_into().expect("8 bytes")),
+        payload_len: u32::from_le_bytes(b[36..40].try_into().expect("4 bytes")),
+        extent_count: u32::from_le_bytes(b[40..44].try_into().expect("4 bytes")),
+    })
+}
+
 /// Decodes a whole frame from `buf[0]`: length, magic, version, header
 /// CRC, payload bounds, trailer CRC — then the payload walk.
 pub fn decode_frame(buf: &[u8]) -> Result<DecodedFrame, FrameError> {

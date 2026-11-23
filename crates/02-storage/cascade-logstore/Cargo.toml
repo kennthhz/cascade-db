@@ -14,6 +14,8 @@ cascade-types       = { workspace = true }
 cascade-wal-format  = { workspace = true }
 cascade-rt-api      = { workspace = true }
 crc32fast           = { workspace = true }
+cascade-telemetry   = { workspace = true }
+futures-lite        = { workspace = true }
 
 [dev-dependencies]
 futures-lite = { workspace = true }

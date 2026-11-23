@@ -247,9 +247,13 @@ pub async fn log_sink_suite<H: LogStoreHarness>(h: &mut H) {
     );
 
     // Promise 7 — a flush failure fails the epoch until reopen (S19's
-    // blast radius at store scale; §8.1 step 1).
+    // blast radius at store scale; §8.1 step 1). A flush failure needs a
+    // flush: stage bytes so the injected failure hits a real write+sync
+    // (a store with nothing staged has no flush to fail — it waits).
     h.inject_flush_failure(&revived);
-    let failed = (revived.wait_durable(&ctx, SCOPE, Lsn(1 << 40))).await;
+    let inject = group_at(d3.0, 2, 9, 90, b"nine");
+    (revived.append(&ctx, SCOPE, e2, Lsn(d3.0), &inject, meta(90))).await.expect("appends");
+    let failed = (revived.wait_durable(&ctx, SCOPE, Lsn(d3.0 + inject.len() as u64))).await;
     assert!(matches!(failed, Err(StoreError::Failed { .. })));
     assert!(matches!(
         (revived.append(&ctx, SCOPE, e2, Lsn(d3.0), &group_at(d3.0, 2, 9, 90, b"nine"), meta(90))).await,
