@@ -15,7 +15,10 @@ cascade-page      = { workspace = true }
 cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-tenant    = { workspace = true }
-cascade-wal       = { workspace = true }
+cascade-wal        = { workspace = true }
+cascade-wal-format = { workspace = true }
+cascade-storage-api = { workspace = true }
+cascade-logstore   = { workspace = true }
 cascade-bpm       = { workspace = true }
 cascade-storage   = { workspace = true }
 cascade-pg-parser = { workspace = true }

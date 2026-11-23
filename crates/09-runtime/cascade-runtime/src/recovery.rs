@@ -27,7 +27,8 @@ use std::{
     time::Duration,
 };
 
-use cascade_types::{DatabaseId, Lsn};
+use cascade_storage_api::log_source::LogSource;
+use cascade_types::{DatabaseId, Lsn, ScopeId};
 use cascade_wal::{WalError, WalReader};
 
 /// What boot resumes from. Produced by [`prepare`] before any worker
@@ -216,6 +217,7 @@ pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan
 
 /// Maps a reader error to the recovery error it refuses boot with. The
 /// `at` LSN only surfaces for errors that do not carry one of their own.
+#[allow(dead_code)] // legacy file-path reader: dies with the M6 boot swap
 fn wal_err(e: WalError, at: Lsn) -> RecoveryError {
     match e {
         WalError::Corruption(lsn) => RecoveryError::Corrupt { lsn },
@@ -240,6 +242,113 @@ fn wal_err(e: WalError, at: Lsn) -> RecoveryError {
         // must exist — report it at the cursor, refusing beats guessing.
         WalError::TornTail(_) => RecoveryError::Corrupt { lsn: at },
     }
+}
+
+/// M6 (storage §9): the replay walk over a [`LogSource`] — the log store
+/// serves only durable, gap-free records and has already dropped its torn
+/// tail at open, so this walk has no truncation, no clean marker and no
+/// torn-tail arm: it replays exactly what durability acked and stops at
+/// the durable LSN. The replay law is byte-for-byte the legacy walk's
+/// (committed transactions in commit order, uncommitted buffers drop, an
+/// unparseable cell from a CRC-valid record refuses the boot).
+pub async fn prepare_from_source<S: LogSource + ?Sized>(
+    source: &S,
+    scope: ScopeId,
+    durable: Lsn,
+) -> Result<RecoveryPlan, RecoveryError> {
+    let span = cascade_telemetry::Span::noop();
+    let ctx = cascade_storage_api::OpCtx::new(
+        cascade_storage_api::TenantContext::for_database(DatabaseId(0)),
+        &span,
+    );
+    let mut open: HashMap<u64, Vec<(i32, String)>> = HashMap::new();
+    let mut seed_rows: Vec<(i32, String)> = Vec::new();
+    let mut cursor = Lsn(0);
+    while cursor.0 < durable.0 {
+        // Whole records up to about 1 MiB; the store serves at least one
+        // whole record per call and stops at durability (§4.4).
+        let chunk = source
+            .read_log(&ctx, scope, cursor, 1024 * 1024)
+            .await
+            .map_err(|e| RecoveryError::Io(std::io::Error::other(e.to_string())))?;
+        if chunk.bytes.is_empty() {
+            break; // durable reached (or a gap the store refused to paper over)
+        }
+        let mut at = 0usize;
+        while at < chunk.bytes.len() {
+            let decoded = cascade_wal_format::decode(&chunk.bytes[at..]).map_err(|e| match e {
+                cascade_wal_format::DecodeError::Corruption => {
+                    RecoveryError::Corrupt { lsn: Lsn(chunk.start.0 + at as u64) }
+                }
+                cascade_wal_format::DecodeError::UnknownRecordVersion(v) => {
+                    RecoveryError::UnknownVersion { version: v }
+                }
+                cascade_wal_format::DecodeError::UnknownRecordType(t) => {
+                    RecoveryError::UnknownRecordType {
+                        lsn: Lsn(chunk.start.0 + at as u64),
+                        type_byte: t,
+                    }
+                }
+            })?;
+            replay_record(&decoded.record, cursor, &mut open, &mut seed_rows)?;
+            cursor = Lsn(cursor.0 + decoded.total as u64);
+            at += decoded.total;
+        }
+    }
+    Ok(RecoveryPlan {
+        resume_offset: durable.0,
+        seed_rows,
+        clean_lsn: None, // the marker died with the file path (§9, M6)
+        unclean: false,  // the store's own open decided the tail's fate
+        torn_tail: None, // dropped by the log store before this walk
+    })
+}
+
+/// One record's replay effect — the legacy walk's match, extracted so the
+/// LogSource walk and (until its removal) the file walk share it.
+fn replay_record(
+    record: &cascade_wal::WalRecord,
+    cursor: Lsn,
+    open: &mut HashMap<u64, Vec<(i32, String)>>,
+    seed_rows: &mut Vec<(i32, String)>,
+) -> Result<(), RecoveryError> {
+    match record {
+        cascade_wal::WalRecord::BeginTxn { xid } => {
+            open.entry(*xid).or_default();
+        }
+        cascade_wal::WalRecord::LegacyInsert { xid, id, val, .. } => {
+            open.entry(*xid).or_default().push((*id, val.clone()));
+        }
+        // The runtime's row image since T1.3: the row rides in the cell's
+        // payload; the version words stay opaque to this walk — buffering
+        // is keyed on the header xid.
+        cascade_wal::WalRecord::HeapInsert { xid, cell, .. } => {
+            match crate::session::parse_heap_insert_row(cell) {
+                Some(row) => open.entry(*xid).or_default().push(row),
+                // A CRC-valid record whose cell won't parse is a buggy
+                // encoder — refuse over it, never serve a row nobody can
+                // vouch for.
+                None => return Err(RecoveryError::Corrupt { lsn: cursor }),
+            }
+        }
+        // Commit order is replay order: the row vector is exactly what
+        // the acking boot served from its table.
+        cascade_wal::WalRecord::CommitTxn { xid, .. } => {
+            if let Some(rows) = open.remove(xid) {
+                seed_rows.extend(rows);
+            }
+        }
+        cascade_wal::WalRecord::AbortTxn { xid } => {
+            open.remove(xid);
+        }
+        // Reserved families (§6/§7/§17): no replay effect in the debug
+        // slice — they carry no row data.
+        cascade_wal::WalRecord::ClosedTsHeartbeat { .. }
+        | cascade_wal::WalRecord::HlcHighWater { .. }
+        | cascade_wal::WalRecord::BulkLoad
+        | cascade_wal::WalRecord::UnloggedMarker => {}
+    }
+    Ok(())
 }
 
 // ---- Crash barrier (the T3.3 harness's crash points) ----
