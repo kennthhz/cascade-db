@@ -181,6 +181,15 @@ impl WalWriter {
     pub fn append_group(&self, records: &[WalRecord]) -> GroupReservation<'_> {
         let lens: Vec<usize> = records.iter().map(format::encoded_len).collect();
         let total: usize = lens.iter().sum();
+        // §5.4 item 6: a mini-transaction is at most 1 MiB — the writer
+        // enforces the cap BEFORE consuming LSNs (a group the log store's
+        // planner can never flush would wedge its waiters forever).
+        const GROUP_CAP: usize = 1024 * 1024;
+        assert!(
+            total <= GROUP_CAP,
+            "mini-transaction of {total} bytes exceeds the {GROUP_CAP}-byte \
+             group cap (§5.4) — split the operation"
+        );
         let start = self.reserved.fetch_add(total as u64, Ordering::Relaxed);
         let mut bytes = Vec::with_capacity(total);
         let mut at = start;

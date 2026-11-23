@@ -248,8 +248,6 @@ fn cleanup(case: &Case) {
 /// what the restart serves. Every case also re-asserts the baseline row.
 fn crash_case(phases_passed: &[&str], stop_at: &'static str, inflight_survives: bool) {
     let _serial = serial();
-    std::env::set_var("CASCADE_MANIFEST_DEBUG", "1");
-    let _ = std::fs::remove_file("/tmp/storeboot-debug.log");
     let case = fresh_case();
 
     let mut child = spawn_server(&case, true);
@@ -264,20 +262,6 @@ fn crash_case(phases_passed: &[&str], stop_at: &'static str, inflight_survives: 
     // is post-replay (FR-7): whatever it sees *is* the recovery verdict.
     let mut child = spawn_server(&case, false);
     wait_ready(&case);
-    eprintln!("PROBE restart stderr: {}", {
-        // Peek non-blockingly: stderr is piped; read what is buffered via
-        // the OS — a real read would block at EOF on a live child, so use
-        // /proc/<pid>/fd-inspection-free approach: spawn's stderr stays
-        // piped; read_to_string happens later. Here we only dump the store
-        // dir listing for diagnosis.
-        let _ = &child;
-        format!("{:?}", std::fs::read_dir(case.wal_dir.join("store"))
-            .map(|rd| rd.filter_map(|e| e.ok())
-                .map(|e| format!("{} ({}B)", e.file_name().to_string_lossy(),
-                    e.metadata().map(|m| m.len()).unwrap_or(0)))
-                .collect::<Vec<_>>())
-            .unwrap_or_default())
-    });
     let mut expected = vec![(1, "committed-1".to_owned())];
     if inflight_survives {
         expected.push((99, "inflight".to_owned()));

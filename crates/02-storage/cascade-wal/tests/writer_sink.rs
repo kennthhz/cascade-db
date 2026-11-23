@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use cascade_storage_api::fake::{test_ctx, MemLogStore};
-use cascade_storage_api::log_sink::LogSink;
+use cascade_storage_api::{KeyRef, log_sink::LogSink};
 use cascade_storage_api::log_source::LogSource;
 use cascade_storage_api::scope_admin::LogScopes;
 use cascade_types::{Epoch, Hlc, Lsn, ScopeId};
@@ -228,4 +228,77 @@ fn a_fenced_epoch_fails_the_flush() {
         );
         assert_eq!(w.durable(), Lsn(0), "nothing became durable");
     });
+}
+
+/// Ported from the deleted file-mode suite (§9 M5's contract): 16
+/// concurrent committers hammering one writer — every acked commit is in
+/// the log exactly once, in a decodable record stream, with no torn or
+/// duplicated bytes. This is the law the leader election, `take_batch`,
+/// and `StagedBatch` re-stage machinery exist to keep.
+#[test]
+fn sixteen_concurrent_committers_keep_the_log_exact() {
+    use std::sync::Arc;
+
+    let sink = Arc::new(sink_store());
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 1);
+    block_on(sink.create_scope(&ctx, SCOPE, Epoch(1), KeyRef { key_id: 1 })).expect("creates");
+    let writer = Arc::new(block_on(open_writer_over(&sink, Epoch::FIRST)));
+
+    let handles: Vec<_> = (0..16)
+        .map(|t| {
+            let writer = Arc::clone(&writer);
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                for i in 0..25u64 {
+                    let xid = t * 100 + i;
+                    let r = writer.append_wal(&WalRecord::CommitTxn {
+                        xid,
+                        commit_ts: cascade_types::Hlc(xid),
+                    });
+                    let end = r.end();
+                    r.fill();
+                    block_on(writer.flush_wal_sink(end)).expect("flush");
+                    // Acknowledged means durable, immediately (FR-27).
+                    let d = sink.durable_lsn(SCOPE).expect("sink durable");
+                    assert!(d >= end, "ack before durability: {d:?} < {end:?}");
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("committer thread");
+    }
+
+    // The log decodes as one exact stream: 400 commit records, xids
+    // 0..400 each exactly once (no torn, no duplicated, no lost bytes).
+    let durable = sink.durable_lsn(SCOPE).expect("durable");
+    let ctx2 = test_ctx(&span, 1);
+    use cascade_storage_api::log_source::LogSource as _;
+    let mut seen: Vec<u64> = Vec::new();
+    let mut pos = Lsn(0);
+    let mut total = 0u64;
+    while pos < durable {
+        let chunk = block_on(sink.read_log(&ctx2, SCOPE, pos, 1 << 20)).expect("chunk");
+        assert_eq!(chunk.start, pos, "chunks stay contiguous");
+        if chunk.bytes.is_empty() {
+            break;
+        }
+        let mut at = 0usize;
+        while at < chunk.bytes.len() {
+            let d = cascade_wal_format::decode(&chunk.bytes[at..]).expect("record decodes");
+            if let WalRecord::CommitTxn { xid, .. } = d.record {
+                seen.push(xid);
+            }
+            at += d.total;
+            total += d.total as u64;
+        }
+        pos = chunk.end;
+    }
+    seen.sort_unstable();
+    let expected: Vec<u64> = (0..16)
+        .flat_map(|t| (0..25).map(move |i| t * 100 + i))
+        .collect();
+    assert_eq!(seen, expected, "every commit exactly once, none lost");
+    assert_eq!(total, durable.0, "the log is exactly the durable prefix");
 }

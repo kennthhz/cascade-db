@@ -42,6 +42,10 @@ fn sample() -> Manifest {
                     segment_seq: 4,
                     offset: 4096,
                 }],
+                spans: vec![
+                    (Lsn(0), Some(cascade_types::Hlc(10))),
+                    (Lsn(95), None),
+                ],
             },
             ScopeRecord {
                 scope: ScopeId(11),
@@ -50,6 +54,7 @@ fn sample() -> Manifest {
                 durable: Lsn(0),
                 holders: vec![],
                 runs: vec![],
+                spans: vec![],
             },
         ],
     }
@@ -83,6 +88,14 @@ fn manifest_roundtrips_every_field() {
     assert_eq!(s7.holders[0].0, RetentionHolder::PageStore { instance: 1 });
     assert_eq!(s7.holders[1].0, RetentionHolder::Archive);
     assert_eq!(s7.runs[0].lsn_end, Lsn(95));
+    assert_eq!(
+        s7.spans,
+        vec![
+            (Lsn(0), Some(cascade_types::Hlc(10))),
+            (Lsn(95), None)
+        ],
+        "the append-time index survives the manifest roundtrip"
+    );
 }
 
 #[test]

@@ -12,8 +12,7 @@ use cascade_storage_api::fake::MemBlockDevice;
 use cascade_storage_api::log_sink::LogSink;
 use cascade_storage_api::scope_admin::LogScopes;
 use cascade_storage_api::{KeyRef};
-use cascade_types::Epoch;
-use cascade_types::{Hlc, Lsn, ScopeId, SegmentId};
+use cascade_types::{DatabaseId, Epoch, Hlc, Lsn, ScopeId, SegmentId, TxnId};
 use cascade_wal_format::{encode_with_flags, encode, WalRecord, FLAG_GROUP_END};
 use futures_lite::future::block_on;
 
@@ -240,11 +239,101 @@ fn legacy_insert_replays_through_the_log_source() {
     assert_eq!(plan.seed_rows, vec![(3, "legacy row".to_string())]);
 }
 
-/// Migrated from the legacy matrix: a HEAP_INSERT whose page cell is
-/// shape-valid but whose row image is not UTF-8 refuses as Corrupt — the
-/// replay never coerces to U+FFFD and seeds a row nobody can vouch for.
+
+/// A CRC-valid record declaring a foreign LSN is a transplant: the
+/// replay's declared-LSN cross-check refuses it by name (the law the
+/// legacy reader enforced — the store's framing suite pins the append-
+/// time half; this pins the replay half for any LogSource).
+#[test]
+fn a_transplanted_record_refuses_by_name() {
+    struct ShiftedSource;
+
+    use cascade_storage_api::LogSource;
+    impl LogSource for ShiftedSource {
+        fn read_log<'a>(
+            &'a self,
+            _ctx: &'a cascade_storage_api::OpCtx<'_>,
+            _scope: ScopeId,
+            from: Lsn,
+            _max_bytes: usize,
+        ) -> cascade_types::LocalBoxFuture<'a, Result<cascade_storage_api::LogChunk, cascade_storage_api::StoreError>>
+        {
+            Box::pin(async move {
+                // A valid record encoded for LSN 100, served at cursor 0.
+                let bytes = cascade_wal_format::encode(
+                    &WalRecord::CommitTxn {
+                        xid: 1,
+                        commit_ts: Hlc(1),
+                    },
+                    Lsn(100),
+                    1,
+                );
+                Ok(cascade_storage_api::LogChunk {
+                    start: from,
+                    bytes,
+                    end: Lsn(from.0 + 52),
+                    durable: Lsn(from.0 + 52),
+                })
+            })
+        }
+        fn subscribe(
+            &self,
+            _ctx: &cascade_storage_api::OpCtx<'_>,
+            _scope: ScopeId,
+            _from: Lsn,
+        ) -> Box<dyn cascade_storage_api::log_source::LogSubscription> {
+            unreachable!("the transplant walk uses read_log only")
+        }
+        fn set_retained_from<'a>(
+            &'a self,
+            _ctx: &'a cascade_storage_api::OpCtx<'_>,
+            _scope: ScopeId,
+            _holder: cascade_storage_api::RetentionHolder,
+            _lsn: Lsn,
+        ) -> cascade_types::LocalBoxFuture<'a, Result<(), cascade_storage_api::StoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn release_holder<'a>(
+            &'a self,
+            _ctx: &'a cascade_storage_api::OpCtx<'_>,
+            _scope: ScopeId,
+            _holder: cascade_storage_api::RetentionHolder,
+        ) -> cascade_types::LocalBoxFuture<'a, Result<(), cascade_storage_api::StoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn retained_floor(&self, _scope: ScopeId) -> Result<Lsn, cascade_storage_api::StoreError> {
+            Ok(Lsn(0))
+        }
+        fn append_before_time<'a>(
+            &'a self,
+            _ctx: &'a cascade_storage_api::OpCtx<'_>,
+            _scope: ScopeId,
+            _ts: Hlc,
+        ) -> cascade_types::LocalBoxFuture<'a, Result<Lsn, cascade_storage_api::StoreError>> {
+            Box::pin(async { Ok(Lsn(0)) })
+        }
+    }
+
+    let span = cascade_telemetry::Span::noop();
+    let ctx = cascade_storage_api::OpCtx::new(
+        cascade_storage_api::TenantContext::for_database(DatabaseId(0)),
+        &span,
+    );
+    let _ = ctx;
+    let src = ShiftedSource;
+    let plan = block_on(recovery::prepare_from_source(&src, SCOPE, Lsn(52)));
+    assert!(matches!(
+        plan,
+        Err(RecoveryError::LsnMismatch { at, declared }) if at == Lsn(0) && declared == Lsn(100)
+    ));
+}
+
+/// Migrated from the legacy matrix: a CRC-valid HEAP_INSERT whose cell
+/// parses but whose row image is not UTF-8 refuses as Corrupt — replay
+/// never coerces to U+FFFD and seeds a row nobody can vouch for.
 #[test]
 fn a_non_utf8_row_image_refuses_as_corrupt() {
+    use cascade_page::encode_cell;
     let store = store();
     let ctx = ctx();
     block_on(store.create_scope(&ctx, SCOPE, Epoch(1), KeyRef { key_id: 1 })).expect("creates");
@@ -255,11 +344,8 @@ fn a_non_utf8_row_image_refuses_as_corrupt() {
     image.extend_from_slice(&1i32.to_le_bytes());
     image.extend_from_slice(&3u16.to_le_bytes());
     image.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
-    let cell = cascade_page::encode_cell(
-        cascade_types::VersionWord::uncommitted(cascade_types::TxnId(8)),
-        &image,
-    )
-    .expect("cell fits");
+    let cell = encode_cell(cascade_types::VersionWord::uncommitted(TxnId(8)), &image)
+        .expect("cell fits");
     let ins = cascade_wal_format::encode(
         &WalRecord::HeapInsert {
             xid: 8,
@@ -282,7 +368,6 @@ fn a_non_utf8_row_image_refuses_as_corrupt() {
     bytes.extend(com);
     block_on(store.append(&ctx, SCOPE, Epoch(1), Lsn(0), &bytes, meta())).expect("appends");
     block_on(store.wait_durable(&ctx, SCOPE, Lsn(bytes.len() as u64))).expect("durables");
-
     let plan = block_on(recovery::prepare_from_source(
         &*store,
         SCOPE,

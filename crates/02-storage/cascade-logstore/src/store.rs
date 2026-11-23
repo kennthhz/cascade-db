@@ -16,6 +16,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+
 use std::task::Waker;
 use std::task::Poll;
 
@@ -145,6 +147,9 @@ struct StreamState {
     cur_segment: u64,
     write_offset: u64,
     next_frame_seq: u64,
+    /// The last segment whose directory entry was namespace-synced (§4.8:
+    /// a fresh file's fdatasync does not persist its directory entry).
+    ns_synced_segment: Option<u64>,
 }
 
 struct Inner {
@@ -161,6 +166,9 @@ struct Inner {
 pub struct LogStore<D: BlockDevice + 'static> {
     dev: Arc<D>,
     inner: Mutex<Inner>,
+    /// Flush leadership (§5.4 item 4): at most one frame composed-to-
+    /// published per stream at a time.
+    flush_leader: std::sync::atomic::AtomicBool,
     /// This store's own handle, for subscriptions (which must outlive
     /// the `&self` that spawned them).
     me: OnceLock<std::sync::Weak<LogStore<D>>>,
@@ -175,7 +183,7 @@ impl<D: BlockDevice + 'static> LogStore<D> {
         let span = cascade_telemetry::Span::noop();
         let ctx = OpCtx::new(cascade_storage_api::TenantContext::for_database(cascade_types::DatabaseId(0)), &span);
 
-        let manifest_bytes = match read_file(&*local, &ctx, MANIFEST_NAME).await {
+        let manifest_bytes = match read_file(&*local, &ctx, MANIFEST_NAME).await? {
             Some(padded) => {
                 // The file is length-prefixed (the O_DIRECT pad would
                 // otherwise shift the CRC trailer on read-back).
@@ -210,6 +218,18 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                 }],
                 scopes: vec![],
             },
+        };
+        // §5.7: a clean shutdown recorded its exact end — any bad frame
+        // BEFORE that end is corruption, never a truncatable torn flush.
+        // Captured (Copy values) before the move into bump.
+        let clean_end: Option<(u64, u64)> = if manifest_bytes.clean_shutdown {
+            manifest_bytes
+                .streams
+                .iter()
+                .find(|s| s.stream == STREAM)
+                .map(|s| (s.scan_segment_seq, s.scan_offset))
+        } else {
+            None
         };
         let mut m = manifest::bump_incarnation(manifest_bytes);
 
@@ -247,6 +267,15 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                     runs: rec.runs.clone(),
                     cache_from: rec.durable,
                     holders: rec.holders.iter().map(|(h, l)| (*h, *l)).collect(),
+                    spans: rec
+                        .spans
+                        .iter()
+                        .map(|(start, ts)| AppendSpan {
+                            start: *start,
+                            len: 0,
+                            max_commit_ts: *ts,
+                        })
+                        .collect(),
                     ..ScopeState::default()
                 },
             );
@@ -265,14 +294,17 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                 cur_segment: seed_pos.scan_segment_seq,
                 write_offset: seed_pos.scan_offset,
                 next_frame_seq: seed_pos.scan_frame_seq,
+                ns_synced_segment: None,
             },
         );
-        scan_stream(&*local, &ctx, &mut inner, &seed_pos).await?;
+        scan_stream(&*local, &ctx, &mut inner, &seed_pos, clean_end).await?;
 
+        inner.incarnation = m.incarnation;
         let store = Arc::new(LogStore {
             dev,
             inner: Mutex::new(inner),
             me: OnceLock::new(),
+            flush_leader: std::sync::atomic::AtomicBool::new(false),
         });
         let _ = store.me.set(Arc::downgrade(&store));
         store.write_manifest().await?;
@@ -318,6 +350,11 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                         durable: s.durable,
                         holders: s.holders.iter().map(|(h, l)| (*h, *l)).collect(),
                         runs: s.runs.clone(),
+                        spans: s
+                            .spans
+                            .iter()
+                            .map(|sp| (sp.start, sp.max_commit_ts))
+                            .collect(),
                     })
                     .collect(),
             }
@@ -338,10 +375,28 @@ impl<D: BlockDevice + 'static> LogStore<D> {
     }
 
     /// Builds and persists one frame from the staged queues (inline flush,
+    /// §4.3: waiting triggers it). Gated by a flush leadership CAS (§5.4
+    /// item 4: at most one frame written but not yet synced per stream) —
+    /// a concurrent caller yields immediately; its `flush_until` loop
+    /// retries after the leader publishes.
+    async fn flush_some(&self) -> Result<(), StoreError> {
+        if self
+            .flush_leader
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(()); // another flush is in flight; it will cover us
+        }
+        let r = self.flush_some_inner().await;
+        self.flush_leader.store(false, Ordering::Release);
+        r
+    }
+
+    /// Builds and persists one frame from the staged queues (inline flush,
     /// §4.3: waiting triggers it). Plans with DRR, composes record extents
     /// plus any staged control ops, writes + syncs, then advances the
     /// per-scope durable LSNs and wakes waiters.
-    async fn flush_some(&self) -> Result<(), StoreError> {
+    async fn flush_some_inner(&self) -> Result<(), StoreError> {
         // 1. Plan under the lock; take the staged groups out.
         struct Planned {
             scope: ScopeId,
@@ -377,6 +432,15 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                 let s = inner.scopes.get_mut(id).expect("came from scopes");
                 s.staged = std::mem::take(&mut views[i].groups);
                 s.deficit = views[i].deficit;
+            }
+            if plan.is_empty() && controls.is_empty() {
+                // Bytes are staged but nothing is plannable: a group
+                // exceeds the frame cap (the writer's §5.4 contract) —
+                // fail the oldest stalled scope loudly rather than hang
+                // its waiters forever.
+                return Err(StoreError::Failed {
+                    scope: *indexes.first().expect("staged non-empty"),
+                });
             }
             let st = inner.streams.get(&STREAM).expect("stream seeded").clone();
             let mut planned = Vec::new();
@@ -484,6 +548,9 @@ impl<D: BlockDevice + 'static> LogStore<D> {
             let s = inner.streams.get_mut(&STREAM).expect("stream");
             s.next_frame_seq = frame_seq + 1;
             s.write_offset = offset + frame_bytes.len() as u64;
+            if s.ns_synced_segment != Some(seg_seq) {
+                s.ns_synced_segment = Some(seg_seq);
+            }
             for (p, ext) in planned.iter().zip(extents.iter()) {
                 if ext.kind != ExtentKind::Records {
                     continue;
@@ -493,11 +560,9 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                     scope.durable = p.durable_to;
                 }
                 scope.cache.extend_from_slice(&ext.bytes);
-                scope.spans.push(AppendSpan {
-                    start: ext.start_lsn,
-                    len: ext.bytes.len(),
-                    max_commit_ts: None, // flushed spans carry no ts (§4.4)
-                });
+                // Spans are appended once, at append time, with their
+                // commit ts (§4.4) — a flush-time push would duplicate the
+                // index entry with no timestamp.
                 scope.runs.push(ExtentRun {
                     lsn_start: ext.start_lsn,
                     lsn_end: Lsn(ext.start_lsn.0 + ext.bytes.len() as u64),
@@ -554,19 +619,29 @@ impl<D: BlockDevice + 'static> LogStore<D> {
 }
 
 
-/// Reads a whole file from the flat namespace; `None` when absent.
+/// Reads a whole file from the flat namespace. `Ok(None)` only when the
+/// file is genuinely absent (fresh store); any other error is a real I/O
+/// failure and propagates — booting "fresh" over an unreadable manifest
+/// would destroy the store on the next flush (S19 posture).
 async fn read_file<H: BlockHandle + ?Sized>(
     h: &H,
     ctx: &OpCtx<'_>,
     name: &str,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>, StoreError> {
     let fname = FileName(name.into());
-    let f = h.open(ctx, &fname, false).await.ok()?;
-    let len = h.len(f).await.ok()?;
+    let f = match h.open(ctx, &fname, false).await {
+        Ok(f) => f,
+        Err(e) if e.0.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(StoreError::Io(e.0)),
+    };
+    let len = h.len(f).await.map_err(|e| StoreError::Io(e.0))?;
     let padded = (len as usize).div_ceil(PAD) * PAD;
     let buf = cascade_types::AlignedBuf::zeroed(padded.max(PAD));
-    let back = h.read_at(ctx, f, 0, buf).await.ok()?;
-    Some(back.as_slice()[..len as usize].to_vec())
+    let back = h
+        .read_at(ctx, f, 0, buf)
+        .await
+        .map_err(|e| StoreError::Io(e.0))?;
+    Ok(Some(back.as_slice()[..len as usize].to_vec()))
 }
 
 /// Writes a whole file (create/truncate), padded to 4 KiB.
@@ -591,12 +666,25 @@ async fn write_file<H: BlockHandle + ?Sized>(
 /// exactly one more than the previous frame's. The scan stops at the
 /// first failure — torn (nothing valid after) unless a valid successor
 /// appears at a 4 KiB boundary, which is corruption: synced-then-damaged.
+#[allow(clippy::type_complexity)]
 async fn scan_stream<H: BlockHandle + ?Sized>(
     h: &H,
     ctx: &OpCtx<'_>,
     inner: &mut Inner,
     from: &StreamPosition,
+    clean_end: Option<(u64, u64)>,
 ) -> Result<(), StoreError> {
+    // A failure at a position the clean-shutdown record vouches for is
+    // damaged-after-clean: corruption, never a truncatable torn flush.
+    let before_clean_end = |seq: u64, offset: u64| -> bool {
+        match clean_end {
+            Some((cseq, coff)) => seq < cseq || (seq == cseq && offset < coff),
+            None => false,
+        }
+    };
+    fn refuse(e: IoError) -> StoreError {
+        StoreError::Io(e.0)
+    }
     let mut seq = from.scan_segment_seq;
     let mut offset = from.scan_offset;
     let mut expected_seq = from.scan_frame_seq;
@@ -604,9 +692,12 @@ async fn scan_stream<H: BlockHandle + ?Sized>(
         let fname = FileName(format!("seg-{STREAM}-{seq}"));
         let f = match h.open(ctx, &fname, false).await {
             Ok(f) => f,
-            Err(_) => break, // never written / recycled away: end of stream
+            Err(e) if e.0.kind() == std::io::ErrorKind::NotFound => {
+                break // never written / recycled away: end of stream
+            }
+            Err(e) => return Err(refuse(e)), // transient I/O: trust nothing
         };
-        let file_len = h.len(f).await.unwrap_or(0);
+        let file_len = h.len(f).await.map_err(refuse)?;
         loop {
             if offset + PAD as u64 > file_len {
                 break; // end of segment
@@ -616,7 +707,7 @@ async fn scan_stream<H: BlockHandle + ?Sized>(
                 .await
             {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(e) => return Err(refuse(e)), // I/O mid-scan: refuse, never truncate
             };
             let header = match frame::decode_header_only(&head.as_slice()[..FRAME_HEADER_LEN]) {
                 Ok(hd) => hd,
@@ -643,7 +734,7 @@ async fn scan_stream<H: BlockHandle + ?Sized>(
                         }
                         probe += PAD as u64;
                     }
-                    if corruption {
+                    if corruption || before_clean_end(seq, offset) {
                         for s in inner.scopes.values_mut() {
                             s.failed = true;
                         }
@@ -658,6 +749,17 @@ async fn scan_stream<H: BlockHandle + ?Sized>(
                 }
             };
             if header.segment_seq != seq || header.frame_seq != expected_seq {
+                if before_clean_end(seq, offset) {
+                    for s in inner.scopes.values_mut() {
+                        s.failed = true;
+                    }
+                    return Err(StoreError::Corruption {
+                        what: CorruptionSite::LogFrame {
+                            scope: ScopeId(0),
+                            at: Lsn(offset),
+                        },
+                    });
+                }
                 break; // stale frame from an earlier incarnation of the segment
             }
             let total = FRAME_HEADER_LEN + header.payload_len as usize + 4;
@@ -678,7 +780,7 @@ async fn scan_stream<H: BlockHandle + ?Sized>(
                     .await;
                 let rest = match rest {
                     Ok(b) => b,
-                    Err(_) => break,
+                    Err(e) => return Err(refuse(e)), // I/O mid-scan: refuse
                 };
                 whole.as_mut_slice()[PAD..].copy_from_slice(rest.as_slice());
             }
@@ -1278,6 +1380,14 @@ impl<D: BlockDevice + 'static> LogSource for LogStore<D> {
         Box::pin(async move {
             let inner = self.inner.lock().expect("store lock");
             let s = inner.scopes.get(&scope).ok_or(StoreError::UnknownScope(scope))?;
+            if s.spans.is_empty() && s.durable > Lsn(0) {
+                // The time index is lost (crash before the next manifest
+                // write) — answering the log end would silently restore
+                // commits the caller asked to exclude (§4.4).
+                return Err(StoreError::Unsupported(
+                    "append time index unavailable after recovery",
+                ));
+            }
             let answer = s
                 .spans
                 .iter()

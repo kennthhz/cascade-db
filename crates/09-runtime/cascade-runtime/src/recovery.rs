@@ -146,6 +146,15 @@ pub async fn prepare_from_source<S: LogSource + ?Sized>(
                     }
                 }
             })?;
+            // The declared-LSN cross-check (the law the legacy reader
+            // enforced): a CRC-valid record declaring a foreign LSN is a
+            // transplant — refuse by name, never replay it as truth.
+            if decoded.lsn != cursor.0 {
+                return Err(RecoveryError::LsnMismatch {
+                    at: cursor,
+                    declared: Lsn(decoded.lsn),
+                });
+            }
             replay_record(&decoded.record, cursor, &mut open, &mut seed_rows)?;
             cursor = Lsn(cursor.0 + decoded.total as u64);
             at += decoded.total;

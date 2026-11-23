@@ -10,7 +10,7 @@
 //! the incarnation, and writes it back before any frame is written.
 
 use cascade_storage_api::RetentionHolder;
-use cascade_types::{Epoch, Lsn, ScopeId};
+use cascade_types::{Epoch, Hlc, Lsn, ScopeId};
 
 /// What stopped a manifest decode — metadata corruption is never
 /// guessed, so every refusal is this one named value.
@@ -53,6 +53,11 @@ pub struct ScopeRecord {
     pub durable: Lsn,
     pub holders: Vec<(RetentionHolder, Lsn)>,
     pub runs: Vec<ExtentRun>,
+    /// The sparse append-time index (§5.6): (start LSN, highest commit ts)
+    /// per accepted append. Persisted so point-in-time restore survives a
+    /// restart; entries since the last manifest write are lost with a
+    /// crash (the scan is payload-blind and cannot rebuild them).
+    pub spans: Vec<(Lsn, Option<Hlc>)>,
 }
 
 /// The whole manifest.
@@ -188,6 +193,20 @@ pub fn encode(m: &Manifest) -> Vec<u8> {
             put_u64(&mut b, r.segment_seq);
             put_u64(&mut b, r.offset);
         }
+        put_u32(&mut b, s.spans.len() as u32);
+        for (start, ts) in &s.spans {
+            put_u64(&mut b, start.0);
+            match ts {
+                Some(t) => {
+                    put_u8(&mut b, 1);
+                    put_u64(&mut b, t.0);
+                }
+                None => {
+                    put_u8(&mut b, 0);
+                    put_u64(&mut b, 0);
+                }
+            }
+        }
     }
     let crc = crc32(&b);
     put_u32(&mut b, crc);
@@ -254,6 +273,14 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, ManifestError> {
                 offset: r.u64()?,
             });
         }
+        let spans_n = r.u32()? as usize;
+        let mut spans = Vec::with_capacity(spans_n.min(65536));
+        for _ in 0..spans_n {
+            let start = Lsn(r.u64()?);
+            let has_ts = r.u8()?;
+            let ts = if has_ts == 1 { Some(Hlc(r.u64()?)) } else { None };
+            spans.push((start, ts));
+        }
         scopes.push(ScopeRecord {
             scope,
             epoch,
@@ -261,6 +288,7 @@ pub fn decode(bytes: &[u8]) -> Result<Manifest, ManifestError> {
             durable,
             holders,
             runs,
+            spans,
         });
     }
     Ok(Manifest {

@@ -112,7 +112,7 @@ impl GlommioHandle {
             .guarded("write", || {
                 let mut dma = glommio::allocate_dma_buffer(buf.len());
                 dma.as_bytes_mut().copy_from_slice(buf.as_slice());
-                async move { file.write_at(dma, off).await.map_err(|e| e.to_string()) }
+                async move { file.write_at(dma, off).await.map_err(io) }
             })
             .await?;
         if written as usize != buf.len() {
@@ -162,11 +162,18 @@ impl GlommioHandle {
     /// is over `timer::sleep` rather than `timer::timeout`, whose bound
     /// pairs the future's Ok type with its error payload — read's error
     /// payload is `()`, so timeout refuses it; sleep has no such law.
+    /// A REAL op error is returned immediately, never retried: §4.8/S19
+    /// forbid retrying a failed `sync` and trusting the retry, and a
+    /// failed read/write is not the watchdog's to mask.
     async fn guarded<T, Fut, F>(&self, op: &'static str, make: F) -> Result<T, IoError>
     where
         F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T, String>>,
+        Fut: std::future::Future<Output = Result<T, IoError>>,
     {
+        enum Outcome<T> {
+            Done(Result<T, IoError>),
+            TimedOut,
+        }
         for attempt in 0..OP_ATTEMPTS {
             let outcome;
             {
@@ -174,16 +181,22 @@ impl GlommioHandle {
                 let timer = glommio::timer::sleep(OP_WATCHDOG);
                 futures_lite::pin!(fut, timer);
                 outcome = futures_lite::future::race(
-                    async { fut.await.map_err(|e| e.to_string()) },
-                    async move { timer.await; Err(format!("{op} stalled past the watchdog")) },
+                    async move { Outcome::Done(fut.await) },
+                    async move {
+                        timer.await;
+                        Outcome::TimedOut
+                    },
                 )
                 .await;
             }
             match outcome {
-                Ok(v) => return Ok(v),
-                Err(msg) => {
+                Outcome::Done(r) => return r,
+                Outcome::TimedOut => {
                     if attempt + 1 == OP_ATTEMPTS {
-                        return Err(io(format!("{msg} ({OP_ATTEMPTS} attempts)")));
+                        return Err(io(format!(
+                            "{op} stalled past the watchdog {OP_ATTEMPTS} times — \
+                             the op may or may not have completed; trust nothing"
+                        )));
                     }
                     // Re-issue: a superseded op that lands late is harmless
                     // by idempotence (io.rs).
@@ -212,7 +225,14 @@ impl BlockHandle for GlommioHandle {
                 // exist, so create it through a plain truncate-then-open.
                 std::fs::File::create(&path).map_err(io)?;
             } else if !path.exists() {
-                return Err(io("no such file"));
+                // A genuinely absent file must keep the NotFound kind —
+                // the log store's scan treats "segment absent" as
+                // end-of-stream and boot treats "manifest absent" as
+                // first boot; any other error is a real I/O failure.
+                return Err(IoError(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such file",
+                )));
             }
             let file = glommio::io::OpenOptions::new()
                 .read(true)
@@ -243,7 +263,7 @@ impl BlockHandle for GlommioHandle {
             let file = &file;
             let read = self
                 .guarded("read", || async move {
-                    file.read_at(off, len).await.map_err(|e| e.to_string())
+                    file.read_at(off, len).await.map_err(io)
                 })
                 .await?;
             let bytes: &[u8] = &read;
@@ -281,14 +301,16 @@ impl BlockHandle for GlommioHandle {
             let file = &file;
             match self
                 .guarded("sync", || async move {
-                    file.fdatasync().await.map_err(|e| e.to_string())
+                    file.fdatasync().await.map_err(io)
                 })
                 .await
             {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    // S19: a failed sync is permanent — contents unknown,
-                    // every later op refuses, retrying proves nothing.
+                    // S19: a failed (or watchdog-lost, so possibly
+                    // completed-but-unverifiable) sync is permanent —
+                    // contents unknown, every later op refuses, retrying
+                    // proves nothing.
                     self.poisoned.borrow_mut().insert(f);
                     Err(e)
                 }
