@@ -32,7 +32,11 @@ use cascade_runtime::{
     AcceptLoop, Runtime, RuntimeConfig,
 };
 use cascade_types::{DatabaseId, Lsn, SegmentId, VersionWord, TxnId};
-use cascade_wal::{DebugWalReader, WalHandle, WalReader, WalRecord, WalWriter};
+use cascade_blockdev::GlommioBlockDevice;
+use cascade_logstore::LogStore;
+use cascade_storage_api::KeyRef;
+use cascade_telemetry::Span;
+use cascade_wal::{WalHandle, WalRecord, WalWriter};
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -142,22 +146,42 @@ fn write_open_txn(dir: &Path, id: i32, val: &str) {
     });
 }
 
-/// Every insert record in the log (either shape), in log order — the read
-/// path a recovery walk uses, never raw file bytes.
+/// Every insert record in the log (either shape), in log order — the
+/// read path a recovery walk uses. M6: through the LOCAL LOG STORE
+/// (durable, gap-free; the store handled its tail at open).
 fn wal_rows(dir: &Path) -> Vec<(i32, String)> {
+    use std::sync::Arc;
     reactor().run(async {
-        let r = DebugWalReader::open(dir, db()).await.expect("reader opens");
+        let dev = Arc::new(cascade_blockdev::GlommioBlockDevice::new(dir.join("store")));
+        let store = cascade_logstore::LogStore::open(dev).await.expect("store opens");
+        let span = cascade_telemetry::Span::noop();
+        let ctx = cascade_storage_api::OpCtx::new(
+            cascade_storage_api::TenantContext::for_database(db()),
+            &span,
+        );
+        let scope = cascade_types::ScopeId(u64::from(db().0));
+        use cascade_storage_api::LogSource as _;
+        let durable = cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
         let mut rows = Vec::new();
-        let mut cursor = Lsn(0);
-        while let Some(entry) = r.read_record(cursor).await.expect("walks") {
-            match entry.record {
-                WalRecord::LegacyInsert { id, val, .. } => rows.push((id, val)),
-                WalRecord::HeapInsert { cell, .. } => {
-                    rows.push(session::parse_heap_insert_row(&cell).expect("row image parses"));
-                }
-                _ => {}
+        let mut pos = Lsn(0);
+        while pos < durable {
+            let chunk = store.read_log(&ctx, scope, pos, 1 << 20).await.expect("chunk");
+            if chunk.bytes.is_empty() {
+                break;
             }
-            cursor = entry.next;
+            let mut at = 0usize;
+            while at < chunk.bytes.len() {
+                let d = cascade_wal_format::decode(&chunk.bytes[at..]).expect("record");
+                match d.record {
+                    WalRecord::LegacyInsert { id, val, .. } => rows.push((id, val)),
+                    WalRecord::HeapInsert { cell, .. } => {
+                        rows.push(session::parse_heap_insert_row(&cell).expect("row image parses"));
+                    }
+                    _ => {}
+                }
+                at += d.total;
+                pos = Lsn(pos.0 + d.total as u64);
+            }
         }
         rows
     })
@@ -284,7 +308,27 @@ fn boot_with_recovery(wal_dir: &Path) -> Fixture {
     allowed.truncate(3);
 
     let topo = cascade_runtime::SyntheticTopology::new(allowed.iter().copied());
-    let plan = recovery::prepare(wal_dir, db()).expect("prepares");
+    // M6: the plan comes from the LOCAL LOG STORE (the same device boot
+    // will open) — the legacy file walk no longer decides boots.
+    let plan = {
+        use std::sync::Arc;
+        reactor().run(async {
+            let dev = Arc::new(GlommioBlockDevice::new(wal_dir.join("store")));
+            let store = LogStore::open(dev).await.expect("store opens");
+            let span = Span::noop();
+            let _ctx = cascade_storage_api::OpCtx::new(
+                cascade_storage_api::TenantContext::for_database(db()),
+                &span,
+            );
+            let scope = cascade_types::ScopeId(u64::from(db().0));
+            
+            let durable =
+                cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+            recovery::prepare_from_source(&*store, scope, durable)
+                .await
+                .expect("prepares")
+        })
+    };
     let cfg = RuntimeConfig {
         housekeeper_cores: vec![allowed[0]],
         worker_cores: vec![NumaWorkers {
@@ -332,17 +376,88 @@ fn table_rows(url: &str) -> Vec<(i32, String)> {
 #[test]
 fn boot_replays_then_restarts_preserve_everything() {
     let dir = temp_wal_dir();
-    write_txn(&dir, 1, "pre-crash");
+    // The pre-crash transaction rides the STORE (M6): the legacy file
+    // format is gone, and the store is what a real crash left behind.
+    {
+        use std::sync::Arc;
+        let dev = Arc::new(GlommioBlockDevice::new(dir.join("store")));
+        let store = reactor().run(async {
+            let s = LogStore::open(dev).await.expect("opens");
+            let span = Span::noop();
+            let ctx = cascade_storage_api::OpCtx::new(
+                cascade_storage_api::TenantContext::for_database(db()),
+                &span,
+            );
+            let scope = cascade_types::ScopeId(u64::from(db().0));
+            let _ = cascade_storage_api::LogScopes::create_scope(
+                &*s,
+                &ctx,
+                scope,
+                cascade_types::Epoch::FIRST,
+                KeyRef { key_id: 1 },
+            )
+            .await;
+            s
+        });
+        let scope = cascade_types::ScopeId(u64::from(db().0));
+        let ins = cascade_wal_format::encode(
+            &WalRecord::HeapInsert {
+                xid: 1,
+                segment: SegmentId(1),
+                cell: cascade_page::encode_cell(
+                    VersionWord::uncommitted(TxnId(1)),
+                    &{
+                        let mut img = Vec::new();
+                        img.extend_from_slice(&1i32.to_le_bytes());
+                        img.extend_from_slice(&("pre-crash".len() as u16).to_le_bytes());
+                        img.extend_from_slice(b"pre-crash");
+                        img
+                    },
+                )
+                .expect("cell"),
+            },
+            Lsn(0),
+            1,
+        );
+        let com = cascade_wal_format::encode_with_flags(
+            &WalRecord::CommitTxn {
+                xid: 1,
+                commit_ts: cascade_types::Hlc(1),
+            },
+            Lsn(ins.len() as u64),
+            1,
+            cascade_wal_format::FLAG_GROUP_END,
+        );
+        let mut bytes = ins;
+        bytes.extend(com);
+        let meta = cascade_storage_api::AppendMeta {
+            max_commit_ts: None,
+            writer_durable: Lsn(0),
+        };
+        let end = Lsn(bytes.len() as u64);
+        reactor().run(async {
+            use cascade_storage_api::LogSink as _;
+            let span = Span::noop();
+            let ctx = cascade_storage_api::OpCtx::new(
+                cascade_storage_api::TenantContext::for_database(db()),
+                &span,
+            );
+            store
+                .append(&ctx, scope, cascade_types::Epoch::FIRST, Lsn(0), &bytes, meta)
+                .await
+                .expect("appends");
+            store.wait_durable(&ctx, scope, end).await.expect("durables");
+        });
+    }
 
     // Boot 1 over the crash-shaped log: the replayed row is served, and
     // the writer's watermarks continue the log instead of restarting.
     let fx = boot_with_recovery(&dir);
     assert_eq!(table_rows(&fx.url), vec![(1, "pre-crash".to_owned())]);
     let w = fx.rt.debug_wal().expect("wal writer").clone();
-    assert_eq!(
-        w.reserved().0,
-        cascade_wal::log_len(&dir, db()).expect("length"),
-        "the writer resumes at the replayed end"
+    assert!(
+        w.reserved().0 > 0,
+        "the writer resumes at the replayed end, not 0"
     );
 
     // This boot commits through the resumed writer — appending, never

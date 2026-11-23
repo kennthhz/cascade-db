@@ -20,7 +20,7 @@ use cascade_runtime::{
     AcceptLoop, Runtime, RuntimeConfig, SyntheticTopology,
 };
 use cascade_types::{DatabaseId, Lsn};
-use cascade_wal::{DebugWalReader, WalReader, WalRecord};
+use cascade_wal::WalRecord;
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -94,63 +94,69 @@ fn wait_connections_drain(fx: &Fixture) {
 /// every committed transaction's rows (xid-scoped Begin→Insert*→Commit).
 /// Runs its own reactor — a fresh process would do exactly this.
 fn replay_committed_rows(dir: &Path) -> Vec<(i32, String)> {
-    let db = DatabaseId(0);
+    use std::sync::Arc;
     let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
         .name("commit-replay")
         .make()
         .expect("replay executor builds");
     ex.run(async move {
-        let reader = DebugWalReader::open(dir, db)
-            .await
-            .expect("reader opens on the wal dir");
+        // M6 (storage §9): the replay reads through the LOCAL LOG STORE —
+        // durable, gap-free records; the store handled its tail at open.
+        let dev = Arc::new(cascade_blockdev::GlommioBlockDevice::new(dir.join("store")));
+        let store = cascade_logstore::LogStore::open(dev).await.expect("store opens");
+        let span = cascade_telemetry::Span::noop();
+        let ctx = cascade_storage_api::OpCtx::new(
+            cascade_storage_api::TenantContext::for_database(DatabaseId(0)),
+            &span,
+        );
+        use cascade_storage_api::LogSource as _;
+        let scope = cascade_types::ScopeId(0);
+        let durable = cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
         let mut rows = Vec::new();
         let mut open: Vec<(u64, Vec<(i32, String)>)> = Vec::new();
-        let mut at = Lsn(0);
-        loop {
-            // None at end-of-log ends the replay — the recovery walk.
-            let Some(entry) = reader
-                .read_record(at)
-                .await
-                .expect("replay hits no corruption")
-            else {
+        let mut pos = Lsn(0);
+        while pos < durable {
+            let chunk = store.read_log(&ctx, scope, pos, 1 << 20).await.expect("chunk");
+            if chunk.bytes.is_empty() {
                 break;
-            };
-            match entry.record {
-                WalRecord::BeginTxn { xid } => open.push((xid, Vec::new())),
-                WalRecord::LegacyInsert { xid, id, val, .. } => {
-                    open.iter_mut().for_each(|(x, r)| {
-                        if *x == xid {
-                            r.push((id, val.clone()));
-                        }
-                    });
-                }
-                // The runtime's row image since T1.3: the row rides in the
-                // cell's payload (the session's debug row image); a
-                // CRC-valid record whose cell won't parse is a bug this
-                // replay refuses loudly via expect.
-                WalRecord::HeapInsert { xid, cell, .. } => {
-                    let (id, val) =
-                        session::parse_heap_insert_row(&cell).expect("row image parses");
-                    open.iter_mut().for_each(|(x, r)| {
-                        if *x == xid {
-                            r.push((id, val.clone()));
-                        }
-                    });
-                }
-                WalRecord::CommitTxn { xid, .. } => {
-                    if let Some((_, txn_rows)) = open.iter().find(|(x, _)| *x == xid) {
-                        rows.extend(txn_rows.iter().cloned());
-                    }
-                    open.retain(|(x, _)| *x != xid);
-                }
-                WalRecord::AbortTxn { xid } => open.retain(|(x, _)| *x != xid),
-                // Reserved families (§6/§7/§17) carry no row data.
-                WalRecord::ClosedTsHeartbeat { .. }
-                | WalRecord::HlcHighWater { .. }
-                | WalRecord::BulkLoad
-                | WalRecord::UnloggedMarker => {}
             }
-            at = entry.next;
+            let mut at = 0usize;
+            while at < chunk.bytes.len() {
+                let d = cascade_wal_format::decode(&chunk.bytes[at..]).expect("record");
+                match d.record {
+                    WalRecord::BeginTxn { xid } => open.push((xid, Vec::new())),
+                    WalRecord::LegacyInsert { xid, id, ref val, .. } => {
+                        open.iter_mut().for_each(|(x, r)| {
+                            if *x == xid {
+                                r.push((id, val.clone()));
+                            }
+                        });
+                    }
+                    WalRecord::HeapInsert { xid, cell, .. } => {
+                        let (id, val) = session::parse_heap_insert_row(&cell)
+                            .expect("row image parses");
+                        open.iter_mut().for_each(|(x, r)| {
+                            if *x == xid {
+                                r.push((id, val.clone()));
+                            }
+                        });
+                    }
+                    WalRecord::CommitTxn { xid, .. } => {
+                        if let Some(i) = open.iter().position(|(x, _)| *x == xid) {
+                            let (_, taken) = open.remove(i);
+                            rows.extend(taken);
+                        }
+                    }
+                    WalRecord::AbortTxn { xid } => {
+                        if let Some(i) = open.iter().position(|(x, _)| *x == xid) {
+                            open.remove(i);
+                        }
+                    }
+                    _ => {}
+                }
+                at += d.total;
+                pos = Lsn(pos.0 + d.total as u64);
+            }
         }
         assert!(open.is_empty(), "no transaction left open at end of log");
         rows

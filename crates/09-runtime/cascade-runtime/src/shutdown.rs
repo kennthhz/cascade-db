@@ -65,7 +65,7 @@
 //! shutdown degenerates to the joins; the trace records exactly that.
 
 use std::{
-    rc::Rc,
+
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, RecvTimeoutError, TryRecvError},
@@ -98,12 +98,11 @@ pub enum DrainMsg {
 }
 
 /// What one designated reactor needs to answer [`DrainMsg::FinalFlush`].
-/// Built *in-task* on the worker (the WAL handle is `Rc` — reactor-local
-/// by construction), passed to [`drain_loop`].
+/// Passed to [`drain_loop`].
 pub struct FinalFlushCtx {
-    /// This reactor's per-DB WAL writer and handle. `Some` only when the
-    /// boot has a WAL at all; the handle is the worker's own.
-    pub wal: Option<(Arc<cascade_wal::WalWriter>, Rc<cascade_wal::WalHandle>)>,
+    /// This reactor's per-DB WAL writer. `Some` only when the boot has a
+    /// WAL at all; durability rides the sink (the local log store, M6).
+    pub wal: Option<Arc<cascade_wal::WalWriter>>,
     /// Whether this reactor is the dev DB's WAL-home reactor — the one
     /// whose flush is §10.2 step 3 (and whose ack stamps the marker's
     /// durable LSN on the serving side).
@@ -126,10 +125,11 @@ pub async fn drain_loop(
                     match &final_flush {
                         None => Err("no WAL on this boot".to_string()),
                         Some(ctx) if ctx.is_home => {
-                            let (writer, handle) = ctx.wal.as_ref().expect("is_home implies wal");
-                            // §10.2 step 3: the per-DB WAL tail, first.
+                            let writer = ctx.wal.as_ref().expect("is_home implies wal");
+                            // §10.2 step 3: the per-DB WAL tail, first —
+                            // through the sink (M6).
                             writer
-                                .flush_wal(handle, writer.filled())
+                                .flush_wal_sink(writer.filled())
                                 .await
                                 .map_err(|e| e.to_string())?;
                             // Then step 4: the last flush pass.
@@ -253,10 +253,10 @@ pub struct ServingShutdown {
     /// §10.2's `drain_deadline` (config `drain_deadline_s`).
     pub deadline: Duration,
     pub trace: ShutdownTrace,
-    /// The WAL writer and its directory, for the clean marker's durable
-    /// LSN. `None` on a boot with no `wal_dir` (nothing to flush or
-    /// stamp).
-    pub wal: Option<(Arc<cascade_wal::WalWriter>, std::path::PathBuf)>,
+    /// The WAL writer (M6: durability rides the sink — the local log
+    /// store owns its tail at open, so no clean marker is stamped).
+    /// `None` on a boot with no WAL (nothing to flush).
+    pub wal: Option<Arc<cascade_wal::WalWriter>>,
 }
 
 /// The ack wait, cooperative for the same reason as [`wait_inflight`]:
@@ -312,7 +312,7 @@ pub async fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSe
     let (home_present, acks) = send_final_flush(senders);
     // Nothing to flush without a WAL; and without a home reactor there is
     // nothing that CAN flush one — refuse the marker on both, loudly.
-    let mut wal_flushed = ctx.wal.is_none();
+    let _wal_flushed_witness = ctx.wal.is_none();
     if ctx.wal.is_some() && !home_present {
         cascade_telemetry::log(
             Level::Warn,
@@ -332,7 +332,6 @@ pub async fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSe
                 // the tail flushed — step 3 done.
                 if i == 0 && home_present && ctx.wal.is_some() {
                     ctx.trace.record("final-wal-flush");
-                    wal_flushed = true;
                 }
             }
             Ok(Err(e)) => {
@@ -364,23 +363,9 @@ pub async fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSe
         ctx.trace.record("final-flush-incomplete");
     }
 
-    // T3.3's clean marker, stamped only after the WAL tail is known
-    // durable: an unacknowledged (or failed) flush — or a boot whose
-    // home site never existed — must leave the marker unwritten, so the
-    // next boot treats the log as unclean and replays honestly. A wedged
-    // *other* site does not block the marker — the marker vouches for
-    // the WAL, which the home site alone flushed.
-    if let (Some((writer, dir)), true) = (&ctx.wal, wal_flushed) {
-        let db = crate::tenant::dev_context().db;
-        match cascade_wal::write_clean_marker(dir, db, writer.durable()) {
-            Ok(()) => ctx.trace.record("clean-marker"),
-            Err(e) => cascade_telemetry::log(
-                Level::Warn,
-                "shutdown_clean_marker_failed",
-                &[("reason", e.to_string().as_str())],
-            ),
-        }
-    }
+    // M6: no clean marker — the log store handles its own tail at open
+    // (§5.7), so the next boot replays the durable log regardless; the
+    // marker's clean/unclean bookkeeping died with the file path.
 }
 
 #[cfg(test)]

@@ -18,6 +18,10 @@ glommio         = { workspace = true }
 cascade-error     = { workspace = true }
 cascade-telemetry = { workspace = true }
 cascade-runtime   = { workspace = true }
+cascade-logstore     = { workspace = true }
+cascade-storage-api  = { workspace = true }
+cascade-types       = { workspace = true }
+cascade-blockdev  = { workspace = true }
 cascade-pgwire    = { workspace = true }
 cascade-storage   = { workspace = true }
 cascade-wal       = { workspace = true }

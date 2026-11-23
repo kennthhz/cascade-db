@@ -25,5 +25,10 @@ cascade-page      = { workspace = true }
 libc        = { workspace = true }
 
 [dev-dependencies]
+cascade-blockdev   = { workspace = true }
+cascade-logstore   = { workspace = true }
+cascade-storage-api = { workspace = true }
+cascade-telemetry  = { workspace = true }
+cascade-wal-format = { workspace = true }
 glommio  = { workspace = true }
 postgres = "0.19"

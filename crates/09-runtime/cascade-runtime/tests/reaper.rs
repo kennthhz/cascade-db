@@ -166,11 +166,29 @@ fn reaped_midtxn_connection_leaves_only_committed_rows() {
     let report = fx.rt.shutdown();
     assert_eq!(report.workers_stopped, 2);
     let db = DatabaseId(0);
-    let plan = cascade_runtime::recovery::prepare(
-        fx.wal_dir.as_ref().expect("wal fixture"),
-        db,
-    )
-    .expect("recovery reads");
+    let scope = cascade_types::ScopeId(u64::from(db.0));
+    let plan = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+        .name("reaper-replay")
+        .make()
+        .expect("executor")
+        .run(async {
+            let device = std::sync::Arc::new(
+                cascade_blockdev::GlommioBlockDevice::new(
+                    fx.wal_dir.as_ref().expect("wal fixture").join("store"),
+                ),
+            );
+            let store = cascade_logstore::LogStore::open(device).await.expect("store opens");
+            let span = cascade_telemetry::Span::noop();
+            let _ctx = cascade_storage_api::OpCtx::new(
+                cascade_storage_api::TenantContext::for_database(db),
+                &span,
+            );
+            
+            let durable =
+                cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+            cascade_runtime::recovery::prepare_from_source(&*store, scope, durable).await
+        })
+        .expect("recovery reads");
     assert_eq!(
         plan.seed_rows,
         vec![(1, "keep".to_string())],

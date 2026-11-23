@@ -23,7 +23,7 @@ use std::{
 use cascade_telemetry::Span;
 use cascade_tenant::TenantContext;
 use cascade_types::{Hlc, Lsn, SegmentId, VersionWord, TxnId};
-use cascade_wal::{WalError, WalHandle, WalRecord, WalWriter};
+use cascade_wal::{WalError, WalRecord, WalWriter};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use static_assertions::assert_not_impl_any;
 
@@ -112,13 +112,13 @@ fn next_commit_ts() -> Hlc {
     Hlc(NEXT_COMMIT_TS.fetch_add(1, Ordering::Relaxed))
 }
 
-/// Per-connection WAL wiring (T1.11, FR-27): the DB's shared writer plus
-/// *this reactor's* handle. The writer is `Arc`-shared across workers; the
-/// handle is opened on — and stays on — this worker's ring (I2), shared by
-/// all its sessions via `Rc`.
+/// Per-connection WAL wiring (T1.11, FR-27; M6 storage §9): the DB's
+/// shared writer, whose durability is the local log store (the sink).
+/// `Arc`-shared across workers — there is no per-reactor file handle
+/// anymore: flushes go through `flush_wal_sink`, and the log store owns
+/// the device I/O on whichever core a flush runs on.
 pub struct Wal {
     pub writer: Arc<WalWriter>,
-    pub handle: Rc<WalHandle>,
 }
 
 /// The worker-shared debug table: `debug_table(id INT, val TEXT)`, one
@@ -1160,7 +1160,8 @@ async fn durable_commit(wal: &Wal, rows: &[Row]) -> Result<Lsn, PgError> {
     crate::recovery::crash_barrier("midfill").await;
     let _ = commit.fill();
 
-    writer.flush_wal(&wal.handle, end).await?;
+    // M6: durability rides the sink (the local log store).
+    writer.flush_wal_sink(end).await?;
     // Barrier: durable, not yet acked — the window FR-27's ordering
     // exists for. A kill here replays a commit the client never saw
     // (in-doubt); the replay applies it either way.

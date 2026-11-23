@@ -19,6 +19,7 @@ cascade-wal        = { workspace = true }
 cascade-wal-format = { workspace = true }
 cascade-storage-api = { workspace = true }
 cascade-logstore   = { workspace = true }
+cascade-blockdev   = { workspace = true }
 cascade-bpm       = { workspace = true }
 cascade-storage   = { workspace = true }
 cascade-pg-parser = { workspace = true }
@@ -37,5 +38,9 @@ rand         = { workspace = true }
 static_assertions = { workspace = true }
 
 [dev-dependencies]
-postgres     = "0.19"
-trybuild     = "1"
+postgres           = "0.19"
+trybuild           = "1"
+cascade-blockdev   = { workspace = true }
+cascade-storage-api = { workspace = true }
+cascade-wal-format  = { workspace = true }
+futures-lite        = { workspace = true }

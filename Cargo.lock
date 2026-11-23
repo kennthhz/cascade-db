@@ -85,10 +85,15 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "bench"
 version = "0.1.0"
 dependencies = [
+ "cascade-blockdev",
+ "cascade-logstore",
  "cascade-page",
  "cascade-runtime",
+ "cascade-storage-api",
+ "cascade-telemetry",
  "cascade-types",
  "cascade-wal",
+ "cascade-wal-format",
  "glommio",
  "libc",
  "postgres",
@@ -358,6 +363,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "base64",
+ "cascade-blockdev",
  "cascade-bpm",
  "cascade-error",
  "cascade-logstore",
@@ -390,15 +396,19 @@ name = "cascade-server"
 version = "0.1.0"
 dependencies = [
  "bench",
+ "cascade-blockdev",
  "cascade-bpm",
  "cascade-catalog",
  "cascade-error",
+ "cascade-logstore",
  "cascade-pgwire",
  "cascade-runtime",
  "cascade-sql-exec",
  "cascade-sql-planner",
  "cascade-storage",
+ "cascade-storage-api",
  "cascade-telemetry",
+ "cascade-types",
  "cascade-wal",
  "glommio",
  "libc",

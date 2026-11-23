@@ -22,7 +22,10 @@ use cascade_runtime::{
     pin, AcceptLoop, Runtime, RuntimeConfig, SyntheticTopology,
 };
 use cascade_types::{DatabaseId, Lsn};
-use cascade_wal::{DebugWalReader, WalReader, WalRecord};
+use cascade_blockdev::GlommioBlockDevice;
+use cascade_logstore::LogStore;
+use cascade_storage_api::{LogSink as _, LogSource as _};
+use cascade_wal::WalRecord;
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -146,9 +149,13 @@ fn drive(addr: &str) -> Vec<Vec<Msg>> {
 
 /// Record-shape sequence of the log (xids deliberately erased: each
 /// process numbers its own transactions).
-fn wal_shapes(wal_dir: &Path) -> Vec<String> {
+/// The legacy single-file reader — the pgmodel architecture still writes
+/// exactly this format, so its half of the parity comparison reads it
+/// directly (the cascade side reads through the log store).
+fn wal_shapes_files(wal_dir: &Path) -> Vec<String> {
+    use cascade_wal::{DebugWalReader, WalReader};
     let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
-        .name("parity-wal")
+        .name("parity-wal-files")
         .make()
         .expect("executor");
     ex.run(async move {
@@ -164,9 +171,6 @@ fn wal_shapes(wal_dir: &Path) -> Vec<String> {
             shapes.push(match &entry.record {
                 WalRecord::BeginTxn { .. } => "begin".to_owned(),
                 WalRecord::LegacyInsert { id, val, .. } => format!("insert:({id},{val})"),
-                // The runtime's row image since T1.3: the row rides in the
-                // cell's payload — both architectures produce it, so the
-                // decoded shape stays the parity contract.
                 WalRecord::HeapInsert { cell, .. } => {
                     let (id, val) = cascade_runtime::session::parse_heap_insert_row(cell)
                         .expect("row image parses");
@@ -176,6 +180,55 @@ fn wal_shapes(wal_dir: &Path) -> Vec<String> {
                 other => format!("other:{other:?}"),
             });
             lsn = entry.next;
+        }
+        shapes
+    })
+}
+
+fn wal_shapes(wal_dir: &Path) -> Vec<String> {
+    let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+        .name("parity-wal")
+        .make()
+        .expect("executor");
+    ex.run(async move {
+        // M6 (storage §9): parity reads through the LOCAL LOG STORE —
+        // durable, gap-free records; the store handled its tail at open.
+        let device = std::sync::Arc::new(GlommioBlockDevice::new(wal_dir.join("store")));
+        let store = LogStore::open(device).await.expect("open store");
+        let span = cascade_telemetry::Span::noop();
+        let ctx = cascade_storage_api::OpCtx::new(
+            cascade_storage_api::TenantContext::for_database(DatabaseId(0)),
+            &span,
+        );
+        let scope = cascade_types::ScopeId(0);
+        let durable = store.durable_lsn(scope).expect("durable");
+        let mut shapes = Vec::new();
+        let mut lsn = Lsn(0);
+        while lsn < durable {
+            let chunk = store.read_log(&ctx, scope, lsn, 1 << 20).await.expect("chunk");
+            if chunk.bytes.is_empty() {
+                break;
+            }
+            let mut at = 0usize;
+            while at < chunk.bytes.len() {
+                let decoded = cascade_wal_format::decode(&chunk.bytes[at..]).expect("record");
+                shapes.push(match &decoded.record {
+                WalRecord::BeginTxn { .. } => "begin".to_owned(),
+                WalRecord::LegacyInsert { id, val, .. } => format!("insert:({id},{val})"),
+                // The runtime's row image since T1.3: the row rides in the
+                // cell's payload — both architectures produce it, so the
+                // decoded shape stays the parity contract.
+                WalRecord::HeapInsert { cell, .. } => {
+                    let (id, val) = cascade_runtime::session::parse_heap_insert_row(cell)
+                        .expect("row image parses");
+                    format!("insert:({id},{val})")
+                }
+                    WalRecord::CommitTxn { .. } => "commit".to_owned(),
+                    other => format!("other:{other:?}"),
+                });
+                at += decoded.total;
+                lsn = Lsn(lsn.0 + decoded.total as u64);
+            }
         }
         shapes
     })
@@ -241,7 +294,7 @@ fn wire_and_wal_parity_between_architectures() {
     // files (the fairness contract's byte identity, modulo per-process
     // xids).
     let cascade_shapes = wal_shapes(&cascade_wal_dir);
-    let pgmodel_shapes = wal_shapes(&pgmodel_wal_dir);
+    let pgmodel_shapes = wal_shapes_files(&pgmodel_wal_dir);
     assert_eq!(cascade_shapes, pgmodel_shapes);
     assert!(cascade_shapes.contains(&"insert:(3,three)".to_owned()));
     assert!(!cascade_shapes.iter().any(|s| s.contains("five")));
@@ -283,7 +336,9 @@ fn concurrent_backends_keep_the_log_self_describing() {
     // and every record must decode at its declared position. Each bare
     // INSERT autocommits, so the log holds exactly three shapes per
     // commit — begin, insert, commit — with none lost or duplicated.
-    let shapes = wal_shapes(&wal_dir);
+    // The concurrent backends are the pgmodel's forked children writing
+    // the legacy single-file format.
+    let shapes = wal_shapes_files(&wal_dir);
     assert_eq!(
         shapes.len(),
         CLIENTS * COMMITS_PER_CLIENT * 3,

@@ -32,6 +32,7 @@ use glommio::{
     ExecutorJoinHandle, LocalExecutorBuilder, Placement,
 };
 
+use cascade_storage_api::KeyRef;
 use cascade_wal::WalWriter;
 
 use crate::{
@@ -220,6 +221,10 @@ pub enum BootError {
     Config(#[from] crate::config::ConfigError),
     #[error("configured core {core} is not online per topology")]
     CoreOffline { core: u32 },
+    /// M6: the local log store failed to open or its recovery refused —
+    /// boot must not start over a log it cannot vouch for.
+    #[error("log store boot failed: {0}")]
+    LogStore(std::io::Error),
     #[error("housekeeper thread on core {core} failed to spawn: {message}")]
     HousekeeperSpawn { core: u32, message: String },
     #[error("worker reactor on core {core} failed to spawn: {message}")]
@@ -595,14 +600,73 @@ impl Runtime {
                 // before the housekeepers spawned) — one decision, two
                 // consumers.
                 let home = dev_home.expect("wal dir implies a resolved home");
-                // T3.3: the writer resumes at the replayed log end —
-                // seeding it at 0 after a recovery would overwrite durable
-                // history with this boot's first flush.
-                let resume = recovery
-                    .map(|p| cascade_types::Lsn(p.resume_offset))
-                    .unwrap_or(cascade_types::Lsn(0));
-                let (writer, constructed_on) =
-                    walhome::construct_writer_on(cfg, &online, topology, home, resume);
+                // M6 (storage §9): boot opens the LOCAL LOG STORE, runs
+                // recovery through it, and opens the writer on its sink —
+                // inside a bootstrap reactor, because the device's I/O is
+                // reactor-bound. open_with_sink positions the writer at
+                // the store's durable LSN: the replayed log end, where the
+                // first append must begin (§4.3 promise 1). The first-touch
+                // writer placement of walhome::construct_writer_on is
+                // deferred with the real engine: the writer's state is a
+                // few atomics; the flush rides whichever core waits.
+                let scope = cascade_types::ScopeId(u64::from(dev.0));
+                let store = Arc::new(cascade_blockdev::GlommioBlockDevice::new(dir.join("store")));
+                let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+                    .name("cascade-store-boot")
+                    .make()
+                    .map_err(|e| BootError::LogStore(std::io::Error::other(e.to_string())))?;
+                let (writer, plan_here) = ex
+                    .run(async {
+                        let store = cascade_logstore::LogStore::open(Arc::clone(&store))
+                            .await
+                            .map_err(|e| BootError::LogStore(std::io::Error::other(e.to_string())))?;
+                        let span = cascade_telemetry::Span::noop();
+                        let ctx = cascade_storage_api::OpCtx::new(
+                            cascade_storage_api::TenantContext::for_database(dev),
+                            &span,
+                        );
+                        // First boot creates the scope; a reopen's retry
+                        // open returns the durable LSN unchanged (§4.3 P1).
+                        let _ = cascade_storage_api::LogScopes::create_scope(
+                            &*store,
+                            &ctx,
+                            scope,
+                            cascade_types::Epoch::FIRST,
+                            KeyRef { key_id: 1 },
+                        )
+                        .await;
+                        use cascade_storage_api::LogSink as _;
+                        let durable = store
+                            .durable_lsn(scope)
+                            .map_err(|e| BootError::LogStore(std::io::Error::other(e.to_string())))?;
+                        let plan = match recovery {
+                            Some(p) => p.clone(),
+                            None => crate::recovery::prepare_from_source(
+                                store.as_ref(),
+                                scope,
+                                durable,
+                            )
+                            .await
+                            .map_err(|e| {
+                                BootError::LogStore(std::io::Error::other(e.to_string()))
+                            })?,
+                        };
+                        let writer = cascade_wal::WalWriter::open_with_sink(
+                            store.clone(),
+                            &ctx,
+                            scope,
+                            cascade_types::Epoch::FIRST,
+                        )
+                        .await
+                        .map_err(|e| BootError::LogStore(std::io::Error::other(e.to_string())))?;
+                        Ok::<_, BootError>((Arc::new(writer), plan))
+                    })
+                    .map_err(|e| BootError::LogStore(std::io::Error::other(e.to_string())))?;
+                // The plan the store produced drives the rest of boot
+                // (seeding, telemetry) — a caller-supplied plan is only a
+                // pre-M6 override now.
+                let recovery = Some(plan_here);
+                let recovery = recovery.as_ref();
                 if let Some(plan) = recovery {
                     cascade_telemetry::log(
                         cascade_telemetry::Level::Info,
@@ -610,19 +674,14 @@ impl Runtime {
                         &[
                             ("resume_offset", plan.resume_offset.to_string().as_str()),
                             ("rows", plan.seed_rows.len().to_string().as_str()),
-                            ("unclean", plan.unclean.to_string().as_str()),
-                            (
-                                "torn_tail",
-                                plan.torn_tail
-                                    .map(|l| l.0.to_string())
-                                    .unwrap_or_else(|| "none".into())
-                                    .as_str(),
-                            ),
                         ],
                     );
                 }
                 let mut table = WalHomeTable::new();
-                table.set(dev, WalHome { numa: home, constructed_on });
+                // The writer was constructed on the bootstrap reactor —
+                // first-touch placement is deferred with the real engine
+                // (reported honestly as the boot-thread fallback).
+                table.set(dev, WalHome { numa: home, constructed_on: None });
                 // Persist whatever this boot decided (A14), preserving any
                 // rows for databases other than the dev one.
                 let mut to_persist = persisted_homes;
@@ -655,10 +714,7 @@ impl Runtime {
             inflight: inflight.clone(),
             deadline: Duration::from_secs(cfg.drain_deadline_s),
             trace: shutdown_trace.clone(),
-            wal: wal
-                .as_ref()
-                .zip(cfg.wal_dir.clone())
-                .map(|(w, dir)| (Arc::clone(w), dir)),
+            wal: wal.as_ref().map(Arc::clone),
         });
         // A dup of the listening fd, taken before the listener moves into
         // the serving thread (T4.4): `shutdown(2)` on the dup wakes a
@@ -1458,7 +1514,6 @@ fn spawn_workers(
         let task_sample_ms = cfg.load_sample_ms;
         let reap_stall_ms = cfg.stall_reap_ms;
         let task_writer = wal.map(Arc::clone);
-        let task_wal_dir = cfg.wal_dir.clone();
         let task_heap = demo_heap.clone();
         let task_seed = seed_rows.to_vec();
         let deadline = Duration::from_micros(cfg.yield_deadline_us);
@@ -1496,16 +1551,10 @@ fn spawn_workers(
                 }
                 // T1.11 (I2): this reactor's WAL handle, opened on — and
                 // owned by — this ring, shared by all its sessions.
-                let wal = match (task_writer, task_wal_dir) {
-                    (Some(writer), Some(dir)) => {
-                        let handle =
-                            cascade_wal::WalHandle::open(&dir, crate::tenant::dev_context().db)
-                                .await
-                                .expect("worker wal handle opens");
-                        Some((writer, Rc::new(handle)))
-                    }
-                    _ => None,
-                };
+                // M6 (storage §9): no per-reactor file handle — the
+                // writer's durability is the local log store; flushes go
+                // through flush_wal_sink on whichever core runs them.
+                let wal = task_writer.map(|writer| (writer, ()));
                 let handoffs = rx.connect().await;
                 // The control plane (T4.2): checkpoint signals arrive on
                 // their own channel and run as a sibling task on this
@@ -1527,9 +1576,7 @@ fn spawn_workers(
                 if let Some(drain_rx) = drain_rx {
                     let drains = drain_rx.connect().await;
                     let final_flush = crate::shutdown::FinalFlushCtx {
-                        wal: wal
-                            .as_ref()
-                            .map(|(w, h)| (Arc::clone(w), Rc::clone(h))),
+                        wal: wal.as_ref().map(|(w, _)| Arc::clone(w)),
                         is_home: task_is_home,
                     };
                     glommio::spawn_local(crate::shutdown::drain_loop(
@@ -1619,10 +1666,11 @@ fn spawn_workers(
                     let tenants = task_tenants.clone();
                     let table = Rc::clone(&table);
                     let heap = task_heap.clone();
-                    let wal = wal.as_ref().map(|(writer, handle)| crate::session::Wal {
-                        writer: Arc::clone(writer),
-                        handle: Rc::clone(handle),
-                    });
+                    let wal = wal
+                        .as_ref()
+                        .map(|(writer, _)| crate::session::Wal {
+                            writer: Arc::clone(writer),
+                        });
                     glommio::spawn_local(crate::session::run(
                         handoff, table, counter, tenants, wal, heap,
                         Some(crate::session::Tierc {

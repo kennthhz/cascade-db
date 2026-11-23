@@ -282,11 +282,24 @@ fn ticks_continue_under_client_load() {
         "load clients only managed {} inserts",
         acked.len()
     );
-    let plan = cascade_runtime::recovery::prepare(
-        &dir,
-        cascade_runtime::tenant::dev_context().db,
-    )
-    .expect("wal walk");
+    // M6 (storage §9): the replay walks the LOCAL LOG STORE.
+    let plan = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+        .name("tick-replay")
+        .make()
+        .expect("executor")
+        .run(async {
+            let dev = cascade_runtime::tenant::dev_context().db;
+            let device = std::sync::Arc::new(
+                cascade_blockdev::GlommioBlockDevice::new(dir.join("store")),
+            );
+            let store = cascade_logstore::LogStore::open(device).await.expect("store opens");
+            let scope = cascade_types::ScopeId(u64::from(dev.0));
+            
+            let durable =
+                cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+            cascade_runtime::recovery::prepare_from_source(&*store, scope, durable).await
+        })
+        .expect("wal walk");
     let wal_ids: std::collections::HashSet<i32> =
         plan.seed_rows.iter().map(|(id, _)| *id).collect();
     let kills = fx.rt.reap_stats().map(|s| s.reaped()).unwrap_or(0) as usize;

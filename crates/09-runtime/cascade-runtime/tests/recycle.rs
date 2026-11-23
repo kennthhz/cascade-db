@@ -21,6 +21,8 @@ use std::{
 };
 
 use cascade_bpm::{Bpm, BpmConfig, PerDbAccounting};
+use cascade_blockdev::GlommioBlockDevice;
+use cascade_logstore::LogStore;
 use cascade_runtime::{
     checkpointer::{self, TruncatableLsn},
     config::{AuthConfig, NumaPool, NumaWorkers},
@@ -112,8 +114,38 @@ fn live_recycler_runs_but_never_touches_the_log() {
     }
 
     let dev = cascade_runtime::tenant::dev_context().db;
-    let log_path: PathBuf = dir.join(format!("db_{}.log", dev.0));
-    let before = std::fs::read(&log_path).expect("log readable");
+    let scope = cascade_types::ScopeId(u64::from(dev.0));
+    let store_log = |dir: &std::path::Path| -> Vec<u8> {
+        use std::sync::Arc;
+        glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("recycle-read")
+            .make()
+            .expect("executor")
+            .run(async {
+                let device = Arc::new(GlommioBlockDevice::new(dir.join("store")));
+                let store = LogStore::open(device).await.expect("store opens");
+                let span = cascade_telemetry::Span::noop();
+                let ctx = cascade_storage_api::OpCtx::new(
+                    cascade_storage_api::TenantContext::for_database(dev),
+                    &span,
+                );
+                use cascade_storage_api::LogSource as _;
+                let durable =
+                    cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+                let mut out = Vec::new();
+                let mut pos = Lsn(0);
+                while pos < durable {
+                    let chunk = store.read_log(&ctx, scope, pos, 1 << 20).await.expect("chunk");
+                    if chunk.bytes.is_empty() {
+                        break;
+                    }
+                    out.extend_from_slice(&chunk.bytes);
+                    pos = chunk.end;
+                }
+                out
+            })
+    };
+    let before = store_log(&dir);
     assert!(!before.is_empty(), "the log has content to protect");
 
     std::thread::sleep(Duration::from_millis(1000));
@@ -134,7 +166,7 @@ fn live_recycler_runs_but_never_touches_the_log() {
         "frontier 0: nothing is reclaimable — ever"
     );
 
-    let after = std::fs::read(&log_path).expect("log readable after");
+    let after = store_log(&dir);
     assert_eq!(
         before, after,
         "needed-segment protection: a second of recycles left the log byte-identical"
@@ -144,8 +176,25 @@ fn live_recycler_runs_but_never_touches_the_log() {
         Some(Lsn(0)),
         "the recycler is a frontier consumer, never an advancer"
     );
-    // And the protected log still replays everything committed above.
-    let plan = cascade_runtime::recovery::prepare(&dir, dev).expect("wal walk");
+    // And the protected log still replays everything committed above
+    // (M6: through the log store's LogSource walk).
+    let plan = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+        .name("recycle-replay")
+        .make()
+        .expect("executor")
+        .run(async {
+            let device = Arc::new(GlommioBlockDevice::new(dir.join("store")));
+            let store = LogStore::open(device).await.expect("store opens");
+            let span = cascade_telemetry::Span::noop();
+            let _ctx = cascade_storage_api::OpCtx::new(
+                cascade_storage_api::TenantContext::for_database(dev),
+                &span,
+            );
+            
+            let durable = cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+            cascade_runtime::recovery::prepare_from_source(&*store, scope, durable).await
+        })
+        .expect("wal walk");
     assert_eq!(
         plan.seed_rows.len(),
         ROWS as usize,

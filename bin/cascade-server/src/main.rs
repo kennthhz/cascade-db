@@ -115,30 +115,56 @@ fn main() {
 
     // FR-7: recovery runs *before* the socket binds. A boot that refused
     // (corrupt log) never accepts a connection; a boot that replayed never
-    // serves a row its WAL cannot vouch for.
+    // serves a row its WAL cannot vouch for. M6 (storage §9): recovery
+    // reads the LOCAL LOG STORE through LogSource — this pre-bind pass
+    // refuses a corrupt store before bind; boot re-opens the store and
+    // replays again on its own terms.
     let db = cascade_runtime::tenant::dev_context().db;
-    let plan = match cfg.wal_dir.as_ref() {
-        Some(dir) => match cascade_runtime::recovery::prepare(dir, db) {
-            Ok(plan) => {
-                if plan.unclean {
+    let scope = cascade_types::ScopeId(u64::from(db.0));
+    if cfg.wal_dir.is_some() {
+        let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+            .name("cascade-store-boot")
+            .make()
+            .expect("bootstrap executor");
+        let refused: Result<(), String> = ex.run(async {
+            let device = std::sync::Arc::new(cascade_blockdev::GlommioBlockDevice::new(
+                cfg.wal_dir.as_ref().expect("checked").join("store"),
+            ));
+            let store = match cascade_logstore::LogStore::open(device).await {
+                Ok(s) => s,
+                Err(e) => return Err(e.to_string()),
+            };
+            let span = cascade_telemetry::Span::noop();
+            let ctx = cascade_storage_api::OpCtx::new(
+                cascade_storage_api::TenantContext::for_database(db),
+                &span,
+            );
+            let _ = cascade_storage_api::LogScopes::create_scope(
+                &*store,
+                &ctx,
+                scope,
+                cascade_types::Epoch::FIRST,
+                cascade_storage_api::KeyRef { key_id: 1 },
+            )
+            .await;
+            use cascade_storage_api::LogSink as _;
+            let durable = store.durable_lsn(scope).expect("durable");
+            cascade_runtime::recovery::prepare_from_source(&*store, scope, durable)
+                .await
+                .map(|plan| {
                     eprintln!(
-                        "cascade-server: crash recovery: replaying from byte {} ({} row(s){})",
+                        "cascade-server: recovered: replaying from byte {} ({} row(s))",
                         plan.resume_offset,
                         plan.seed_rows.len(),
-                        plan.torn_tail
-                            .map(|l| format!(", torn tail truncated at {:#x}", l.0))
-                            .unwrap_or_default(),
                     );
-                }
-                Some(plan)
-            }
-            Err(e) => {
-                eprintln!("cascade-server: boot refused: {e}");
-                std::process::exit(1);
-            }
-        },
-        None => None,
-    };
+                })
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = refused {
+            eprintln!("cascade-server: boot refused: {e}");
+            std::process::exit(1);
+        }
+    }
 
     let listener = AcceptLoop::bind("127.0.0.1", port).expect("bind");
     let bound = listener.local_addr().expect("addr").port();
@@ -147,7 +173,7 @@ fn main() {
         &topo,
         Some(listener),
         Default::default(),
-        plan.as_ref(),
+        None, // M6: boot computes the plan from the log store itself
     )
     .expect("boot routed");
     println!("cascade-server: ready on 127.0.0.1:{bound}");
@@ -170,12 +196,9 @@ fn main() {
     let wal = rt.debug_wal().cloned();
     let report = rt.shutdown();
     eprintln!("cascade-server: shutdown phases: {:?}", report.phases);
-    // The clean marker is the crash-recovery contract (T3.3): a shutdown
-    // that could not vouch for the WAL tail must say so loudly.
-    if cfg.wal_dir.is_some() && !report.phases.contains(&"clean-marker") {
-        eprintln!("cascade-server: clean marker not written — WAL tail unconfirmed");
-        std::process::exit(1);
-    }
+    // M6: the clean marker died with the file path — the log store
+    // handles its own tail at open (§5.7), so the next boot replays the
+    // durable log regardless.
 
     // One JSON observables line: the numbers the architecture claims live
     // or die on (stalls ≈ 0 under healthy load; bytes-per-fsync shows the

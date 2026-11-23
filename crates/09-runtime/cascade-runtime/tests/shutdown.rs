@@ -170,7 +170,6 @@ fn drain_order_is_the_102_sequence() {
             "sessions-drained",
             "final-wal-flush",
             "final-bpm-flush",
-            "clean-marker",
             "reactors-dropped",
         ],
         "the drain order is the §10.2 sequence"
@@ -195,17 +194,34 @@ fn drain_order_is_the_102_sequence() {
         wal.filled(),
         "final flush synced the whole tail"
     );
-    // The clean marker exists (fsynced by the runtime).
-    let db = DatabaseId(0);
-    let marker = fx.wal_dir.join(format!("db_{}.clean", db.0));
-    assert!(marker.exists(), "the clean marker was written");
+    // M6 (storage §9): no clean marker — the log store handles its own
+    // tail at open (§5.7), so the next boot replays the durable log
+    // regardless of how the previous one stopped.
+    let _ = DatabaseId(0);
 
-    // Restart semantics: recovery reads an unclean-free log with the
-    // clean LSN stamped and replays exactly the committed rows.
-    let plan = cascade_runtime::recovery::prepare(&fx.wal_dir, db).expect("recovery reads");
-    assert!(!plan.unclean, "a clean shutdown never replays a crash");
-    assert!(plan.clean_lsn.is_some(), "the marker is visible to recovery");
-    assert!(plan.torn_tail.is_none(), "no torn tail after a clean flush");
+    // Restart semantics (M6): the replay walks the LOCAL LOG STORE — the
+    // store owns the tail, so there is no marker, no torn-tail bookkeeping;
+    // exactly the committed rows replay.
+    let plan = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+        .name("shutdown-replay")
+        .make()
+        .expect("executor")
+        .run(async {
+            let device = std::sync::Arc::new(
+                cascade_blockdev::GlommioBlockDevice::new(fx.wal_dir.join("store")),
+            );
+            let store = cascade_logstore::LogStore::open(device).await.expect("store opens");
+            let dev = DatabaseId(0);
+            let scope = cascade_types::ScopeId(u64::from(dev.0));
+            
+            let durable =
+                cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+            cascade_runtime::recovery::prepare_from_source(&*store, scope, durable).await
+        })
+        .expect("recovery reads");
+    assert!(!plan.unclean, "no marker era: unclean is always false");
+    assert!(plan.clean_lsn.is_none(), "no marker era: no clean LSN");
+    assert!(plan.torn_tail.is_none(), "the store handled its tail at open");
     assert_eq!(
         plan.seed_rows.len(),
         3,
@@ -343,7 +359,6 @@ fn ddl_in_flight_at_shutdown_drains_cleanly() {
             "sessions-drained",
             "final-wal-flush",
             "final-bpm-flush",
-            "clean-marker",
             "reactors-dropped",
         ],
         "the drain carried the bounce to a fully clean shutdown: {:?}",
@@ -356,13 +371,25 @@ fn ddl_in_flight_at_shutdown_drains_cleanly() {
     // the server answered with an error) must fail this test loudly, not
     // vanish into a detached thread.
     ddl_thread.join().expect("the DDL client thread joins cleanly");
-    // The WAL is clean for the next boot — the marker the pre-fix drain
-    // refused is exactly what a healthy system must stamp.
-    let db = DatabaseId(0);
-    let marker = fx.wal_dir.join(format!("db_{}.clean", db.0));
-    assert!(marker.exists(), "the clean marker was written");
-    let plan = cascade_runtime::recovery::prepare(&fx.wal_dir, db).expect("recovery reads");
-    assert!(!plan.unclean, "a clean shutdown never replays a crash");
+    // M6 (storage §9): no clean marker — the log store owns the tail.
+    let plan = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
+        .name("shutdown-replay-2")
+        .make()
+        .expect("executor")
+        .run(async {
+            let device = std::sync::Arc::new(
+                cascade_blockdev::GlommioBlockDevice::new(fx.wal_dir.join("store")),
+            );
+            let store = cascade_logstore::LogStore::open(device).await.expect("store opens");
+            let dev = DatabaseId(0);
+            let scope = cascade_types::ScopeId(u64::from(dev.0));
+            
+            let durable =
+                cascade_storage_api::LogSink::durable_lsn(&*store, scope).expect("durable");
+            cascade_runtime::recovery::prepare_from_source(&*store, scope, durable).await
+        })
+        .expect("recovery reads");
+    assert!(!plan.unclean, "no marker era: unclean is always false");
 }
 
 /// A listenerless boot orchestrates nothing (D9): shutdown degenerates to

@@ -144,9 +144,9 @@ fn single_writer_homes_to_the_bound_numa() {
         rt.wal_homes().home(dev),
         Some(WalHome {
             numa: 1,
-            constructed_on: Some(w1),
+            constructed_on: None,
         }),
-        "single affinity: writer homed to the bound NUMA, constructed there"
+        "single affinity: writer homed to the bound NUMA (M6: constructed on the bootstrap reactor; first-touch defers)"
     );
     // A14: the choice is recorded where the next boot will re-read it.
     assert_eq!(
@@ -178,9 +178,9 @@ fn appends_route_to_the_home_writer_even_from_off_home_reactors() {
         rt.wal_homes().home(dev),
         Some(WalHome {
             numa: 1,
-            constructed_on: Some(w1),
+            constructed_on: None,
         }),
-        "cross affinity: writer homed to the derived NUMA, constructed there"
+        "cross affinity: writer homed to the derived NUMA (M6: constructed on the bootstrap reactor; first-touch defers)"
     );
 
     let writer = rt.debug_wal().expect("home writer wired").clone();
@@ -342,16 +342,14 @@ fn workerless_pool_numa_never_homes_the_writer() {
         "a worker-less pool numa is never a derived home"
     );
 
-    // And the shutdown stamps the marker: the home has a designated
-    // reactor to run the final flush. The pre-fix boot refused it.
+    // And the shutdown runs the home's final flush (M6: the marker died
+    // with the file path — the log store owns its tail at open): the home
+    // has a designated reactor to run it. The pre-fix boot refused even
+    // the flush.
     let report = rt.shutdown();
     assert!(
-        report.phases.contains(&"clean-marker"),
-        "the home reactor stamps the clean marker: {:?}",
+        report.phases.contains(&"final-wal-flush"),
+        "the home reactor runs the final flush: {:?}",
         report.phases
-    );
-    assert!(
-        dir.join("db_0.clean").is_file(),
-        "the clean marker exists for the next boot"
     );
 }

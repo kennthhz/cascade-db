@@ -272,3 +272,27 @@ fn a_heavy_backlog_cannot_starve_a_committing_scope() {
         "the backlog was not drained at the small scope's expense"
     );
 }
+
+/// The cross-executor lifecycle the runtime boot exercises: open on one
+/// ring, append+flush on the SAME Arc from another ring, reopen on a
+/// third — the scan must find the flushed frame.
+#[test]
+fn reopen_across_executors_sees_the_flushed_frame() {
+    use std::sync::Arc;
+    let dev = Arc::new(MemBlockDevice::new());
+    let store = block_on(cascade_logstore::LogStore::open(dev.clone())).expect("opens");
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 1);
+    block_on(store.create_scope(&ctx, SCOPE, Epoch(1), KeyRef { key_id: 1 })).expect("creates");
+    block_on(store.open_writer(&ctx, SCOPE, Epoch(1))).expect("opens");
+    let bytes = commit_bytes(1, 1, 0);
+    block_on(store.append(&ctx, SCOPE, Epoch(1), Lsn(0), &bytes, meta_none())).expect("appends");
+    block_on(store.wait_durable(&ctx, SCOPE, Lsn(bytes.len() as u64))).expect("durables");
+
+    let reopened = block_on(cascade_logstore::LogStore::open(dev.clone())).expect("reopens");
+    assert_eq!(
+        cascade_storage_api::LogSink::durable_lsn(&*reopened, SCOPE).expect("durable"),
+        Lsn(bytes.len() as u64),
+        "the scan finds the flushed frame across the reopen"
+    );
+}

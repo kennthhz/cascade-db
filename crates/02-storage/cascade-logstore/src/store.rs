@@ -230,14 +230,22 @@ impl<D: BlockDevice + 'static> LogStore<D> {
             scopes: HashMap::new(),
             staged_controls: Vec::new(),
         };
-        // Manifest scopes seed epochs/keys; the scan is authoritative for
-        // durable/appended/index and re-applies control extents (§5.7).
+        // Manifest scopes seed the FULL record — the manifest was written
+        // from durable state, so its durable/appended/index are the truth
+        // the scan extends (never lowers): a manifest whose scan position
+        // is already at the end has nothing to replay, and its numbers
+        // must survive the open.
         for rec in &m.scopes {
             inner.scopes.insert(
                 rec.scope,
                 ScopeState {
                     epoch: rec.epoch,
                     key_id: rec.key_id,
+                    durable: rec.durable,
+                    appended: rec.durable,
+                    runs: rec.runs.clone(),
+                    cache_from: rec.durable,
+                    holders: rec.holders.iter().map(|(h, l)| (*h, *l)).collect(),
                     ..ScopeState::default()
                 },
             );
@@ -743,14 +751,11 @@ async fn scan_stream<H: BlockHandle + ?Sized>(
             st.pos.next_segment_seq = seq + 1;
         }
     }
-    // Manifest-only scopes the scan never saw start empty: the scan is
-    // authoritative for durable/appended/index (§5.7).
+    // The scan is authoritative for anything it replayed; manifest state
+    // stands for everything else (a manifest whose scan position is at
+    // the end has nothing to replay — its durable LSN is the truth).
     for s in inner.scopes.values_mut() {
-        if s.runs.is_empty() {
-            s.durable = Lsn(0);
-            s.appended = Lsn(0);
-        }
-        s.appended = s.durable;
+        s.appended = s.appended.max(s.durable);
         s.cache.clear();
         s.cache_from = s.durable;
     }
