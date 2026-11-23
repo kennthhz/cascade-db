@@ -248,6 +248,8 @@ fn cleanup(case: &Case) {
 /// what the restart serves. Every case also re-asserts the baseline row.
 fn crash_case(phases_passed: &[&str], stop_at: &'static str, inflight_survives: bool) {
     let _serial = serial();
+    std::env::set_var("CASCADE_MANIFEST_DEBUG", "1");
+    let _ = std::fs::remove_file("/tmp/storeboot-debug.log");
     let case = fresh_case();
 
     let mut child = spawn_server(&case, true);
@@ -262,6 +264,20 @@ fn crash_case(phases_passed: &[&str], stop_at: &'static str, inflight_survives: 
     // is post-replay (FR-7): whatever it sees *is* the recovery verdict.
     let mut child = spawn_server(&case, false);
     wait_ready(&case);
+    eprintln!("PROBE restart stderr: {}", {
+        // Peek non-blockingly: stderr is piped; read what is buffered via
+        // the OS — a real read would block at EOF on a live child, so use
+        // /proc/<pid>/fd-inspection-free approach: spawn's stderr stays
+        // piped; read_to_string happens later. Here we only dump the store
+        // dir listing for diagnosis.
+        let _ = &child;
+        format!("{:?}", std::fs::read_dir(case.wal_dir.join("store"))
+            .map(|rd| rd.filter_map(|e| e.ok())
+                .map(|e| format!("{} ({}B)", e.file_name().to_string_lossy(),
+                    e.metadata().map(|m| m.len()).unwrap_or(0)))
+                .collect::<Vec<_>>())
+            .unwrap_or_default())
+    });
     let mut expected = vec![(1, "committed-1".to_owned())];
     if inflight_survives {
         expected.push((99, "inflight".to_owned()));
@@ -272,14 +288,15 @@ fn crash_case(phases_passed: &[&str], stop_at: &'static str, inflight_survives: 
         "crash at {stop_at}: replay verdict"
     );
 
-    // A kill -9 leaves no clean marker: the restart must announce itself
-    // as crash recovery. Kill BEFORE reading stderr — read_to_string ends
+    // M6 (storage §9): no clean marker — the log store handles its own
+    // tail at open (§5.7), and the replay of the durable log is the
+    // restart contract. Kill BEFORE reading stderr — read_to_string ends
     // only at the child's EOF; on a live child it blocks forever.
     kill9(&mut child);
     let stderr = crash_recover_stderr(&mut child);
     assert!(
-        stderr.contains("crash recovery"),
-        "a kill -9 boot must report unclean: stderr was {stderr:?}"
+        stderr.contains("recovered: replaying from byte"),
+        "a restart must announce its replay: stderr was {stderr:?}"
     );
     cleanup(&case);
 }
@@ -346,10 +363,10 @@ fn crash_after_ack_preserves_and_continues() {
     cleanup(&case);
 }
 
-/// Graceful shutdown: SIGTERM → exit 0 with the clean marker on disk →
-/// restart serves the rows and does *not* report crash recovery.
+/// Graceful shutdown: SIGTERM → exit 0 → restart serves every served row
+/// (M6: no marker — the log store owns the tail; replay is the contract).
 #[test]
-fn sigterm_writes_clean_marker_and_restart_is_clean() {
+fn sigterm_exits_clean_and_restart_serves_everything() {
     let _serial = serial();
     let case = fresh_case();
 
@@ -366,20 +383,12 @@ fn sigterm_writes_clean_marker_and_restart_is_clean() {
     }
     let status = child.wait().expect("reaps");
     assert!(status.success(), "SIGTERM exits 0");
-    let marker = case
-        .wal_dir
-        .join(format!("db_{}.clean", cascade_runtime::tenant::dev_context().db.0));
-    assert!(marker.exists(), "graceful shutdown stamps the clean marker");
 
     let mut child = spawn_server(&case, false);
     wait_ready(&case);
     assert_eq!(table_rows(&case), vec![(7, "graceful".to_owned())]);
-    // Kill first (see crash_case): the stderr read ends at the child's EOF.
-    kill9(&mut child);
-    let stderr = crash_recover_stderr(&mut child);
-    assert!(
-        !stderr.contains("crash recovery"),
-        "a clean restart must not report crash recovery: stderr was {stderr:?}"
-    );
+    // Reap the server so the test leaves no zombie behind.
+    let _ = child.kill();
+    let _ = child.wait();
     cleanup(&case);
 }

@@ -8,7 +8,6 @@ use std::{
         Arc, Mutex,
     },
     task::{Poll, Waker},
-    time::Duration,
 };
 
 use cascade_storage_api::{AppendMeta, LogSink, OpCtx, StoreError, TenantContext};
@@ -16,16 +15,7 @@ use cascade_telemetry::Span;
 use cascade_types::{Epoch, Lsn, ScopeId};
 use cascade_wal_format::FLAG_GROUP_END;
 
-use crate::{format, io::WalHandle, WalError, WalRecord};
-
-/// How long a flush leader holds the window open when its own commit is the
-/// frontier (`filled == up_to`) — the group-commit analog of PostgreSQL's
-/// `commit_delay`. Sessions landing within the window ride one `fdatasync`
-/// instead of each paying a solo barrier; when other records are already
-/// filled, the leader skips the wait and drains immediately. Must stay an
-/// order of magnitude below the fdatasync floor (~4 ms on the M1 bench
-/// disk); revisit against the bare-metal gate before changing.
-const COMMIT_DELAY: Duration = Duration::from_micros(300);
+use crate::{format, WalError, WalRecord};
 
 /// Per-database WAL writer (§8.2): `Arc`-shared by every reactor appending
 /// to this DB. Holds *only* shared memory — atomics and the staging map of
@@ -33,11 +23,10 @@ const COMMIT_DELAY: Duration = Duration::from_micros(300);
 /// flush leader borrows the caller's [`WalHandle`], on the caller's own
 /// ring.
 pub struct WalWriter {
-    /// The durability sink (M5, storage §9): when set, the flush leader
-    /// sends its staged batch with [`LogSink::append`] and waits with
-    /// [`LogSink::wait_durable`] instead of writing a file through a
-    /// [`WalHandle`]. `None` is the pre-M5 file mode — boot keeps it until
-    /// M6 swaps it to the local log store.
+    /// The durability sink (M5, storage §9): the flush leader sends its
+    /// staged batch with [`LogSink::append`] and waits with
+    /// [`LogSink::wait_durable`] — the local log store, wired at boot
+    /// (M6). `None` only in the watermark-only test constructor.
     sink: Option<Arc<dyn LogSink>>,
     /// The scope this writer owns, in sink mode.
     scope: ScopeId,
@@ -79,34 +68,10 @@ pub struct WalWriter {
     wake: Mutex<Vec<Waker>>,
 }
 
-impl Default for WalWriter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WalWriter {
-    pub fn new() -> Self {
-        Self::new_in_epoch(Lsn(0), 0)
-    }
-
-    /// A writer whose watermarks start at `start` instead of 0 — the
-    /// post-recovery resume constructor (T3.3). After replaying a log to
-    /// byte offset `start`, a fresh `WalWriter::new()` would hand out LSNs
-    /// from 0 and the first flush would overwrite replayed records;
-    /// `new_at(replay_end)` continues the same byte stream. Assumes the
-    /// log was already truncated to `start` (torn tail dropped) — the
-    /// resume point is a record boundary, and everything before it is
-    /// durable history this writer never re-mentions.
-    pub fn new_at(start: Lsn) -> Self {
-        Self::new_in_epoch(start, 0)
-    }
-
-    /// A writer in scope-ownership `epoch` (§4 fencing, WP1 F3): every
-    /// record it stamps carries that epoch, so a reader can refuse records
-    /// from a superseded owner once the multi-owner era lands. Epoch 0 is
-    /// the single-owner default; a fenced restart takes a *new* epoch, it
-    /// never mutates a live writer's.
+    /// A watermark-only writer for unit tests of the reservation/fill
+    /// protocol (no sink attached; `flush_wal_sink` refuses). Production
+    /// writers come from [`WalWriter::open_with_sink`].
     pub fn new_in_epoch(start: Lsn, epoch: u64) -> Self {
         WalWriter {
             sink: None,
@@ -242,9 +207,8 @@ impl WalWriter {
     /// immediately.
     pub async fn flush_wal_sink(&self, up_to: Lsn) -> Result<Lsn, WalError> {
         let Some(sink) = self.sink.as_ref() else {
-            // File mode: delegate to the file path via the shared engine.
             return Err(WalError::Sink(StoreError::Unsupported(
-                "flush_wal_sink on a file-mode writer",
+                "flush_wal_sink on a watermark-only test writer",
             )));
         };
         let ctx = OpCtx::new(self.tenant, &self.span);
@@ -290,93 +254,6 @@ impl WalWriter {
                     }
                 };
                 if !progressed {
-                    self.wait_durable(up_to).await?;
-                }
-            } else {
-                self.wait_durable(up_to).await?;
-            }
-        }
-    }
-
-    /// §8.2 `flush_wal`: make everything up to `up_to` durable (FR-26),
-    /// bounded always by the filled watermark (FR-25): bytes that are not
-    /// completely written are never fsynced, and this call does not return
-    /// until `durable >= up_to` — it waits rather than report a durability
-    /// that has not happened. Elects one leader by CAS; the leader writes
-    /// and `fdatasync`s through `io` (the caller's per-reactor handle, own
-    /// ring) and publishes the durable LSN; losers wait for it.
-    pub async fn flush_wal(&self, io: &WalHandle, up_to: Lsn) -> Result<Lsn, WalError> {
-        if self.sink.is_some() {
-            // M5: a sink-mode writer ignores the borrowed file handle —
-            // durability goes through the sink (M6 removes this shim with
-            // the file path).
-            return self.flush_wal_sink(up_to).await;
-        }
-        loop {
-            if self.durable() >= up_to {
-                return Ok(self.durable());
-            }
-            if self
-                .leader
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // Leader: drain the contiguous prefix the watermarks allow.
-                // The guard releases leadership on every exit path — an
-                // abandoned (dropped) leader future cannot wedge the log.
-                let progressed = {
-                    let _leader = LeaderGuard(self);
-                    // Group-commit window ([`COMMIT_DELAY`]): when our own
-                    // commit is the frontier, give concurrent sessions a
-                    // moment to land in this barrier. Without it the leader
-                    // syncs a solo batch and the next leader syncs the next
-                    // batch solo — one fdatasync per commit at any
-                    // concurrency (measured: throughput pinned at the c1
-                    // level, the M1 "txn collapse").
-                    if self.filled().0 <= up_to.0 {
-                        glommio::timer::sleep(COMMIT_DELAY).await;
-                    }
-                    let start = self.durable().0;
-                    // Drain the *whole* contiguous prefix, never just up to
-                    // this caller's `up_to`. `filled` is a record boundary by
-                    // construction (FR-25), so flushing past our own commit
-                    // is always safe — and one barrier covering every filled
-                    // session is the entire point of group commit. Capping at
-                    // `up_to` (the M1 shape) defeated that: each leader
-                    // synced only its own bytes even when other sessions'
-                    // records were already filled and waiting.
-                    let target = self.filled().0;
-                    if target > start {
-                        let batch = self.take_batch(start, target)?;
-                        // From here to `durable.store` the batch bytes live
-                        // only in `staged` — the leader future can be
-                        // abandoned (drop/unwind) at any await, and a batch
-                        // gone from `pending` but never written would wedge
-                        // the log forever (the next leader finds a staging
-                        // gap behind the filled watermark). The guard
-                        // re-stages the bytes unless durability was
-                        // published; a re-written batch is identical bytes
-                        // at identical offsets, so idempotent by
-                        // construction.
-                        let mut staged = StagedBatch {
-                            writer: self,
-                            start,
-                            bytes: batch,
-                            published: false,
-                        };
-                        io.write_batch(start, staged.bytes.clone()).await?;
-                        io.sync_data().await?;
-                        self.durable.store(target, Ordering::Release);
-                        self.syncs.fetch_add(1, Ordering::AcqRel);
-                        staged.published = true;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if !progressed {
-                    // Nothing was flushable (a gap wedges us). Wait like any
-                    // waiter instead of spinning through re-elections.
                     self.wait_durable(up_to).await?;
                 }
             } else {

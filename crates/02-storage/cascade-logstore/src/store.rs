@@ -212,6 +212,7 @@ impl<D: BlockDevice + 'static> LogStore<D> {
             },
         };
         let mut m = manifest::bump_incarnation(manifest_bytes);
+
         if m.streams.iter().all(|s| s.stream != STREAM) {
             m.streams.push(StreamPosition {
                 stream: STREAM,

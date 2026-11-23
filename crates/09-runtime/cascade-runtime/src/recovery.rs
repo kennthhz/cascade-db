@@ -20,16 +20,12 @@
 //! lying log would let a later boot serve rows whose history nobody can
 //! vouch for.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::OnceLock,
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
 
 use cascade_storage_api::log_source::LogSource;
+use cascade_wal_format;
 use cascade_types::{DatabaseId, Lsn, ScopeId};
-use cascade_wal::{WalError, WalReader};
+
 
 /// What boot resumes from. Produced by [`prepare`] before any worker
 /// exists; consumed by boot to seed the writer's watermarks and every
@@ -104,146 +100,6 @@ pub enum RecoveryError {
     Io(#[from] std::io::Error),
 }
 
-/// Walks the DB's log and produces the resume plan. Synchronous (it runs
-/// on the boot thread through a throwaway executor) and single-shot: by
-/// the time any worker opens a handle, the log is final — torn tail
-/// already truncated, no concurrent appends.
-///
-/// The walk: `BeginTxn` opens a buffer, `Insert` appends its row image,
-/// `CommitTxn` applies the buffer in commit order, `AbortTxn` discards it.
-/// An uncommitted buffer at end-of-log (crash mid-transaction) is dropped
-/// — exactly the FR-27 contract: nothing unacked survives. A torn tail
-/// ends the walk and is truncated; corruption refuses the boot.
-pub fn prepare(wal_dir: &std::path::Path, db: DatabaseId) -> Result<RecoveryPlan, RecoveryError> {
-    // No log file: first boot (or a wiped data dir). Nothing to walk — and
-    // no shutdown ever happened, so this is neither clean nor unclean.
-    if cascade_wal::log_len(wal_dir, db)? == 0 {
-        let clean_lsn = cascade_wal::read_clean_marker(wal_dir, db)?;
-        return Ok(RecoveryPlan {
-            clean_lsn,
-            ..RecoveryPlan::fresh()
-        });
-    }
-
-    let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
-        .name("cascade-recovery")
-        .make()
-        .map_err(|e| RecoveryError::Io(std::io::Error::other(e.to_string())))?;
-    let plan = ex.run(async {
-        let reader = cascade_wal::DebugWalReader::open(wal_dir, db)
-            .await
-            .map_err(|e| wal_err(e, Lsn(0)))?;
-
-        let mut open: HashMap<u64, Vec<(i32, String)>> = HashMap::new();
-        let mut seed_rows: Vec<(i32, String)> = Vec::new();
-        let mut cursor = Lsn(0);
-        let mut torn_tail = None;
-        loop {
-            match reader.read_record(cursor).await {
-                Ok(Some(entry)) => {
-                    match entry.record {
-                        cascade_wal::WalRecord::BeginTxn { xid } => {
-                            open.entry(xid).or_default();
-                        }
-                        cascade_wal::WalRecord::LegacyInsert { xid, id, val, .. } => {
-                            open.entry(xid).or_default().push((id, val));
-                        }
-                        // The runtime's row image since T1.3: the row rides
-                        // in the cell's payload (session's debug row image);
-                        // the version words stay opaque to this walk —
-                        // buffering is keyed on the header xid, exactly as
-                        // it is for the legacy shape.
-                        cascade_wal::WalRecord::HeapInsert { xid, cell, .. } => {
-                            match crate::session::parse_heap_insert_row(&cell)
-                            {
-                                Some(row) => open.entry(xid).or_default().push(row),
-                                // A CRC-valid record whose cell won't parse
-                                // is a buggy encoder — refuse over it, never
-                                // serve a row nobody can vouch for.
-                                None => return Err(RecoveryError::Corrupt { lsn: cursor }),
-                            }
-                        }
-                        // Commit order is replay order: the row vector is
-                        // exactly what the acking boot served from its
-                        // table.
-                        cascade_wal::WalRecord::CommitTxn { xid, .. } => {
-                            if let Some(rows) = open.remove(&xid) {
-                                seed_rows.extend(rows);
-                            }
-                        }
-                        cascade_wal::WalRecord::AbortTxn { xid } => {
-                            open.remove(&xid);
-                        }
-                        // Reserved families (§6/§7/§17): no replay effect
-                        // in the debug slice — they carry no row data.
-                        cascade_wal::WalRecord::ClosedTsHeartbeat { .. }
-                        | cascade_wal::WalRecord::HlcHighWater { .. }
-                        | cascade_wal::WalRecord::BulkLoad
-                        | cascade_wal::WalRecord::UnloggedMarker => {}
-                    }
-                    cursor = entry.next;
-                }
-                // End-of-log: the walk boundary is the resume point.
-                Ok(None) => break,
-                // The normal crash artifact: stop here; the caller
-                // truncates the tail below.
-                Err(WalError::TornTail(lsn)) => {
-                    torn_tail = Some(lsn);
-                    break;
-                }
-                Err(e) => return Err(wal_err(e, cursor)),
-            }
-        }
-
-        if let Some(lsn) = torn_tail {
-            cascade_wal::truncate_log(wal_dir, db, lsn.0)?;
-        }
-
-        let clean_lsn = cascade_wal::read_clean_marker(wal_dir, db)?;
-        // Clean means: a marker exists AND the log ends exactly at it. Any
-        // byte past the marker was written after the graceful shutdown's
-        // last sync — a crash, not a clean stop.
-        let unclean = !matches!(clean_lsn, Some(l) if l.0 == cursor.0);
-        Ok(RecoveryPlan {
-            resume_offset: cursor.0,
-            seed_rows,
-            clean_lsn,
-            unclean,
-            torn_tail,
-        })
-    })?;
-    Ok(plan)
-}
-
-/// Maps a reader error to the recovery error it refuses boot with. The
-/// `at` LSN only surfaces for errors that do not carry one of their own.
-#[allow(dead_code)] // legacy file-path reader: dies with the M6 boot swap
-fn wal_err(e: WalError, at: Lsn) -> RecoveryError {
-    match e {
-        WalError::Corruption(lsn) => RecoveryError::Corrupt { lsn },
-        // Named refusals stay named through the boot boundary — a
-        // transplant and an unknown producer's record are integrity
-        // failures recovery must refuse over, but their causes are not
-        // CRC failures and must not read as one.
-        WalError::LsnMismatch { at, declared } => RecoveryError::LsnMismatch { at, declared },
-        WalError::UnknownRecordType { at, type_byte } => RecoveryError::UnknownRecordType {
-            lsn: at,
-            type_byte,
-        },
-        WalError::UnknownRecordVersion(v) => RecoveryError::UnknownVersion { version: v },
-        WalError::Io(io) => RecoveryError::Io(io),
-        // M5: a sink-backed writer's error surfaces on the flush path,
-        // never on the reader this function walks — but the match must
-        // exist. Report at the cursor, refusing beats guessing.
-        WalError::Sink(e) => RecoveryError::Io(std::io::Error::other(
-            format!("wal sink refused: {e}"),
-        )),
-        // The walk handles torn tails itself; this arm is unreachable but
-        // must exist — report it at the cursor, refusing beats guessing.
-        WalError::TornTail(_) => RecoveryError::Corrupt { lsn: at },
-    }
-}
-
 /// M6 (storage §9): the replay walk over a [`LogSource`] — the log store
 /// serves only durable, gap-free records and has already dropped its torn
 /// tail at open, so this walk has no truncation, no clean marker and no
@@ -304,8 +160,8 @@ pub async fn prepare_from_source<S: LogSource + ?Sized>(
     })
 }
 
-/// One record's replay effect — the legacy walk's match, extracted so the
-/// LogSource walk and (until its removal) the file walk share it.
+/// One record's replay effect — the legacy walk's match, kept verbatim so
+/// the LogSource walk's law stays the law the legacy tests pinned.
 fn replay_record(
     record: &cascade_wal::WalRecord,
     cursor: Lsn,
@@ -319,20 +175,12 @@ fn replay_record(
         cascade_wal::WalRecord::LegacyInsert { xid, id, val, .. } => {
             open.entry(*xid).or_default().push((*id, val.clone()));
         }
-        // The runtime's row image since T1.3: the row rides in the cell's
-        // payload; the version words stay opaque to this walk — buffering
-        // is keyed on the header xid.
         cascade_wal::WalRecord::HeapInsert { xid, cell, .. } => {
             match crate::session::parse_heap_insert_row(cell) {
                 Some(row) => open.entry(*xid).or_default().push(row),
-                // A CRC-valid record whose cell won't parse is a buggy
-                // encoder — refuse over it, never serve a row nobody can
-                // vouch for.
                 None => return Err(RecoveryError::Corrupt { lsn: cursor }),
             }
         }
-        // Commit order is replay order: the row vector is exactly what
-        // the acking boot served from its table.
         cascade_wal::WalRecord::CommitTxn { xid, .. } => {
             if let Some(rows) = open.remove(xid) {
                 seed_rows.extend(rows);
@@ -341,8 +189,6 @@ fn replay_record(
         cascade_wal::WalRecord::AbortTxn { xid } => {
             open.remove(xid);
         }
-        // Reserved families (§6/§7/§17): no replay effect in the debug
-        // slice — they carry no row data.
         cascade_wal::WalRecord::ClosedTsHeartbeat { .. }
         | cascade_wal::WalRecord::HlcHighWater { .. }
         | cascade_wal::WalRecord::BulkLoad
@@ -350,6 +196,7 @@ fn replay_record(
     }
     Ok(())
 }
+
 
 // ---- Crash barrier (the T3.3 harness's crash points) ----
 

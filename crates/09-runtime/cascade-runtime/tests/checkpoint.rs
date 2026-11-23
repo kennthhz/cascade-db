@@ -40,7 +40,7 @@ use cascade_runtime::{
 };
 use cascade_storage::{StorageConfig, StorageManager};
 use cascade_types::{DatabaseId, Lsn, PageId, SegmentId};
-use cascade_wal::{WalHandle, WalRecord, WalWriter};
+use cascade_wal::WalRecord;
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -86,12 +86,38 @@ fn reactor_named(name: &str) -> glommio::LocalExecutor {
 /// | 2    | p3 re-stamped UNDER its pin   | 1 flushed while pinned (T6.2) | advances to l3 |
 /// | 3    | nothing                       | no-op                         | stays l3 |
 /// | 4    | p4@l4, durable < l4           | parks on the gate (T3.2 rerun) until the WAL flush publishes | l4 |
+/// M6: durability rides the sink — a MemLogStore-backed writer for tests
+/// that need real flushes without a filesystem WAL.
+fn sink_writer(
+) -> (std::sync::Arc<cascade_storage_api::fake::MemLogStore>, std::sync::Arc<cascade_wal::WalWriter>) {
+    use cascade_storage_api::fake::{test_ctx as sink_ctx, MemLogStore};
+    use cascade_storage_api::LogScopes as _;
+    futures_lite::future::block_on(async {
+        let store = std::sync::Arc::new(MemLogStore::new());
+        let span = cascade_telemetry::Span::noop();
+        let ctx = sink_ctx(&span, 0);
+        let _ = store
+            .create_scope(&ctx, cascade_types::ScopeId(0), cascade_types::Epoch::FIRST,
+                          cascade_storage_api::KeyRef { key_id: 1 })
+            .await;
+        let writer = cascade_wal::WalWriter::open_with_sink(
+            store.clone(),
+            &ctx,
+            cascade_types::ScopeId(0),
+            cascade_types::Epoch::FIRST,
+        )
+        .await
+        .expect("writer opens");
+        (store, std::sync::Arc::new(writer))
+    })
+}
+
 #[test]
 fn flush_pass_flushes_gated_pages_and_advances_the_frontier() {
     let dir = temp_dir("engine");
     let cleanup_dir = dir.clone();
     let db = DatabaseId(7);
-    let writer = Arc::new(WalWriter::new());
+    let (_store, writer) = sink_writer();
     let trunc = TruncatableLsn::new();
 
     let ex = reactor_named("checkpoint-engine-test");
@@ -128,10 +154,7 @@ fn flush_pass_flushes_gated_pages_and_advances_the_frontier() {
         let r3 = writer.append_wal(&WalRecord::BeginTxn { xid: 3 });
         let l3 = r3.end();
         let _ = r3.fill();
-        let handle = WalHandle::open(&dir.join("wal"), db)
-            .await
-            .expect("wal handle opens");
-        writer.flush_wal(&handle, l3).await.expect("flush to l3");
+        writer.flush_wal_sink(l3).await.expect("flush to l3");
 
         // Three stamped dirty pages.
         for (page_no, lsn) in [(1u32, l1), (2, l2), (3, l3)] {
@@ -221,7 +244,7 @@ fn flush_pass_flushes_gated_pages_and_advances_the_frontier() {
         assert!(!done.get(), "undurable stamp must park the pass");
         assert_eq!(bpm.is_dirty(&page(db, 4)), Some(true), "p4 stays dirty");
         assert_eq!(trunc.get(), l3, "no advance while parked");
-        writer.flush_wal(&handle, l4).await.expect("flush to l4");
+        writer.flush_wal_sink(l4).await.expect("flush to l4");
         passer.await;
         assert!(done.get(), "the pass resolved once durability published");
         assert_eq!(bpm.is_dirty(&page(db, 4)), Some(false), "p4 written back");
@@ -251,7 +274,7 @@ fn fanout_reaches_the_worker_and_the_housekeeper_touches_no_storage_io() {
     let (ready_tx, ready_rx) = mpsc::channel::<u64>();
     let (done_tx, done_rx) = mpsc::channel::<(u64, usize)>();
     let (ctrl_tx, ctrl_rx) = glommio::channels::shared_channel::new_bounded::<ControlMsg>(8);
-    let writer = Arc::new(WalWriter::new());
+    let (_store, writer) = sink_writer();
     let worker_writer = Arc::clone(&writer);
     let trunc = Arc::new(TruncatableLsn::new());
     let worker_dir = dir.clone();
@@ -364,12 +387,11 @@ fn fanout_reaches_the_worker_and_the_housekeeper_touches_no_storage_io() {
     // The housekeeper publishes durability (this DOES write — after the
     // snapshot, on its own ring and its own WAL handle, the way a
     // boot/shutdown path would). The parked pass resumes on the worker.
-    let wal_log_dir = dir.join("wal");
-    reactor_named("checkpoint-hk-flush").run(async move {
-        let h = WalHandle::open(&wal_log_dir, db)
-            .await
-            .expect("hk wal handle opens");
-        writer.flush_wal(&h, Lsn(max_stamp)).await.expect("hk flush");
+    // M6: the flush rides the sink (no per-ring handle anymore) — a
+    // short-lived reactor hosts the device-less store's inline future,
+    // the way the old handle hosted its own ring flush.
+    reactor_named("checkpoint-hk-flush").run(async {
+        writer.flush_wal_sink(Lsn(max_stamp)).await.expect("hk flush");
     });
 
     // The three passes report.

@@ -197,3 +197,96 @@ fn recovery_refuses_a_buggy_encoders_unparseable_cell() {
     let plan = block_on(recovery::prepare_from_source(&*store, SCOPE, store.durable_lsn(SCOPE).expect("durable")));
     assert!(matches!(plan, Err(RecoveryError::Corrupt { .. })));
 }
+
+/// Migrated from the legacy matrix (M6): a log written before T1.3
+/// carries LEGACY_INSERT (type 4) — F3 retains its decode so old logs
+/// keep replaying alongside HEAP_INSERT ones, through the LogSource walk.
+#[test]
+fn legacy_insert_replays_through_the_log_source() {
+    let store = store();
+    let ctx = ctx();
+    block_on(store.create_scope(&ctx, SCOPE, Epoch(1), KeyRef { key_id: 1 })).expect("creates");
+    block_on(store.open_writer(&ctx, SCOPE, Epoch(1))).expect("opens");
+    let ins = cascade_wal_format::encode(
+        &WalRecord::LegacyInsert {
+            xid: 42,
+            table: SegmentId(1),
+            id: 3,
+            val: "legacy row".to_string(),
+        },
+        Lsn(0),
+        1,
+    );
+    let com = cascade_wal_format::encode_with_flags(
+        &WalRecord::CommitTxn {
+            xid: 42,
+            commit_ts: Hlc(1),
+        },
+        Lsn(ins.len() as u64),
+        1,
+        FLAG_GROUP_END,
+    );
+    let mut bytes = ins;
+    bytes.extend(com);
+    block_on(store.append(&ctx, SCOPE, Epoch(1), Lsn(0), &bytes, meta())).expect("appends");
+    block_on(store.wait_durable(&ctx, SCOPE, Lsn(bytes.len() as u64))).expect("durables");
+
+    let plan = block_on(recovery::prepare_from_source(
+        &*store,
+        SCOPE,
+        store.durable_lsn(SCOPE).expect("durable"),
+    ))
+    .expect("prepares");
+    assert_eq!(plan.seed_rows, vec![(3, "legacy row".to_string())]);
+}
+
+/// Migrated from the legacy matrix: a HEAP_INSERT whose page cell is
+/// shape-valid but whose row image is not UTF-8 refuses as Corrupt — the
+/// replay never coerces to U+FFFD and seeds a row nobody can vouch for.
+#[test]
+fn a_non_utf8_row_image_refuses_as_corrupt() {
+    let store = store();
+    let ctx = ctx();
+    block_on(store.create_scope(&ctx, SCOPE, Epoch(1), KeyRef { key_id: 1 })).expect("creates");
+    block_on(store.open_writer(&ctx, SCOPE, Epoch(1))).expect("opens");
+    // Shape-valid debug row image: [id i32][len u16][3 bytes of 0xFF] —
+    // the length matches, the bytes are not UTF-8.
+    let mut image = Vec::new();
+    image.extend_from_slice(&1i32.to_le_bytes());
+    image.extend_from_slice(&3u16.to_le_bytes());
+    image.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
+    let cell = cascade_page::encode_cell(
+        cascade_types::VersionWord::uncommitted(cascade_types::TxnId(8)),
+        &image,
+    )
+    .expect("cell fits");
+    let ins = cascade_wal_format::encode(
+        &WalRecord::HeapInsert {
+            xid: 8,
+            segment: SegmentId(1),
+            cell,
+        },
+        Lsn(0),
+        1,
+    );
+    let com = cascade_wal_format::encode_with_flags(
+        &WalRecord::CommitTxn {
+            xid: 8,
+            commit_ts: Hlc(1),
+        },
+        Lsn(ins.len() as u64),
+        1,
+        FLAG_GROUP_END,
+    );
+    let mut bytes = ins;
+    bytes.extend(com);
+    block_on(store.append(&ctx, SCOPE, Epoch(1), Lsn(0), &bytes, meta())).expect("appends");
+    block_on(store.wait_durable(&ctx, SCOPE, Lsn(bytes.len() as u64))).expect("durables");
+
+    let plan = block_on(recovery::prepare_from_source(
+        &*store,
+        SCOPE,
+        store.durable_lsn(SCOPE).expect("durable"),
+    ));
+    assert!(matches!(plan, Err(RecoveryError::Corrupt { .. })));
+}

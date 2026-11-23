@@ -33,7 +33,7 @@ use cascade_runtime::{
 };
 use cascade_storage::{StorageConfig, StorageManager};
 use cascade_types::{DatabaseId, Lsn, PageId, SegmentId};
-use cascade_wal::{WalHandle, WalRecord, WalWriter};
+use cascade_wal::WalRecord;
 
 static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -67,6 +67,32 @@ fn page(db: DatabaseId, page_no: u32) -> PageId {
 /// 0 — the log IS the durable state), and the log file it must protect
 /// is byte-for-byte identical across a full second of ticks. Every
 /// committed insert is still recoverable afterwards.
+/// M6: durability rides the sink — a MemLogStore-backed writer for tests
+/// that need real flushes without a filesystem WAL.
+fn sink_writer(
+) -> (std::sync::Arc<cascade_storage_api::fake::MemLogStore>, std::sync::Arc<cascade_wal::WalWriter>) {
+    use cascade_storage_api::fake::{test_ctx as sink_ctx, MemLogStore};
+    use cascade_storage_api::LogScopes as _;
+    futures_lite::future::block_on(async {
+        let store = std::sync::Arc::new(MemLogStore::new());
+        let span = cascade_telemetry::Span::noop();
+        let ctx = sink_ctx(&span, 0);
+        let _ = store
+            .create_scope(&ctx, cascade_types::ScopeId(0), cascade_types::Epoch::FIRST,
+                          cascade_storage_api::KeyRef { key_id: 1 })
+            .await;
+        let writer = cascade_wal::WalWriter::open_with_sink(
+            store.clone(),
+            &ctx,
+            cascade_types::ScopeId(0),
+            cascade_types::Epoch::FIRST,
+        )
+        .await
+        .expect("writer opens");
+        (store, std::sync::Arc::new(writer))
+    })
+}
+
 #[test]
 fn live_recycler_runs_but_never_touches_the_log() {
     let _serial = serial();
@@ -213,7 +239,7 @@ fn engine_recycle_protects_a_concurrent_checkpoint() {
     let dir = temp_dir("engine");
     let cleanup_dir = dir.clone();
     let db = DatabaseId(7);
-    let writer = Arc::new(WalWriter::new());
+    let (_store, writer) = sink_writer();
     let recycle_passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let reclaimed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let site = RecycleSite::new(Arc::clone(&recycle_passes), Arc::clone(&reclaimed));
@@ -254,10 +280,7 @@ fn engine_recycle_protects_a_concurrent_checkpoint() {
             lsns.push(l);
         }
         let (l1, l2, l3) = (lsns[0], lsns[1], lsns[2]);
-        let handle = WalHandle::open(&dir.join("wal"), db)
-            .await
-            .expect("wal handle opens");
-        writer.flush_wal(&handle, l3).await.expect("flush to l3");
+        writer.flush_wal_sink(l3).await.expect("flush to l3");
 
         // Checkpoint passes (the real T4.2 path) walk the frontier to l3:
         // pass 1 flushes all three (the floor is the min stamp, l1); the
@@ -346,7 +369,7 @@ fn engine_recycle_protects_a_concurrent_checkpoint() {
             assert_eq!(d.reclaimable_bytes, 0);
             assert_eq!(trunc.get(), l3);
         }
-        writer.flush_wal(&handle, l4).await.expect("flush to l4");
+        writer.flush_wal_sink(l4).await.expect("flush to l4");
         passer.await;
         assert!(done.get());
         assert_eq!(

@@ -28,7 +28,6 @@ use std::path::{Path, PathBuf};
 
 use cascade_types::DatabaseId;
 
-use crate::pin;
 use crate::pools::PoolRegistry;
 
 /// Frozen placement hash for a database id: FNV-1a 64 over the
@@ -158,97 +157,6 @@ pub fn resolve_wal_home(
             }
             None => derived,
         },
-    }
-}
-
-/// Constructs the home writer on its home NUMA: a pinned constructor
-/// thread first-touches the writer's state on a core of that node (a
-/// worker core of the NUMA in config order, else any online core the
-/// topology places there). `start` seeds the writer's watermarks — the
-/// replayed log end on a recovery boot (T3.3), 0 otherwise. Returns the
-/// writer and the core it was constructed on (`None` = every fallback
-/// fired and the writer was built on the boot thread — reported, not
-/// hidden).
-pub fn construct_writer_on(
-    cfg: &crate::config::RuntimeConfig,
-    online: &[u32],
-    topology: &dyn crate::topology::TopologyProvider,
-    numa: u32,
-    start: cascade_types::Lsn,
-) -> (std::sync::Arc<cascade_wal::WalWriter>, Option<u32>) {
-    let core = cfg
-        .worker_cores
-        .iter()
-        .find(|w| w.numa == numa)
-        .and_then(|w| w.cores.first().copied())
-        .or_else(|| {
-            online
-                .iter()
-                .copied()
-                .find(|&c| topology.numa_node(c) == Some(numa))
-        });
-    let Some(core) = core else {
-        cascade_telemetry::log(
-            cascade_telemetry::Level::Warn,
-            "wal_home_first_touch_fallback",
-            &[
-                ("numa", numa.to_string().as_str()),
-                ("reason", "no pinnable core on the home NUMA"),
-            ],
-        );
-        return (std::sync::Arc::new(cascade_wal::WalWriter::new_at(start)), None);
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name(format!("cascade-walhome-{numa}"))
-        .spawn(move || {
-            let pinned = pin::pin_current(core)
-                .ok()
-                .and_then(|seen| seen.first().copied());
-            // The writer is built *inside* the pinned thread: its (small)
-            // state first-touches on the home NUMA by construction.
-            let writer = std::sync::Arc::new(cascade_wal::WalWriter::new_at(start));
-            let _ = tx.send((pinned, writer));
-        });
-    match spawned {
-        Ok(_) => match rx.recv() {
-            Ok((Some(core), writer)) => (writer, Some(core)),
-            Ok((None, writer)) => {
-                cascade_telemetry::log(
-                    cascade_telemetry::Level::Warn,
-                    "wal_home_first_touch_fallback",
-                    &[
-                        ("numa", numa.to_string().as_str()),
-                        ("reason", "pin verification failed; placement unverified"),
-                    ],
-                );
-                (writer, None)
-            }
-            Err(_) => {
-                // Constructor thread died before reporting — build on the
-                // boot thread rather than refuse boot over placement.
-                cascade_telemetry::log(
-                    cascade_telemetry::Level::Warn,
-                    "wal_home_first_touch_fallback",
-                    &[
-                        ("numa", numa.to_string().as_str()),
-                        ("reason", "constructor thread died; boot-thread placement"),
-                    ],
-                );
-                (std::sync::Arc::new(cascade_wal::WalWriter::new_at(start)), None)
-            }
-        },
-        Err(e) => {
-            cascade_telemetry::log(
-                cascade_telemetry::Level::Warn,
-                "wal_home_first_touch_fallback",
-                &[
-                    ("numa", numa.to_string().as_str()),
-                    ("reason", e.to_string().as_str()),
-                ],
-            );
-            (std::sync::Arc::new(cascade_wal::WalWriter::new_at(start)), None)
-        }
     }
 }
 

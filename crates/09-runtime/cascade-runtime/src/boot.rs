@@ -593,6 +593,7 @@ impl Runtime {
             }
             _ => None,
         };
+        let mut computed_plan: Option<crate::recovery::RecoveryPlan> = None;
         let (wal, wal_homes) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
@@ -664,10 +665,10 @@ impl Runtime {
                     .map_err(|e| BootError::LogStore(std::io::Error::other(e.to_string())))?;
                 // The plan the store produced drives the rest of boot
                 // (seeding, telemetry) — a caller-supplied plan is only a
-                // pre-M6 override now.
-                let recovery = Some(plan_here);
-                let recovery = recovery.as_ref();
-                if let Some(plan) = recovery {
+                // pre-M6 override now. Hoisted out of the arm below: the
+                // worker tables seed from THIS plan.
+                computed_plan = Some(plan_here);
+                if let Some(plan) = computed_plan.as_ref() {
                     cascade_telemetry::log(
                         cascade_telemetry::Level::Info,
                         "recovery_applied",
@@ -691,6 +692,9 @@ impl Runtime {
             }
             None => (None, WalHomeTable::new()),
         };
+        // M6: with a wal_dir the plan is ALWAYS the store's own (computed
+        // above) — a caller-supplied plan is a pre-M6 override only.
+        let recovery = recovery.or(computed_plan.as_ref());
         // T4.4 (FR-8, §10.2): the serving thread's shutdown state. The
         // draining flag and the per-worker in-flight gauges exist for every
         // boot (sessions carry them as their [`crate::session::SessionEnv`]
