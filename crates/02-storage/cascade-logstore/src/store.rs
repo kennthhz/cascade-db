@@ -387,9 +387,17 @@ impl<D: BlockDevice + 'static> LogStore<D> {
         {
             return Ok(()); // another flush is in flight; it will cover us
         }
-        let r = self.flush_some_inner().await;
-        self.flush_leader.store(false, Ordering::Release);
-        r
+        // Drop-guard release: the flag clears on EVERY exit from this
+        // future — return, error, or panic unwind through the await —
+        // so leadership can never wedge.
+        struct Leader<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Leader<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _leader = Leader(&self.flush_leader);
+        self.flush_some_inner().await
     }
 
     /// Builds and persists one frame from the staged queues (inline flush,
@@ -434,13 +442,15 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                 s.deficit = views[i].deficit;
             }
             if plan.is_empty() && controls.is_empty() {
-                // Bytes are staged but nothing is plannable: a group
-                // exceeds the frame cap (the writer's §5.4 contract) —
-                // fail the oldest stalled scope loudly rather than hang
-                // its waiters forever.
-                return Err(StoreError::Failed {
-                    scope: *indexes.first().expect("staged non-empty"),
-                });
+                if let Some(oldest) = indexes.first() {
+                    // Bytes are staged but nothing is plannable: a group
+                    // exceeds the frame cap (the writer's §5.4 contract) —
+                    // fail the oldest stalled scope loudly rather than hang
+                    // its waiters forever.
+                    return Err(StoreError::Failed { scope: *oldest });
+                }
+                // Nothing staged anywhere: nothing to flush.
+                return Ok(());
             }
             let st = inner.streams.get(&STREAM).expect("stream seeded").clone();
             let mut planned = Vec::new();
@@ -1066,14 +1076,24 @@ impl<D: BlockDevice + 'static> LogStore<D> {
             };
             // Waiting is what triggers a flush (§4.3).
             self.flush_some().await?;
-            let after = {
+            let (after, appended) = {
                 let inner = self.inner.lock().expect("store lock");
-                inner.scopes.get(&scope).map(|s| s.durable).unwrap_or(Lsn(0))
+                (
+                    inner.scopes.get(&scope).map(|s| s.durable).unwrap_or(Lsn(0)),
+                    inner.scopes.get(&scope).map(|s| s.appended).unwrap_or(Lsn(0)),
+                )
             };
             if after >= lsn {
                 return Ok(());
             }
             if after == before {
+                if appended < lsn {
+                    // The wait reaches past everything ever appended: no
+                    // flush can ever cover it — refuse with the frontier
+                    // the caller must append up to (§4.3 promise 2's
+                    // frontier, surfaced to the waiter).
+                    return Err(StoreError::Gap { expected: appended });
+                }
                 // No progress and no failure: the request reaches past
                 // everything staged — park until another task's flush
                 // wakes us (a single-task suite never reaches here).
