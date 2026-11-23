@@ -2,4 +2,6 @@
 //! red tests are written; frame format lands first, then segments,
 //! manifest, flusher, retention, recovery.
 
+pub mod drr;
 pub mod frame;
+pub mod manifest;
