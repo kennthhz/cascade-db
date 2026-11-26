@@ -118,7 +118,7 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - **FR-43** — The frozen FNV-1a placement hash `hash(PageId) mod num_numas` lives in `cascade-bpm` (`home_numa`); the runtime's `pool_for_page` becomes a delegating wrapper over it. (§8.1, §2.5.1, I3)
 - **FR-44** — A full pool evicts in-pool: a pinned-free clean frame first, else one pinned-free dirty page through the WAL gate, else `PoolFull`; WAL-before-data holds on every writeback including eviction; CLOCK-sweep (reference bit) is deferred until measured. (§8.1, I7)
 - **FR-45** — The WAL carries heap mutations as full row images: a `HeapInsert` record holds the segment id plus the cell bytes exactly as the page lays them down; the legacy debug `Insert` type stays decodable, but the runtime stops emitting it. (README §6.3, I8)
-- **FR-46** — The heap access method places rows by sequential fill routed through `home_numa`, stamps `page_lsn` with the commit's end LSN via `write_logged`, scans by page iteration with no visibility logic (committed pages plus the session's own pending rows), and returns `Tid` without persisting it — live layout may differ from replay layout, accepted while Tids never escape to disk. (§4, cascade-heap AI/CONTEXT)
+- **FR-46** — The heap access method places rows by sequential fill routed through `home_numa`, stamps `page_lsn` with the commit's end LSN via `write_logged`, scans by page iteration with no visibility logic (committed pages plus the session's own pending rows), and returns `Tid` without persisting it. Placement follows `cascade-redo`'s sequential-fill rule with the fill cursor advanced in LSN order, so live layout equals replayed layout (decided 2026-11-26; heap design H9 — it replaces the earlier acceptance that the two could differ while Tids never escape to disk). (§4, cascade-heap AI/CONTEXT)
 - **FR-47** — The wire path is behavior-identical through the real engine: same statement set, same error codes, uncommitted rows never visible to another session. (§4, I5)
 - **FR-48** — The checkpointer advances the per-DB truncatable LSN only after a fully drained pass — zero refused pages, post-flush dirty set empty, no in-flight applies — to the minimum resident page LSN; every page writeback is `fdatasync`ed before it reports success. (§9, I7)
 - **FR-49** — Every committing session registers an in-flight-apply slot before its first WAL reservation and clears it only after page apply; the frontier can never outrun an applied commit. (§9)
@@ -457,8 +457,8 @@ untouched. The concurrent-BPM decisions are ADR-0003 (A17 closes there).
 **T6.4 `cascade-heap`: the access method.**
 - Goal: rows on pages through the BPM.
 - FRs: FR-46.
-- Tests: sequential fill across a page boundary; scan completeness and order; append-during-scan makes progress (exclusive-pin retry is not starvation); id filter stays session-side.
-- Code review: no visibility logic sneaking in; `Tid` returned but never persisted; the replay-layout-differs note present.
+- Tests: sequential fill across a page boundary, and route-plus-apply reproducing the leader's pages byte for byte (LSN-ordered fill); scan completeness and order; append-during-scan makes progress (exclusive-pin retry is not starvation); id filter stays session-side.
+- Code review: no visibility logic sneaking in; `Tid` returned but never persisted; the fill cursor advances in LSN order, so live layout equals replayed layout (heap design H9).
 - Test review: is the page-boundary fill exact (64-row page) or approximate?
 
 **T6.5 Runtime wiring + live checkpoint + the frontier rule.**
