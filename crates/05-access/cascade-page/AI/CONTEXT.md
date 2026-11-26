@@ -23,8 +23,11 @@ tail:     cells growing DOWN from PAGE_SIZE
 
 A cell is `[len u16][xmin u64][xmax u64][next u64][payload..]`; `len` counts
 the whole cell (`CELL_FIXED = 26` + payload). A cell fits iff
-`free_offset − len ≥ 32 + 2·slot_count` (the two growth regions must never
-touch). `xmin`/`xmax` are **typed version words** (`cascade_types::VersionWord`,
+`free_offset − len ≥ 32 + 2·(slot_count + 1)` — the two growth regions must never
+touch, *counting the 2-byte slot entry the append itself adds*. A fresh page
+therefore holds at most a 8158-byte cell (8132 bytes of payload). Until
+2026-11-26 the rule omitted that entry and accepted two cell lengths per page
+state that left an image `parse` refuses (see Existing Code). `xmin`/`xmax` are **typed version words** (`cascade_types::VersionWord`,
 WP1 F1 — upstream HLD §12's creator/deleter; top bit = uncommitted tag over a
 63-bit `Xid`, else the packed `Hlc` commit_ts; 0 = EMPTY). `next` is the packed
 chain word (`NextWord`: bits 0..15 slot, 16..47 relation-local `PageNo`,
@@ -85,6 +88,8 @@ bytes), roundtrip readback, exact full-boundary (291 zero-payload cells, 12
 free bytes left, the 292nd append refused and the page stays consistent),
 oversized-cell refusal, the malformed-image matrix (each `PageError` variant
 hand-mangled and refused), wrap-validates-like-parse.
+
+**Fit-rule fix (2026-11-26).** `append_cell`'s space check now counts the slot entry the append writes (`slot_array_end + 2`). Before it, a cell that started at `slot_array_end` or one byte above it had its length prefix overwritten by that entry: `append_cell` returned `Ok` and `PageView::parse` refused the image as malformed (fresh page: 8159- and 8160-byte cells; two lengths per page state in general). Pinned by two tests: the fresh-page boundary (8132 payload accepted and exactly full; 8133 and 8134 refused with the image untouched) and a sweep over every page state the zero-payload fill reaches, crossed with the five cell lengths around the gap — accepted exactly when `cell + 2 ≤ free_bytes`, an accepted append leaves a page that parses, a refused one leaves the image untouched. No valid page changed and no golden moved.
 
 ## Open Design Questions
 

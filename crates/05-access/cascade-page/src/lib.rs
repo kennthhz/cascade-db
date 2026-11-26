@@ -297,8 +297,9 @@ impl<'a> PageView<'a> {
         rd_u64(self.buf, 8)
     }
 
-    /// The gap between the slot array's end and the cell region's start —
-    /// exactly the bytes the next cell may consume.
+    /// The gap between the slot array's end and the cell region's start.
+    /// The next cell may consume this minus 2 bytes: the slot entry its
+    /// own append adds to the array.
     pub fn free_bytes(&self) -> usize {
         rd_u16(self.buf, 6) as usize - (SLOTS_BASE + 2 * self.slot_count())
     }
@@ -378,7 +379,10 @@ impl<'a> PageMut<'a> {
     /// Appends one cell (insertion order = slot order) and returns its slot
     /// index. Cells grow downward from the page tail; the slot array grows
     /// up from [`SLOTS_BASE`]; the append fails with [`PageError::Full`] the
-    /// moment the two regions would touch. `xmin` is the §12 creator word
+    /// moment the two regions would touch, counting the entry this append
+    /// adds to the slot array: a cell may not start inside its own 2-byte
+    /// entry, so a fresh page holds at most `PAGE_SIZE - HEADER_LEN - 2`
+    /// bytes of cell. `xmin` is the §12 creator word
     /// (tagged with the writer's `TxnId`); `xmax`/`next` are written zero —
     /// live, chain ends. `page_lsn` is NOT touched here — the access method
     /// stamps it via [`PageMut::set_page_lsn`] as part of the logged write.
@@ -389,8 +393,11 @@ impl<'a> PageMut<'a> {
         }
         let slot = self.slot_count();
         let slot_array_end = SLOTS_BASE + 2 * slot;
+        // `+ 2` is the slot entry this append is about to write at `slot_array_end`:
+        // without it the new cell can start inside its own entry, and writing
+        // the entry then overwrites the cell's length prefix.
         let new_free = match self.free_offset().checked_sub(cell_len) {
-            Some(f) if f >= slot_array_end => f,
+            Some(f) if f >= slot_array_end + 2 => f,
             _ => return Err(PageError::Full),
         };
         wr_u16(self.buf, new_free, cell_len as u16);
@@ -639,6 +646,92 @@ mod tests {
         ));
         // The refused append left the page consistent.
         assert_eq!(p.view().unwrap().slot_count(), 291);
+    }
+
+    /// The entry an append adds to the slot array is part of the append: a
+    /// cell may not start inside its own 2-byte entry. On a fresh page that
+    /// caps a cell at `PAGE_SIZE - HEADER_LEN - 2` bytes; the next two sizes
+    /// were accepted before the rule counted the entry, and the image they
+    /// left behind did not parse.
+    #[test]
+    fn fresh_page_boundary_counts_the_new_slot_entry() {
+        let max_payload = PAGE_SIZE - HEADER_LEN - 2 - CELL_FIXED; // 8132
+        let mut img = [0u8; PAGE_SIZE];
+        {
+            let mut p = PageMut::init(&mut img);
+            assert_eq!(
+                p.append_cell(VersionWord::uncommitted(TxnId(1)), &vec![b'x'; max_payload])
+                    .unwrap(),
+                0
+            );
+            assert_eq!(p.free_bytes(), 0, "the cell and its entry take the whole tail");
+        }
+        let v = PageView::parse(&img).expect("an exactly full page is a legal page");
+        assert_eq!((v.slot_count(), v.free_bytes()), (1, 0));
+
+        for payload_len in [max_payload + 1, max_payload + 2] {
+            let mut img = [0u8; PAGE_SIZE];
+            PageMut::init(&mut img);
+            let before = img;
+            let outcome = PageMut::wrap(&mut img)
+                .expect("a fresh page wraps")
+                .append_cell(VersionWord::uncommitted(TxnId(1)), &vec![b'x'; payload_len]);
+            assert!(
+                matches!(outcome, Err(PageError::Full)),
+                "payload {payload_len} must be refused, got {outcome:?}"
+            );
+            assert!(img == before, "a refused append leaves the page untouched");
+        }
+    }
+
+    /// Every page state the zero-payload fill reaches (0 through 291 cells),
+    /// crossed with the cell lengths around that state's boundary. The law,
+    /// checked both ways: an append is accepted exactly when the cell plus
+    /// its own slot entry fit in `free_bytes`; an accepted append leaves a
+    /// page that parses, and a refused one leaves the image untouched.
+    #[test]
+    fn append_boundary_holds_in_every_page_state() {
+        let mut states = Vec::new();
+        let mut img = [0u8; PAGE_SIZE];
+        PageMut::init(&mut img);
+        loop {
+            let free = PageView::parse(&img).unwrap().free_bytes();
+            states.push((img, free));
+            let filled = PageMut::wrap(&mut img)
+                .unwrap()
+                .append_cell(VersionWord::uncommitted(TxnId(1)), &[])
+                .is_ok();
+            if !filled {
+                break;
+            }
+        }
+        assert_eq!(states.len(), 292, "0..=291 cells, then the page is full");
+
+        for (img, free) in states {
+            // Cell lengths from 4 bytes below the gap to the gap itself; the
+            // two largest are the ones the old rule accepted.
+            for cell_len in (free.saturating_sub(4)..=free).map(|len| len.max(CELL_FIXED)) {
+                let payload_len = cell_len - CELL_FIXED;
+                let mut img = img;
+                let before = img;
+                let outcome = PageMut::wrap(&mut img)
+                    .unwrap()
+                    .append_cell(VersionWord::uncommitted(TxnId(2)), &vec![b'x'; payload_len]);
+                let accepted = outcome.is_ok();
+                assert_eq!(
+                    accepted,
+                    cell_len + 2 <= free,
+                    "free {free}, cell {cell_len}, outcome {outcome:?}"
+                );
+                if accepted {
+                    let v = PageView::parse(&img)
+                        .expect("an accepted append leaves a page that parses");
+                    assert_eq!(v.free_bytes(), free - cell_len - 2);
+                } else {
+                    assert!(img == before, "a refused append leaves the page untouched");
+                }
+            }
+        }
     }
 
     /// A payload that cannot fit the u16 length field is refused up front.
