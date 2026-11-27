@@ -1,6 +1,6 @@
 # Cascade DB Access Layer: Contracts, Engines and Migration
 
-**Status:** Draft v0.2 for review, 2026-11-26. v0.2 applies the review of v0.1 ([`access-design-review.md`](access-design-review.md), 30 findings): the contract types and the visibility rule are now stated in this document instead of being cited from retired ones, the migration steps are renamed and re-sequenced, and the design errors the review found are corrected (§16 lists them). This document is the single source of truth for the access layer (L5): the table access contract, the table engines, secondary indexes, sequences, temporary tables and maintenance. The detailed engine designs live beside their crates: the [btree design](../cascade-btree/AI/btree-design.md), the [heap design](../cascade-heap/AI/heap-design.md) and the [page design](../cascade-page/AI/storage-page-mutation-design.md). The engine semantics they refine are kept in [`engine-semantics.md`](engine-semantics.md).
+**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-3 review's High and Medium findings ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md); each is marked there with its fix), and for access-api decisions C1, C5, C6 and C10 (accepted by Kenneth; see the [access-api design](../cascade-access-api/AI/access-api-design.md) and the [decision register](decision-register.md)). v0.2 applies the review of v0.1 ([`access-design-review.md`](access-design-review.md), 30 findings): the contract types and the visibility rule are now stated in this document instead of being cited from retired ones, the migration steps are renamed and re-sequenced, and the design errors the review found are corrected (§16 lists them). This document is the single source of truth for the access layer (L5): the table access contract, the table engines, secondary indexes, sequences, temporary tables and maintenance. The detailed engine designs live beside their crates: the [btree design](../cascade-btree/AI/btree-design.md), the [heap design](../cascade-heap/AI/heap-design.md) and the [page design](../cascade-page/AI/storage-page-mutation-design.md). The engine semantics they refine are kept in [`engine-semantics.md`](engine-semantics.md).
 
 **Upstream:** [`architecture-design.md`](../../../docs/architecture-design.md) v0.10.2 — §4.5 (transactions), §4.6 (access), §4.8 (core sets), §1 (design rules). Where the two disagree, the architecture wins unless layer §13.2 says this document proposes a change. **Storage foundations:** [`storage-layer-design.md`](../../02-storage/AI/storage-layer-design.md) v0.5 §12, whose rules bind every engine. **Formats:** in code, not in documents — `cascade-types` (version words), `cascade-page` (page layouts), `cascade-wal-format` (records), `cascade-pgtypes` (keys).
 
@@ -113,8 +113,8 @@ Plain words for the terms the access documents use. The formal definition is whe
 | Version word | 64 bits in every row header and index entry. Zero is empty. The top bit set names an in-flight transaction. Otherwise the value is a commit timestamp | `cascade-types` |
 | Commit timestamp, read timestamp | Times from the scope's hybrid logical clock. A commit is ordered by its commit timestamp; a snapshot reads at its read timestamp | storage §12.3 |
 | Snapshot | A read timestamp plus the reader's own transaction | layer §6.6 |
-| Closed timestamp | The scope's promise that no later commit will carry an earlier timestamp. A read waits for it to pass its read timestamp | runtime module `txnmgr` |
-| Status table | Per scope: transaction id → in progress, committed at a timestamp, or aborted. The only way to resolve a word that names an in-flight transaction | runtime module `txnmgr` |
+| Closed timestamp | The scope's promise that no later commit will carry an earlier timestamp. A snapshot's read timestamp is chosen at or below it (layer §6.7). Not yet in code (register D-2) | layer §6.7 |
+| Status table | Per scope: transaction id → in progress (with its top-level id), committed at a timestamp, or aborted. The only way to resolve a word that names an in-flight transaction. Not yet in code: the runtime's `txnmgr` is only a clock today (register D-2) | `cascade-txn-api` contract; layer §13.1 |
 | Cleanup watermark | The oldest read timestamp any active reader may still use. Versions that died before it can be removed | layer §11.7 |
 | Locator | The executor's handle on a row version: a primary key (IOT) or a Tid (heap). Opaque to the executor | layer §6.5 |
 | Tid | A heap row address: page and slot | layer §6.2 |
@@ -137,6 +137,19 @@ Plain words for the terms the access documents use. The formal definition is whe
 | Out-of-line storage | A value too large for a row, kept as chunks of a hidden relation | heap §8 |
 | Tree key | What a B-tree orders its entries by: the key, or the key followed by the locator | btree §2.3 |
 | Run | The entries of one tree that share a tree key | btree §2.3 |
+| IOT | Index-organized table: the rows live in the leaves of a B-tree ordered by the primary key, so the primary key is not a separate index. The default engine | layer §11.3 |
+| HOT | "Heap-only tuple", PostgreSQL's term. An update is HOT when it changes no indexed column and the new version fits on the same page; it then adds no index entries, and the new version is reachable only through the chain | heap §4.1 |
+| LSN, durable LSN | Log sequence number: a position in the log. The durable LSN is the highest one known to be on stable storage | storage §2 |
+| HLC | Hybrid logical clock: a timestamp that tracks wall-clock time but never goes backwards and orders causally related events | storage §12.3 |
+| Subtransaction id, statement horizon | A transaction id that a statement or savepoint writes under, recorded in the status table with its top-level transaction. The horizon is the next id at a statement's start; own words at or above it are invisible to that statement | layer §6.6 |
+| TOAST, out-of-line value | PostgreSQL's name ("the oversized-attribute storage technique") for storing a large value in chunks outside the row. Here "out-of-line storage" | heap §8 |
+| `OpCtx` | The per-call context the runtime passes to every async storage call: the core, the cancellation token and the deadline | `cascade-runtime` |
+| Verdict | A prune or vacuum decision ("these slots are dead"), logged so that every replica applies the same one rather than deciding again | heap §7 |
+| Stub | A crate that exists in the workspace but whose code is a placeholder from a replaced design | layer §5.2 |
+| Replay boundary | A log position at which a reader of the log may stop and still see whole mini-transactions: always the end of a group | storage §2 |
+| Physiological record | A redo record that names one physical page and describes a logical change within it ("insert this row in slot 7"), rather than the bytes changed | storage §12.4 |
+| SSI | Serializable snapshot isolation, PostgreSQL's serializable level: it tracks read-write dependencies and aborts a transaction that would make a cycle | layer §6.4 |
+| EvalPlanQual | PostgreSQL's re-check of a row that was updated concurrently under read committed. The re-check of layer §6.8 and heap §5.2.1 is its counterpart | layer §6.8 |
 
 ## 4. Summary of Decisions
 
@@ -150,13 +163,16 @@ Each decision carries one status: **Proposed** (the author's proposal, awaiting 
 | A4 | A scope is a shared-memory engine across its write core set. This supersedes the retired WP5 D8 (message-to-owner reads) | §8 | Restates architecture §4.8 |
 | A5 | Engines are built from a `TableDescriptor` and never read the catalog | §6.12 | Restates architecture §4.6 |
 | A6 | Segment and page allocation is a scope-level facility. Ids are never reused | §10 | Proposed |
-| A7 | The key contract stays in `cascade-pgtypes` until `cascade-datum` exists. The dependency is a documented exception | §5.2 | Proposed |
+| A7 | The key contract stays in `cascade-pgtypes` until `cascade-datum` exists. The dependency is a documented exception. Text indexes support the `C` collation only until then | §5.2 | Proposed |
 | A8 | Visibility needs one injected contract, `VisibilitySource`, so engines do not depend on the runtime | §6.6 | Proposed |
 | A9 | `cascade-btree` is the tree mechanism for the IOT and for secondary indexes, and knows nothing about transactions | §11.1 | Restates architecture §4.6 |
 | A10 | The engine builds a mini-transaction's records, and the seam applies each record to the data page it names — the heap, IOT or index page in the buffer pool — through `cascade-redo`. Leader and replay therefore run one code path. A page's LSN is the end of its last record | §9.1, §9.3 | Proposed |
 | A11 | Row locks: on a heap, exclusive locks are recorded in the row header and shared locks in the lock manager; on an IOT, all in the lock manager | §6.10 | Proposed; changes architecture §4.5 (see §13.2) |
 | A12 | An engine that must wait sleeps in an injected wait seam (`WaitSource`) until woken, instead of polling. The wait layer's two aborts — deadlock victim, `lock_timeout` — arrive as errors | §6.5, §6.11 | Proposed |
 | A13 | Callers see an enum (`AnyTable`, three arms: IOT, heap, temporary); the conformance suite is written once over a test-only trait that the engines and the fake implement, and `AnyTable` delegates to it, so the suite covers the whole surface | §6.1, §6.13 | Proposed |
+| A14 | Each writing statement and each savepoint gets a subtransaction id; a snapshot carries the statement horizon, so a statement never sees its own changes, and savepoint rollback marks sub-ids aborted | §6.6 | Proposed (round 3); changes architecture §4.5 |
+| A15 | The unique check reads the latest committed state, not the statement snapshot | §11.4 | Proposed (round 3) |
+| A16 | Each index change is its own mini-transaction, after the row's, in the same statement and transaction | §11.4 | Proposed (round 3) |
 
 The decisions of the retired WP5 design (its D1–D15) are part of the contract in layer §6 and are no longer cited by number. Layer §16 maps each one to where it now lives. One of them is **superseded**: WP5 D8, message-to-owner reads, by A4.
 
@@ -170,7 +186,9 @@ The decisions of the retired WP5 design (its D1–D15) are part of the contract 
 
 | Crate | Status | Contains | Depends on |
 | :--- | :--- | :--- | :--- |
-| `cascade-access-api` | To create | The contract of layer §6: the types, the in-memory fake and the conformance suite | `cascade-types`, `cascade-pgtypes` (A7), `cascade-telemetry` |
+| `cascade-txn-api` | To create (L4) | The transaction seams engines consume: `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule (layer §6.6), `WaitSource` (§6.5), `TxnCtx` and `StmtCtx` (§6.7), and a scripted fake of all of them. Started early, with only what the access contract needs (access-api C1) | `cascade-types` |
+| `cascade-access-api` | To create | The contract of layer §6: the types, the suite's trait, the in-memory fake and the conformance suite | `cascade-types`, `cascade-txn-api`, `cascade-pgtypes` (A7), `cascade-telemetry` |
+| `cascade-access` | To create | The dispatch enums `AnyTable`, `TableScan` and `Maintenance` (layer §6.1). It sits above the engines, because the enums name their types | `cascade-access-api` and every engine crate |
 | `cascade-page` | Landed | The page layer: prologue, kind registry and the heap format (kind 1); the B-tree and free-space-map formats as they land (A3) | `cascade-types` |
 | `cascade-btree` | Stub | The B+tree mechanism: descent, latching, structure changes, operations on byte keys | `cascade-types`, `cascade-page`, the page cache contract |
 | `cascade-heap` | Stub | The heap engine | `cascade-types`, `cascade-page`, the page cache contract, `cascade-access-api`, `cascade-index` once it exists |
@@ -186,7 +204,8 @@ Engines reach pages only through the page cache contract and never through `casc
 
 - **`cascade-page` is in this directory but is an L1 format authority.** The architecture's layer map puts every page layout there. The repository directory is historical: the page design §1 keeps the page format below both the engine and the storage-side consumers of its bytes.
 - **The key contract edge (A7).** `KeyBytes`, `KeyRange` and `IndexEntry::Locator` live in `crates/07-sql/cascade-pgtypes`. Their long-term home is `cascade-datum` (L1), which does not exist yet. Until then `cascade-access-api` depends on `cascade-pgtypes`, an upward edge (05 → 07) that breaks the repository's layering convention. It is a named exception in the layering check and it ends when the key contract moves. No access-layer type may name any other `07-sql` item. `Datum`, `Row`, `Projection` and `ColumnSet` (layer §6.2) move with it.
-- **The visibility seam (A8).** Engines name `Snapshot` and `VisibilitySource`, never the runtime. Both are implemented by the runtime's `txnmgr` today and by `cascade-scope-txn` after the transaction layer is split out, with no engine change.
+- **Key order and collations (round-3 fix V24).** Today's text key encoding (`encode_text`) is byte-wise, which matches PostgreSQL only for the `C` collation. Version 1 indexes on text columns support the `C` collation only, and `CREATE INDEX` on a text column with any other collation is refused with `feature_not_supported` until `cascade-datum` provides collation-aware keys (architecture §4.2). This is a prerequisite of Step 8 for non-`C` collations, and is listed in the decision register.
+- **The visibility seam (A8).** Engines name `Snapshot` and `VisibilitySource`, never the runtime. Both are declared in `cascade-txn-api` (L4), as architecture §4.5 places them (access-api C1, decided 2026-11-27). No implementation exists yet: the runtime's `txnmgr` is only a clock today (decision register D-2). `cascade-scope-txn` will implement them, with no engine change.
 - **The mini-transaction seam.** Engines name one injected type (layer §9.1). Its owner is the page cache, which is the only crate allowed to change a page.
 - **`cascade-mvcc` and `cascade-undo` are pre-pivot stubs.** Their context files describe a design that was replaced. `cascade-heap`'s dependency on them is removed at Step 5. `cascade-undo` returns as a dependency of `cascade-iot` only: the heap has no undo (page §2).
 
@@ -199,10 +218,13 @@ This section is the whole contract. Every type the executor sees is defined here
 ### 6.1 Dispatch — an enum, not `dyn` or generics
 
 ```rust
+// In cascade-access, above the engine crates (access-api C1).
 pub enum AnyTable { Iot(IotTable), Heap(HeapTable), Temp(TempTable) }
 ```
 
-`AnyTable` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in the executor, in this repository, so adding it is a compile-time change and not a contract break.
+`AnyTable` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in this repository, so adding it is a compile-time change and not a contract break.
+
+**Where the enum lives (access-api C1).** Not in `cascade-access-api`: the enum names `IotTable`, `HeapTable` and `TempTable`, and every engine crate depends on the contract crate, so the enum there would be a dependency cycle. It lives in `cascade-access`, a thin crate above all the engines.
 
 **Why there is also a trait (A13).** The rule behind it is one sentence: **write the tests once, and make every engine pass the same tests.** If each engine had its own hand-written tests, bugs would hide in the gaps between them. Running one test suite against four different engines needs a common plug — in Rust, a trait. But the official API must not be a trait, for the reasons above. So there are two doors with different jobs: the **trait is the private plug the test suite uses**, and the **enum is the public front door, whose methods only forward** to the plug. Since the front door only forwards, whatever a user can ask for goes to the thing the tests tested — there is no side door for an untested path to hide in. The trait is never in a production signature, so the rejection of traits above is about the public API and does not change.
 
@@ -361,11 +383,17 @@ pub enum WaitFor {
     /// Resolves when the transaction commits or aborts.
     Txn(TxnId),
     /// Resolves when the last shared locker of the row releases it (layer §6.10).
-    SharedLocks { table: TableHandle, loc: RowLocator },
+    SharedLocks(LockKey),
+    /// Resolves when the engine signals the key: a speculative insertion was aborted and
+    /// its delete word stamped (layer §6.9, round-3 fix V13). Also ends when the holder ends.
+    Key(LockKey),
 }
 /// What one wait ended with.
 pub enum Waited { Resolved, TimedOut }
 
+// Declared in cascade-txn-api (access-api C1). Because L4 cannot name an L5 type, a lock
+// target is an opaque LockKey built from the relation and the locator's or key's bytes
+// (access-api C8). WaitSource also has `signal(key)`, which wakes WaitFor::Key waiters.
 pub trait WaitSource: Send + Sync {
     fn wait<'a>(&'a self, ctx: &'a OpCtx<'_>, waiter: TxnId, what: WaitFor,
                 deadline: Option<Instant>) -> LocalBoxFuture<'a, Waited>;
@@ -387,9 +415,27 @@ pub trait WaitSource: Send + Sync {
 One rule decides every row version and every index entry. Engines and index code call it; nothing else interprets a version word.
 
 ```rust
-pub struct Snapshot { pub read_ts: Hlc, pub own: Option<TxnId> }
+// Declared in cascade-txn-api (access-api C1).
+pub struct Snapshot { pub read_ts: Hlc, pub own: Option<OwnView> }
 
-pub enum TxnStatus { InProgress, Committed { ts: Hlc }, Aborted }
+/// The reader's own transaction, as one statement sees it (round-3 fixes V1, V2).
+pub struct OwnView {
+    /// The top-level transaction. Every word this transaction writes names one of its
+    /// subtransaction ids, whose top is this id.
+    pub top: TxnId,
+    /// The statement horizon: the next transaction id at the moment the statement began.
+    /// Own words with an id at or above it were written by this statement, or by a later
+    /// one, and are not visible to it.
+    pub horizon: TxnId,
+}
+
+pub enum TxnStatus {
+    /// `top` is the top-level transaction the id belongs to (itself, for a top-level id).
+    InProgress { top: TxnId },
+    Committed { ts: Hlc },
+    /// A rolled-back transaction, or a subtransaction rolled back to a savepoint.
+    Aborted,
+}
 
 /// Resolution of a word that names an in-flight transaction. Injected (A8).
 pub trait VisibilitySource {
@@ -414,12 +460,21 @@ impl Snapshot {
 }
 ```
 
-**The rule, as a truth table.** A version is *born* for a snapshot if its creator is visible at `read_ts`; it is *deleted* if its deleter is.
+**Statements and savepoints (round-3 fixes V1 and V2).** A transaction does not stamp every word with one id. Each statement that writes gets a **subtransaction id** the first time it writes, from the scope's ordinary transaction-id counter, and stamps that id. The status table records each subtransaction's top-level transaction. This one mechanism gives two PostgreSQL behaviours:
+
+- *A statement does not see its own changes.* `UPDATE t SET v = v + 1` must not meet, later in the same scan, the new versions it just wrote, or it would update them again (the "Halloween problem"). PostgreSQL uses a command id in each row for this. Here, ids grow monotonically, so a statement's own changes are exactly the own words whose id is at or above the statement's **horizon**, the next id at the moment the statement began. Changes made by earlier statements are below it and visible; a nested statement (a trigger or a function) takes a new horizon, so it sees the changes the outer statement made before it ran.
+- *`ROLLBACK TO SAVEPOINT` works on every engine.* Rolling back to a savepoint marks every subtransaction id allocated since that savepoint `Aborted` in the status table, with a logged record. Their words then read exactly as an aborted transaction's do, on the heap with no undo at all. The IOT additionally restores its leaf rows from undo (kept §1). Locks taken under a rolled-back subtransaction disappear with it: a header lock word names an aborted id, and the lock manager drops entries it lists for that id.
+
+The first record each subtransaction writes carries its top-level id, so followers and recovery rebuild the mapping from the log. A commit commits the top-level transaction and every subtransaction of it that is not aborted.
+
+**The rule, as a truth table.** A version is *born* for a snapshot if its creator is visible at `read_ts`; it is *deleted* if its deleter is. "Own" below means a word whose id belongs to the reader's top-level transaction (`status(x)` is `InProgress { top }` with `top == own.top`).
 
 | Creator word | Status | Born? |
 | :--- | :--- | :--- |
 | zero | — | Never valid. The engine refuses the page. |
-| uncommitted(x), x is the reader's own transaction | — | yes |
+| uncommitted(x), own | aborted (rolled back to a savepoint) | no (`NotBornYet`) |
+| uncommitted(x), own | x ≥ `own.horizon`: written by this statement or a later one | no (`NotBornYet`) |
+| uncommitted(x), own | x < `own.horizon` | yes |
 | uncommitted(x), another transaction | in progress or aborted | no (`NotBornYet`) |
 | uncommitted(x), another transaction | committed at ts | ts ≤ `read_ts` |
 | committed(ts) | — | ts ≤ `read_ts` |
@@ -427,12 +482,13 @@ impl Snapshot {
 | Deleter word (only once born) | Status | Result |
 | :--- | :--- | :--- |
 | zero | — | `Live` |
-| uncommitted(x), the reader's own transaction | — | `Deleted { own: true }` |
+| uncommitted(x), own | aborted, or x ≥ `own.horizon` | `Live`: the delete was rolled back, or this statement made it and must not see it |
+| uncommitted(x), own | x < `own.horizon` | `Deleted { own: true }` |
 | uncommitted(x), another transaction | in progress or aborted | `Live` — the delete may still roll back, or did |
 | uncommitted(x), another transaction | committed at ts | ts ≤ `read_ts` → `Deleted { own: false }`, else `Live` |
 | committed(ts) | — | ts ≤ `read_ts` → `Deleted { own: false }`, else `Live` |
 
-`visible(word)` is the same rule for a single word: the empty word gives `Aborted`; the reader's own in-progress word gives `Visible`; another transaction's gives `InProgress`, `Aborted`, `Visible` or `CommittedAfterSnapshot`.
+`visible(word)` is the same rule for a single word: the empty word gives `Aborted`; an own word gives `Visible` below the horizon and `Aborted` if rolled back; another transaction's gives `InProgress`, `Aborted`, `Visible` or `CommittedAfterSnapshot`. The conflict rules of layer §6.5 and §11.4 treat every own word as "not another transaction": a transaction never waits on itself.
 
 An index entry uses the same composition with its own two words: `row_visible(create, Some(delete))`.
 
@@ -451,11 +507,13 @@ pub struct TxnCtx { /* scope and epoch, the writer's TxnId once assigned, the st
 
 impl TxnCtx {
     /// Read committed: a new snapshot. Repeatable read and serializable: the transaction's.
-    pub fn begin_statement(&mut self) -> &mut StmtCtx;
+    /// Async: a new snapshot waits until its read timestamp is closed (access-api C5).
+    pub async fn begin_statement(&mut self) -> Result<&mut StmtCtx, Fenced>;
     /// Releases statement-scoped state and aborts speculative tokens left unresolved.
-    pub fn end_statement(&mut self);
+    /// Returns the speculative tokens left unresolved; the executor aborts them (access-api C6).
+    pub fn end_statement(&mut self) -> Vec<(RelId, SpecId)>;
     /// A new snapshot, waited for until its read timestamp is closed. For fetch_latest_committed.
-    pub fn fresh_snapshot(&mut self) -> Snapshot;
+    pub async fn fresh_snapshot(&mut self) -> Result<Snapshot, Fenced>;
 }
 
 pub struct StmtCtx {
@@ -465,7 +523,9 @@ pub struct StmtCtx {
 }
 ```
 
-The transaction layer constructs `TxnCtx`; the contract fixes only what engines consume. The context carries the scope's epoch, and every engine call checks it: a call for an epoch the scope no longer holds returns `TamError::Fenced` before touching a page. That is a runtime outcome, not an assertion, because an epoch changes under a running transaction by design — a failover, or a scope reopened after a log failure.
+`TxnCtx` is a concrete struct in `cascade-txn-api`, built by the transaction layer from four injected services: a clock with closed-timestamp waits, the `VisibilitySource`, the `WaitSource` and the scope's epoch (access-api C5). Engines consume it and never construct it. Its poison flag is interior (a `Cell`; the context is `!Send`), so a read that holds only `&TxnCtx`, or a scan that outlives the call that created it, can still poison the transaction (round-3 fix V25). `end_statement` returns each unresolved token as a pair of relation id and token id, so `cascade-access` can route the abort to its table (V26).
+
+**How a read timestamp is chosen (round-3 fix V20).** A snapshot is closed when no commit can still appear below its read timestamp. Taking `read_ts = now` and waiting for the closed timestamp to pass it would make every read-committed statement wait for every concurrent commit to become durable, about the commit latency. So a snapshot takes `read_ts = max(closed_ts, session_token)`, where the session token is the commit timestamp of the session's own last commit (architecture §4.5, read-your-writes). It waits only when the token is ahead of the closed timestamp, which happens just after the session's own commit. For this to keep read-committed semantics across sessions, a commit is acknowledged to its client only once the closed timestamp has reached its commit timestamp, so any commit a client has heard about is visible to every snapshot taken afterwards. `fresh_snapshot` follows the same rule. The context carries the scope's epoch, and every engine call checks it: a call for an epoch the scope no longer holds returns `TamError::Fenced` before touching a page. That is a runtime outcome, not an assertion, because an epoch changes under a running transaction by design — a failover, or a scope reopened after a log failure.
 
 ### 6.8 Reads and the scan protocol
 
@@ -483,12 +543,12 @@ Composing an upsert above the contract (look up the key, then insert or update) 
 1. **`insert_speculative(txn, row, index)`** inserts the row and lets the unique index named by `index` arbitrate. On a heap table the row is inserted like any other and the index entry's create word is the writer's uncommitted word; on an IOT the leaf row is itself the entry. The result is:
    - `Installed(token)` — no conflicting entry. The row is now visible to the writer only.
    - `KeyBusy(Conflict::InProgress { holder })` — another transaction holds the key and has not ended. Under `Wait` the engine has already waited.
-   - `KeyBusy(Conflict::CommittedAfterSnapshot { .. })` — a committed entry that the statement's snapshot cannot see. The executor's update branch works from `fetch_latest_committed`.
-   - `UniqueViolation` — a committed entry the snapshot does see.
+   - `KeyBusy(Conflict::CommittedAfterSnapshot { .. })` — a live committed entry that the statement's snapshot cannot see. The executor's update branch works from `fetch_latest_committed`; a `DO NOTHING` statement simply skips the row.
+   - `UniqueViolation` — a live committed entry the snapshot does see. (For a plain insert, both of the last two cases are a unique violation: see the unique check in layer §11.4, which reads the latest committed state, not the snapshot.)
 2. **`complete_speculative(txn, token)`** changes nothing in storage. The insert becomes an ordinary one.
-3. **`abort_speculative(txn, token)`** **does change bytes.** The transaction goes on running (`ON CONFLICT DO UPDATE`, `DO NOTHING`), so the row must stop existing at once. The engine stamps the row's deleter and the entry's delete word with the writer's uncommitted word, as one mini-transaction. From then on the row is `Deleted { own: true }` for the writer, and for every other transaction it is invisible whatever the writer's outcome, because the same transaction created and deleted it.
+3. **`abort_speculative(txn, token)`** **does change bytes.** The transaction goes on running (`ON CONFLICT DO UPDATE`, `DO NOTHING`), so the row must stop existing at once. On a heap, the engine stamps the row's deleter and the entry's delete word with the writer's uncommitted word. On an IOT, where the row is itself the primary-key entry and has no deleter word, it sets the leaf row's delete-mark and writes the undo record that carries the deleting word, in one group with undo first (round-3 fix V15). From then on the row is `Deleted { own: true }` for the writer, and for every other transaction it is invisible whatever the writer's outcome, because the same transaction created and deleted it.
 
-Two consequences for the conflict protocol. An entry whose create and delete words name the same in-flight transaction is not a conflict. Waiters for a key are woken when its delete word lands, not only when a transaction ends. A token that the statement leaves unresolved is aborted by the engine at `end_statement`.
+Two consequences for the conflict protocol. An entry whose create and delete words name the same in-flight transaction is not a conflict. Waiters for a key are woken when its delete word lands, not only when a transaction ends: a waiter sleeps on `WaitFor::Key`, and the engine signals that key when it stamps the delete word (round-3 fix V13). A token that the statement leaves unresolved is returned by `end_statement`, and the executor aborts it through `AnyTable::abort_unresolved` (access-api C6); `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches a list that is dropped.
 
 ### 6.10 Row locks (A11)
 
@@ -505,19 +565,19 @@ Foreign-key checks hold `KeyShare` on the referenced row for the transaction's d
 
 **Exclusive locks live in the row header; shared locks live in the lock manager.**
 
-- **`FOR UPDATE`, `FOR NO KEY UPDATE`, and every `UPDATE` and `DELETE`** stamp the row's deleter word with the writer's uncommitted word and set two flag bits. `XMAX_LOCK_ONLY` says the word names a locker, not a deleter, so readers ignore it. `XMAX_UPDATES_KEY` says the holder deletes the row, changes a key column, or holds `FOR UPDATE`, as opposed to `NO KEY UPDATE`. The heap takes the bits from the unassigned part of its flag word (format F2 assigns three). The page layer assigns them.
-- **`FOR SHARE` and `FOR KEY SHARE`** take an entry in the lock manager, keyed by the relation and the locator of the locked version, listing holders and modes. Nothing is written to the page, and the entry disappears when the transaction ends.
-- **The IOT keeps every row lock in the lock manager**, keyed by the relation and the primary key. Its leaf row has no deleter word to stamp (layer §11.3), and an IOT write already conflicts through the creator word, which names the in-flight updater — the same implicit-lock rule as InnoDB's writer id. So an IOT write consults the lock manager for its row, and so does an IOT locker. It needs no key-change flag: a key update moves the row to a new key, so a surviving live row at the old key *is* the statement that the update changed no key.
+- **`FOR UPDATE`, `FOR NO KEY UPDATE`, and every `UPDATE` and `DELETE`** stamp the row's deleter word with the writer's uncommitted word and set two flag bits. `XMAX_LOCK_ONLY` says the word names a locker, not a deleter, so readers ignore it. `XMAX_UPDATES_KEY` says the holder deletes the row, changes a key column, or holds `FOR UPDATE`, as opposed to `NO KEY UPDATE`. The heap takes the bits, and the `HAS_SHARED_LOCKS` hint below, from the unassigned part of its flag word (format F2 assigns three). The page layer assigns them (register D-9b).
+- **`FOR SHARE` and `FOR KEY SHARE`** take an entry in the lock manager, keyed by the relation and the locator of the locked version, listing holders and modes. The entry disappears when the transaction ends. The only page change is a `HAS_SHARED_LOCKS` hint bit in the row's flag word, set by a logged one-bit record the first time the row is share-locked and never needed again for that version; a writer that finds it set and no holder in the manager may leave it.
+- **The IOT keeps every row lock in the lock manager**, keyed by the relation and the primary key. Its leaf row has no deleter word to stamp (layer §11.3), and an IOT write already conflicts through the creator word, which names the in-flight updater — the same implicit-lock rule as InnoDB's writer id. So an IOT locker takes its lock in the lock manager and also sets a `HAS_LOCKS` bit in the leaf row's flag word (a logged change, while kind 3 is still unfrozen). An IOT writer consults the lock manager only when that bit is set, so writes to rows that nobody has locked never touch the shared lock table; the bit is cleared lazily by the next writer that finds no holder (round-3 fix V16). The lock manager's table is sharded by key hash, so writers on different cores rarely meet in it. It needs no key-change flag: a key update moves the row to a new key, so a surviving live row at the old key *is* the statement that the update changed no key.
 - **Row locks are in-memory and transaction-scoped.** They are never logged and never recovered: the manager starts empty when a scope opens, which is sound because every holder either committed (locks released at commit) or is rolled back by recovery. The same is true of PostgreSQL's stamped lock-only words and of InnoDB's and SQL Server's lock systems. Deadlock detection runs here too, over the locks it holds.
-- **Who consults what.** Readers consult nothing: with `XMAX_LOCK_ONLY` set, the engine passes no deleter to the visibility rule, so the row stays live whatever became of the locker. Writers and exclusive lockers consult the header word — an in-progress holder whose mode conflicts starts the conflict protocol (layer §6.5); a holder that has ended means the lock is gone — and they consult the lock manager for shared holders of the version they target, honouring the table above. Shared lockers consult the header word and the lock manager.
+- **Who consults what.** Readers consult nothing: with `XMAX_LOCK_ONLY` set, the engine passes no deleter to the visibility rule, so the row stays live whatever became of the locker. Writers and exclusive lockers consult the header word — an in-progress holder whose mode conflicts starts the conflict protocol (layer §6.5); a holder that has ended means the lock is gone — and they consult the lock manager for shared holders of the version they target, honouring the table above. To keep that lookup off the common path, a heap shared locker also sets a `HAS_SHARED_LOCKS` hint bit in the row's flag word, and a writer looks in the lock manager only when it is set. Shared lockers consult the header word and the lock manager.
 
-**Why this split.** Several transactions may hold a shared lock on one row at once, which one 64-bit word cannot list; PostgreSQL adds a separate multi-locker id space for that case. The lock manager already has that list. Putting *every* row lock there would instead make every row write probe the lock table, which the header word avoids for the modes that writes themselves need.
+**Why this split.** Several transactions may hold a shared lock on one row at once. The row header has one deleter word, which can name one transaction, so it cannot list them; PostgreSQL adds a separate multi-locker id space for that case. The lock manager already has that list. Putting *every* row lock there would instead make every row write probe the lock table, which the header word avoids for the modes that writes themselves need.
 
 **Locks follow the row.** No update leaves a lock behind on the old version. After any update, by the lock owner or by another transaction, every lock the old version carried is recorded again on the new one (heap §4.4). A shared lock survives an update because a non-key update does not conflict with it — which is exactly why a later key-changing update on the new version must still find it.
 
 **Prior art.** Each ingredient is in production use. The lock-only stamp is PostgreSQL's (`HEAP_XMAX_LOCK_ONLY` — this design borrows the name), and PostgreSQL likewise carries locks over to a row's new version when an update moves it. The two-places rule — a write's lock read from the row, a `FOR` lock looked up in a lock system — is InnoDB's, which calls the row's writer id an *implicit* lock and keeps every explicit `FOR` lock in its lock system; InnoDB's secondary-index records, which carry no writer id, get manager locks, as every IOT lock does here. SQL Server and DB2 keep all row locks in the lock manager, with nothing in the row.
 
-Two choices are not the mainstream default. Shared locks go to the lock manager rather than PostgreSQL's MultiXact id space — deliberately, because MultiXact is a large subsystem with its own wraparound emergencies, and these shared locks are transaction-scoped like every other row lock, so the manager loses nothing that outlives a transaction. And one bit records whether the in-flight writer changes key columns; PostgreSQL does not persist that for a write in progress and cannot always tell a key-changing update from a non-key one until it has waited the writer out, so a key-share holder here can be answered from the page instead.
+Two choices are not the mainstream default. Shared locks go to the lock manager rather than PostgreSQL's MultiXact id space — deliberately, because MultiXact is a large subsystem with its own wraparound emergencies (its ids are 32-bit, like PostgreSQL's transaction ids, so a busy database must periodically rewrite old rows before the counter wraps, or stop accepting writes), and these shared locks are transaction-scoped like every other row lock, so the manager loses nothing that outlives a transaction. And one bit records whether the in-flight writer changes key columns; PostgreSQL does not persist that for a write in progress and cannot always tell a key-changing update from a non-key one until it has waited the writer out, so a key-share holder here can be answered from the page instead.
 
 A11 is a proposal that changes the architecture's sentence "row locks themselves live in version words" (layer §13.2). It needs the two flag bits from the page layer and the shared-lock lists from `cascade-lock`.
 
@@ -569,13 +629,13 @@ pub struct TableEnv { /* .. */ }
 An engine is constructed from a descriptor and a `TableEnv`. Engines never read the catalog: the scope host builds descriptors from it, and the catalog's own tables use built-in bootstrap descriptors (architecture §4.6). A schema change arrives as a new descriptor at the next statement boundary; a write under a retired schema version returns `TamError::SchemaStale`. `build_index` and `truncate` execute only the physical phase of a DDL statement, and the catalog coordinates the rest above this contract. Two constraints on them:
 
 - **A build blocks writes on its table for its duration** (a table lock held by the statement). Without it, an entry inserted for a row that dies before the build commits would never receive a delete word (heap §7.3).
-- **`truncate`** logs the old segment's drop and allocates a new one, and the descriptor's new segment takes effect at commit, so a rolled-back `truncate` leaves the table as it was.
+- **`truncate`** allocates a new segment at once and logs the old segment's drop only at commit, as part of the commit (round-3 fix V9). The page store discards a segment's files when it applies the drop (layer §10), so dropping earlier would destroy data that a rollback still needs. The descriptor's new segment takes effect at commit. A rolled-back `truncate` logs only the new segment's allocation, which is harmless: the unused segment is dropped with the abort. `DROP TABLE` and `DROP INDEX` follow the same rule.
 
 ### 6.13 The in-memory fake and the conformance suite
 
 This section is A13 applied. The rule: **write the tests once; every engine takes the same test.** The tests plug into a private trait (§6.1); four implementations plug in beside them — the fake always, the three engines as they land. What each of the four is:
 
-- **A fake engine**: a multi-version table in memory with no pages and no log. Versions are `(creator, deleter, payload)` triples resolved through the same visibility rule, and conflicts come from a scripted `VisibilitySource`. It implements the trait like a real engine. It is the executor's test double, and its machinery is the base of the temporary-table engine (§11.6) — which is why the temporary arm is cheap to add.
+- **A fake engine**: a multi-version table in memory with no pages and no log. Versions are `(creator, deleter, payload)` triples resolved through the same visibility rule, and conflicts come from a scripted `VisibilitySource`. It implements the trait like a real engine, in two locator flavours: `Heap`, where a locator names one version and every update moves it, and `Iot`, where the locator is the primary key and moves only when the key changes (access-api C10). The suite checks locator movement against both, and each engine is compared with its flavour. It is the executor's test double, and its machinery is the base of the temporary-table engine (§11.6) — which is why the temporary arm is cheap to add.
 - **A conformance suite**: one test per promise of §6, written as generic functions over the test-only trait, and run against every implementation of it — the fake and, as they land, the three engines. Because `AnyTable` delegates to the trait (§6.1), passing the suite is not a parallel obligation the engines can drift away from: it is the same code the executor reaches.
 
 The suite covers: every outcome under each `WaitPolicy`; the read-committed re-check; locator movement; the scan protocol (rescan, mark/restore, drop); speculative arbitration, including two transactions racing on one key; poisoning and fencing; and the visibility truth table against a scripted status source.
@@ -594,7 +654,7 @@ One row inserted into a heap table, followed from the executor to the page store
 6. **Secondary indexes**, once they exist, receive their entries in the same statement. The primary-key check returns a conflict as a value if another transaction already holds the key.
 7. **The engine returns `Done { locator }`**, the new row's Tid.
 8. **Other sessions** resolve `uncommitted(txn.xid)` through the status table, find it in progress, and do not see the row. The writer's own statements do.
-9. **`COMMIT`** is the transaction layer's: it appends the commit record under the scope's commit-section mutex, waits for durability, and marks the status table `Committed { ts }`. Every snapshot with `read_ts ≥ ts` now sees the row. Nothing on the page changed.
+9. **`COMMIT`** is the transaction layer's: it appends the commit record (taking the scope's commit-section mutex, a proposed change to the architecture, layer §13.2), waits for durability, and marks the status table `Committed { ts }`. Every snapshot with `read_ts ≥ ts` now sees the row. Nothing on the page changed.
 10. **The page store** reads the record from the log and applies the same redo function, so it writes the same bytes.
 11. **`ROLLBACK`** leaves the page alone. The status table says `Aborted`, the row is dead, and prune reclaims it.
 
@@ -612,9 +672,9 @@ What follows from that:
 2. **Where work serializes.** The architecture's budget — a commit uses at most one contended atomic and takes no lock — describes the commit itself in the uncontended case. It is not a statement about page access. In order, the serialization points are:
    - An uncontended commit's one shared write is the log's LSN reservation, one atomic (storage §12.3).
    - Every page touch takes the frame's pin word and then its mutex. Two cores on the same page serialize. A hot leaf — the rightmost one under sequential inserts — serializes all of its writers.
-   - The commit path takes the scope's commit-section mutex, for one timestamp and one record append (runtime module `txnmgr`).
+   - The commit path takes the scope's commit-section mutex, for one timestamp and one record append (runtime module `txnmgr`). The architecture says a commit takes no lock, so this is listed in layer §13.2 as a proposed change (round-3 fix V19). The mutex is held for a clock read and an LSN reservation, never for I/O; replacing it with a single atomic that hands out timestamp and LSN together is the way back to the architecture's budget, if measurements require it.
    - While the insert record is type 5, each relation has a fill mutex on the insert path (heap §2). It is deleted when the record names its page.
-3. **Row conflicts do not go through a central lock table.** An engine finds a conflict by reading the row's version words and records one by stamping them under the exclusive pin. Row locks that have no word to live in are the exception; they live in the lock manager (layer §6.10).
+3. **Write conflicts are found in the row; explicit locks are found in the lock manager.** An engine finds a write-write conflict by reading the row's version words and records its own write by stamping them under the exclusive pin. Explicit row locks (`SELECT … FOR …`) that have no word to live in are kept in the lock manager (layer §6.10). On the heap a writer reaches the lock manager only when the row's header says shared locks may exist; on the IOT a writer checks one flag bit on the leaf row first, so a row nobody has locked costs no lock-manager lookup (round-3 fix V16).
 4. **Two kinds of misplaced call.** A call from a core outside the write core set is a programming error and a debug assertion; the data plane's promises (architecture §4.8) rule it out. A call under an epoch the scope no longer holds is a runtime outcome, `TamError::Fenced` (layer §6.7).
 5. **Cross-scope reads** take one read timestamp from `cascade-txn-coord`. Each fragment runs on its own scope's core set. The rules are the coordinator's.
 
@@ -671,7 +731,7 @@ engine ── records ──▶ seam ── apply, via cascade-redo ──▶ th
 2. **Apply** each record, through `cascade-redo`, to the data page it names — an image in a buffer-pool frame that the engine holds under an exclusive pin — and stamp the page.
 3. **Seal** the group with the group-end flag and hand it to the log writer.
 
-For each record the log comes first and the page second. Only a commit waits for durability. A page whose LSN is above the durable LSN is never evicted (storage §12.5). Because every append ends on a group-end flag, the durable LSN and every replay boundary fall on a mini-transaction edge (storage §2, S16).
+Records are applied to the cached page before the group is sealed and reaches the log writer. So the page changes first, in memory; the write-ahead rule holds because of the next one: no page whose LSN is above the durable LSN ever leaves the cache, by eviction or by any write (storage §12.5; round-3 fix V18). Only a commit waits for durability. Because every append ends on a group-end flag, the durable LSN and every replay boundary fall on a mini-transaction edge (storage §2, S16).
 
 **The engine supplies records; the seam applies them.** An engine never writes a page's bytes. It reads a data page to decide what to record, builds the record, and the seam applies that same record to that page's image through the one redo function that replay uses. So the leader, a follower and the page store run the same code on the same bytes, and there is no second code path to keep in agreement. The page cache makes its mutation methods invisible to engines, so a page change that skips the seam does not compile (architecture §4.4).
 
@@ -710,11 +770,13 @@ The page cache's own design finalizes the shape. Engines rely on four things: re
 
 ### 9.2 Redo ownership (A2) and page formats (A3)
 
-The redo contract (storage §12.4) is one-way: self-contained per page, deterministic, versioned, idempotent by LSN. Three crates divide it, as the architecture assigns (architecture §3.2, Rule 5):
+A redo record must be applicable to its page alone, give the same bytes every time, carry a version, and be safe to apply twice. Three crates share that work:
 
-- **`cascade-wal-format`** encodes and decodes every record payload. An engine's design says what its records carry (heap §9, btree §8); the bytes live in that crate, pinned by golden tests.
-- **`cascade-redo`** is the single dispatch point, `apply_record`. It keeps applying every version it has ever accepted.
-- **The format authorities own the byte transforms.** The heap family's apply calls `cascade-page`'s `PageMut` methods; the page design's D4 gives those calls a named module. The B-tree family's apply works on `cascade-page`'s B-tree views (A3). The free-space arithmetic is still mirrored in `cascade-redo` (`fits`) instead of being asked of `cascade-page`; sharing it is an open item (layer §13.3).
+- **`cascade-wal-format`** turns each record into bytes and back. Each engine's design says what its records carry; the bytes live in this crate and are pinned by golden tests.
+- **`cascade-redo`** is the single function, `apply_record`, that applies a record to a page. It keeps accepting every record version it has ever accepted.
+- **The page-format crate owns the byte changes themselves.** Heap records are applied by calling `cascade-page`'s page methods; B-tree records by `cascade-page`'s B-tree page views (A3). One piece is still duplicated: `cascade-redo` has its own copy of the free-space arithmetic, which should be shared.
+
+*Sources:* storage §12.4 (the redo contract); architecture §3.2 and Rule 5 (the three-way split); heap §9 and btree §8 (the records); page D4 (the page methods); layer §13.3 (the shared free-space item). Round-3 fix V35 moved these citations out of the sentences.
 
 **A3 — B-tree page formats live in `cascade-page`.** The architecture lists the index-organized leaf layouts under `cascade-page`, and `cascade-redo` (L1) cannot depend on `cascade-btree` (L5). So the B-tree *bytes* — branch nodes, IOT leaf rows, index entries, their headers and their parse — are `cascade-page` kinds, and `cascade-btree` owns the tree *logic* over them. This corrects the page design's §2, which assigned those formats to `cascade-btree`; the architecture wins (architecture §1.1). The page design's boundary "cells are never unified across kinds" stands: an IOT leaf row and an index entry are different cell shapes that happen to live in one crate.
 
@@ -775,7 +837,7 @@ The IOT has no detailed design yet. Kept §1 is its semantics; this section fixe
 
 **Tree keys.** A unique index orders by key. A non-unique index orders by key followed by locator, so that entries are unique in the tree and a range over the key's prefix finds all of the key's entries (btree B8).
 
-**The engines maintain indexes inside their writes**, in the same mini-transaction group as the row:
+**The engines maintain indexes inside their writes**, in the same statement and the same transaction as the row, but each index change is its own mini-transaction (round-3 fix V6). A mini-transaction may not await (layer §9.1), and descending a B-tree awaits whenever a page is not resident, so one group cannot hold the row's page while it descends several trees. Order: the row's mini-transaction first, then each index's entries. What hides a half-done write from others is visibility, not log atomicity: the row and its entries all carry the same transaction's uncommitted word until it commits. After a crash in the middle, recovery aborts the transaction, so the row and any entries it got are dead together.
 
 | Write | Index work |
 | :--- | :--- |
@@ -787,14 +849,14 @@ The IOT has no detailed design yet. Kept §1 is its semantics; this section fixe
 
 An entry never becomes visible before the row it points to: both are the same transaction's uncommitted work until that transaction commits.
 
-**Unique check.** The engine looks up the key and examines every entry at it (btree B8):
+**Unique check.** Uniqueness is a property of the current state, not of a snapshot. So the check reads every entry at the key (btree B8) against the *latest* state, which is PostgreSQL's "dirty snapshot": every committed word counts whatever its timestamp, and the writer's own words count (round-3 fix V3).
 
-| What is at the key | Result |
+| What is at the key, in the latest state | Result |
 | :--- | :--- |
-| An entry another transaction has in progress | `Conflict::InProgress { holder }` — it may still abort |
-| An entry committed and visible to the statement's snapshot | `UniqueViolation` |
-| An entry committed after the statement's snapshot | `Conflict::CommittedAfterSnapshot { commit_ts, latest }` |
-| An entry whose create and delete words name the same in-progress transaction | No conflict (layer §6.9) |
+| An entry another transaction created, or deleted, and has not ended | `Conflict::InProgress { holder }`: it may still abort |
+| An entry committed and not deleted by a committed transaction, or the writer's own live entry | `UniqueViolation` for a plain insert. For `insert_speculative`, `UniqueViolation` if the statement's snapshot sees the row, and otherwise `Conflict::CommittedAfterSnapshot { commit_ts, latest }`, so that `ON CONFLICT DO UPDATE` can work from the latest row |
+| An entry whose delete committed, at any timestamp | No conflict: the key is free |
+| An entry whose creator aborted, or whose create and delete words name the same transaction | No conflict (layer §6.9) |
 
 A unique index compares key bytes only, never the locator. As in PostgreSQL, nulls are distinct: a key with a null in any column never conflicts. Speculative insertion rides on this check (layer §6.9).
 
@@ -804,7 +866,7 @@ A unique index compares key bytes only, never the locator. As in PostgreSQL, nul
 
 ### 11.5 Sequences
 
-`cascade-sequence` hands out monotonically increasing values with cached ranges per scope. Allocating a range is one log record, so after a failover the new owner resumes from the last durable range and never reuses a value. The executor and `serial`/`identity` defaults use a narrow `Sequence` contract.
+`cascade-sequence` hands out monotonically increasing values with cached ranges per scope. Allocating a range is one log record, and the allocation waits until that record is durable before it returns any value from the range (round-3 fix V23). After a crash or failover the new owner resumes after the last durable range, so no value is reused; values cached and not handed out are skipped, as in PostgreSQL. Ranges are sized (by default 32 values, growing with the rate of use) so that the durability wait is rare. The executor and `serial`/`identity` defaults use a narrow `Sequence` contract.
 
 ### 11.6 Temporary tables
 
@@ -814,7 +876,7 @@ A unique index compares key bytes only, never the locator. As in PostgreSQL, nul
 
 `cascade-maintenance` drives `Maintenance::step` across a scope's relations within a budget per tick, so cleanup never exceeds its share and never stops a table (storage §12.1, principle 7). It keeps an in-memory work list per scope.
 
-The **cleanup watermark** it works from is the oldest read timestamp still in use: in version 1, the oldest open snapshot in the process. Learning it across scopes and replicas is `cascade-watermark`'s design (architecture §4.5). The scheduler will also enforce the per-database limits on transaction age and undo size (product definition §4.1) once that component exists.
+The **cleanup watermark** it works from is the oldest read timestamp still in use anywhere that reads this scope's pages: the leader, its followers and its read replicas. Prune and vacuum verdicts are logged and replayed on followers (page D2), so a leader that pruned against its own snapshots alone would remove versions a follower's reader can still see (round-3 fix V8). In single-box mode the watermark is the oldest open snapshot in the process. In the managed service it comes from `cascade-watermark` (architecture §4.5), which collects each follower's and replica's oldest snapshot, and it is a dependency of Step 4 there. A replica whose reader falls behind the watermark the leader is allowed to use, set by a bounded lag, gets the "snapshot too old" error that product definition §4.1 contemplates instead of holding cleanup back without limit. The scheduler will also enforce the per-database limits on transaction age and undo size (product definition §4.1) once that component exists.
 
 ---
 
@@ -868,9 +930,18 @@ So the status table grows with the number of transactions that have ever touched
 **Directions. None is decided.**
 
 - *(a) Stamp through the log.* Each transaction records the positions of the words it stamped. At commit, and at abort, it emits stamp records for them, which `cascade-redo` applies everywhere. It costs one small record per touched row, written once. It gives the heap a real rollback in place of "write the abort record only" (kept §2). Status entries can then be retired once the stamps are durable.
-- *(b) Keep the words and bound the table another way.* No sound way is known. Transaction ids are monotonic, but commit order is not, so no range of ids can be declared resolved.
+- *(b) Keep the words and bound the table in memory another way.* No sound way is known. Transaction ids are monotonic, but commit order is not, so no range of ids can be declared resolved.
+- *(c) Transaction status pages (round-3 fix V12).* The architecture already lists "transaction status pages" among `cascade-page`'s formats (architecture §4.2): a persistent, logged array indexed by transaction id, like PostgreSQL's commit log, holding each id's state, its commit timestamp, and for a subtransaction its top-level id (layer §6.6). It is paged through the buffer pool like any other data, so it never has to fit in memory, and recovery and followers rebuild it by replaying its records.
 
-**Recommendation:** (a). If it is taken, every engine reports each word it stamps to `TxnCtx`, with its position.
+| | (a) Stamp through the log | (c) Status pages |
+| :--- | :--- | :--- |
+| Space | Bounded in memory; one stamp record per touched row | About 16 bytes per transaction id, on disk, growing forever unless old pages are truncated |
+| Read cost | None once stamped; a lookup before | A lookup per unstamped word; one page read when the page is not cached |
+| Commit cost | Stamp records proportional to rows touched, at commit or abort | One status record per transaction |
+| Recovery | Must re-emit stamps for transactions that ended without them | Replays status records |
+| Savepoints | Needs stamp-on-rollback per subtransaction | A sub-id is one more entry |
+
+**Recommendation:** (c) for version 1, with (a) as the cleanup path rather than the commit path: vacuum and prune "freeze" old words to their commit timestamps through ordinary logged records when they touch a page anyway, as PostgreSQL's freezing does, and status pages below the oldest unfrozen id are truncated. Commit stays one record, savepoints fall out of the same table, and the growth of the status pages is bounded by how far freezing lags. This changes register D-1's recommendation; the decision is still the transaction layer's, ratified by Kenneth. If (a) is chosen instead, every engine reports each word it stamps to `TxnCtx`, with its position.
 
 ### 13.2 Changes proposed to the architecture
 
@@ -879,6 +950,8 @@ So the status table grows with the number of transactions that have ever touched
 | §4.5, `cascade-lock` | "Row locks themselves live in version words" | On a heap, exclusive row locks live in version words and shared ones in the lock manager. On an IOT, every row lock lives in the lock manager (A11, layer §6.10) | Several transactions can hold a shared lock on one row, which one word cannot list; and the IOT row has no word for a locker |
 | §4.6, `cascade-access-api` | A trait, `TableAccessMethod` | An enum with three arms (layer §6.1) | The futures must be `!Send`, and temporary tables are a third engine |
 | §4.4, `cascade-pagecache` | Only the cache's mini-transaction can change a page | The same, and the engine supplies records which the seam applies through `cascade-redo` (A10) | Leader and replay then share one code path |
+| §4.8, commit budget | "A commit … takes no lock" | The commit path takes a short scope-wide commit-section mutex for one timestamp and one LSN reservation (layer §8, round-3 fix V19) | Commit timestamps and LSNs must be issued in the same order; a lock-free replacement is possible but not designed |
+| §4.5, `cascade-txn` | One transaction id per transaction | Subtransaction ids per writing statement and per savepoint, with their top-level id in the status table (layer §6.6, round-3 fixes V1, V2) | Statement visibility and savepoint rollback on an engine without undo |
 
 Three further points are confirmations, not changes: A3 follows the architecture's placement of page layouts in `cascade-page` (§3.2) and corrects the page design; the page LSN of layer §9.3 restates storage S17; and heap H9 supersedes the runtime plan's FR-46 acceptance that live layout may differ from replay — decided on 2026-11-26, and the plan is updated.
 
@@ -933,6 +1006,9 @@ Three further points are confirmations, not changes: A3 follows the architecture
 | A11 | Heap: exclusive row locks in the row header, shared ones in the lock manager. IOT: all in the lock manager | Proposed. Changes architecture §4.5 (layer §13.2) |
 | A12 | An injected wait seam (`WaitSource`): engines sleep until woken; deadlock and `lock_timeout` arrive as errors | Proposed |
 | A13 | An enum for callers; a test-only trait for the suite, with `AnyTable` delegating to it | Proposed |
+| A14 | Subtransaction ids per writing statement and savepoint; a snapshot carries the statement horizon; savepoint rollback aborts sub-ids (layer §6.6) | Proposed (round-3 V1, V2). Changes architecture §4.5 (layer §13.2) |
+| A15 | The unique check reads the latest committed state, not the statement snapshot (layer §11.4) | Proposed (round-3 V3) |
+| A16 | Index maintenance is a separate mini-transaction per index, in the row's statement and transaction (layer §11.4) | Proposed (round-3 V6) |
 
 ## 16. Provenance and Changes
 

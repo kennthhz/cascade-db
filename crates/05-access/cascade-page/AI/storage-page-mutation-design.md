@@ -5,6 +5,14 @@ Upstream: crates/02-storage/AI/storage-layer-design.md §12.1 principle 5 (pages
 Depends on: the T6.1 page format (locked), the T6.2 BPM access model (the buffer pool: copy-out guards, exclusive-pin mutation), WP1 F1/F2 typed version/chain words.
 Citations: `§9`, `§12`, `§6.3`, `§7`, `§11` refer to the upstream HLD's sections.
 
+**Corrections of 2026-11-27 (round-3 review fix V31; these win over anything below that disagrees).**
+
+- **B-tree page formats live in `cascade-page`, not in `cascade-btree`** (layer decision A3). `cascade-redo` sits below the access layer and must apply B-tree records, so it cannot depend on `cascade-btree`. The B-tree *bytes* (branch, IOT leaf, index leaf, metapage: kinds 2–5) and their apply functions are `cascade-page`'s; `cascade-btree` owns only the tree logic. Every sentence below that places B-tree formats or their apply functions in `cascade-btree` is superseded.
+- **There is no owning core.** A scope is a shared-memory engine across its write core set (layer A4, §8): any core of the set may read or write any page, and pages are protected by the buffer pool's pins alone. The "Concurrency, in one paragraph" section below is rewritten accordingly.
+- **Vacuum does not remove index entries first.** It frees a heap slot once the row's death is older than the cleanup watermark, because every index entry carries its own delete word, stamped by the same transaction (heap H6). Index vacuum is a separate pass that the heap does not wait for.
+- **Names.** `apply_delete_mark` is renamed `apply_stamp_deleter(img, slot, word, flags)`, and `apply_relink` preserves the `next` word's lock flags (heap §4.2, fix V17). "Stub" means a cell kept only so a cross-page chain stays resolvable.
+- **Retired references.** Citations to WP1, WP5, WP8, M6 and the upstream "HLD §9/§12" point into retired documents. Read them as: WP1 F1–F4 → the format decisions now in code (layer §2.4); WP5 D4 → layer §6.6; WP5 D8 → retired (see above); WP8 → heap H8 (the insert record names its slot); M6 → the storage milestone before the MVCC step; HLD §9 → storage §12.4 (the redo contract); HLD §12 invariant 2 → storage §12.5. New text follows layer §2.2's citation convention.
+
 **This document in one look:**
 
 1. cascade-page is the **page layer** shared by its two consumers — cascade-heap today, cascade-btree later — and §1–§3 pin what the layer owns vs what each consumer's format owns. The crate exists, first, so the heap format can sit below both the engine and the storage-side consumers of its bytes (WAL producers, replay/PageStore) — see "Why a separate crate at all" in §1.
@@ -21,13 +29,13 @@ Citations: `§9`, `§12`, `§6.3`, `§7`, `§11` refer to the upstream HLD's sec
 | cell | the bytes of one row version: `[len][xmin][xmax][next][payload]` |
 | xmin / xmax | the version's creator / deleter stamps (typed 64-bit "version words") |
 | chain, HOT chain | the versions of one row linked by `next`. "HOT" is decided at update time — the new version fits on the same page and no indexed column changed — so the resulting chain never leaves the page, and index entries keep pointing at its oldest link (the **root**) |
-| stub | a dead cell kept (instead of freed) only so a chain or a stale index entry stays resolvable until vacuum cleans it up |
+| stub | a dead cell kept (instead of freed) only so a cross-page chain stays resolvable until vacuum cleans it up |
 | prune | quick, access-triggered cleanup of dead versions on one page |
-| vacuum | slower background cleanup: index entries first, then the slots they pointed at |
+| vacuum | slower background cleanup that frees slots; it does not wait for index entries, which carry their own visibility (heap H6) |
 | redo | the WAL record that lets a replaying side reproduce one change on one page image |
 | cleanup watermark | the oldest timestamp any active reader may still need; things older than it are safe to remove |
 | MVCC | multi-version concurrency control — readers see snapshots; writers add new versions instead of overwriting |
-| IOT | index-organized table — the PK-clustered B-tree organization (cascade-btree's); the row lives in the leaf |
+| IOT | index-organized table — the PK-clustered B-tree organization; the row lives in the leaf. Its page formats are this crate's (layer A3); its tree logic is cascade-btree's |
 | golden test | a test that pins the exact expected bytes, so any layout drift fails loudly |
 
 **The page, in one picture** (the locked T6.1 layout this design extends):
@@ -73,7 +81,7 @@ Three requirements define the layer:
 - **WAL record producers** — the HeapInsert record carries cell bytes verbatim as this format lays them down (WP1 F3: one code path, or the log and the page drift).
 - **Replay / recovery — today the runtime's boot redo, tomorrow the disaggregated PageStore** — the redo-apply functions (D4) are pure byte transforms with zero engine semantics (§9: engines are opaque to the PageStore except through redo).
 
-If the format lived inside cascade-heap, every storage-side consumer would import an access-method crate to write bytes — a layering inversion (05-access sits above 02-storage), and the PageStore's build would carry engine code the redo contract forbids it from meaning. So cascade-page's real role: **the crate that lets the heap page format sit below both the engine and every consumer of its bytes.** The layer framing (R1–R3) adds the frame contract on top, deliberately nothing more — btree logic never lives here; the btree format is cascade-btree's from day one.
+If the format lived inside cascade-heap, every storage-side consumer would import an access-method crate to write bytes — a layering inversion (05-access sits above 02-storage), and the PageStore's build would carry engine code the redo contract forbids it from meaning. So cascade-page's real role: **the crate that lets the heap page format sit below both the engine and every consumer of its bytes.** The layer framing (R1–R3) adds the frame contract on top, deliberately nothing more — btree logic never lives here. (Superseded 2026-11-27: the btree *format* does live here, layer A3; see the corrections at the top.)
 
 The route from here: §2 draws the boundary the layer must not cross; §3 makes the **layer decisions** (L1–L3); §4 makes the **heap-format decisions** (D1–D6) that obey them.
 
@@ -91,7 +99,7 @@ Precedent check: this is the PostgreSQL `bufpage.h` shape — one shared page AP
 | The redo binding | every kind's redo obeys §9's contract — self-contained per page, deterministic, versioned, idempotent by LSN — and each format's apply functions live at that format's authority (L2) |
 | Helpers | little-endian field accessors and prologue reads shared by every format's parser |
 
-**Each format owns everything else** — its full header, its slot/entry layout, its cell shapes, its parse, its redo apply functions. Today the heap format (kind 1) is the only one implemented, and it lives in this crate. The btree leaf/branch formats (§11) will live in cascade-btree under this contract; columnar keeps its own crate and consumes the same unit.
+**Each format owns everything else** — its full header, its slot/entry layout, its cell shapes, its parse, its redo apply functions. Today the heap format (kind 1) is the only one implemented, and it lives in this crate. The btree leaf/branch formats will live in this crate under the same contract (layer A3, corrected 2026-11-27), with the tree logic in cascade-btree; columnar keeps its own crate and consumes the same unit.
 
 **The line the layer does not cross — cells are not unified.** The heap cell is `[len][xmin][xmax][next]`: a *forward* chain over heap tuples. The future btree leaf entry points *backward* into undo (`roll_ptr`). Different direction, different target space, different mutation model (append-and-prune vs overwrite-in-place). A union cell would tax every heap tuple 8 bytes for a field the heap can never use — and this format's history already rejected the idea: v1's original `undo_ref` reservation *was* the unified-cell accommodation, and WP1 F2 deliberately repurposed it into `NextWord` because "the heap has no undo; undo chains are IOT". That rejection is reaffirmed here as a boundary, not a footnote.
 
@@ -116,7 +124,7 @@ Kind registry: 1 = heap (this crate). B+Tree leaf, btree branch, undo pages, and
 
 ### L2 — The rules are shared; the apply functions are per-format
 
-The redo binding (§9's four rules) is layer property: every kind's WAL redo must be self-contained, deterministic, versioned, and idempotent by LSN. But the apply functions themselves are *byte writers*, so they live with the format authority that owns those bytes — heap apply functions here (D4), btree apply functions in cascade-btree. The layer defines the shape and the rules once so no format invents its own.
+The redo binding (§9's four rules) is layer property: every kind's WAL redo must be self-contained, deterministic, versioned, and idempotent by LSN. But the apply functions themselves are *byte writers*, so they live with the format authority that owns those bytes — heap apply functions here (D4), and btree apply functions here too (layer A3, corrected 2026-11-27). The layer defines the shape and the rules once so no format invents its own.
 
 The same split applies to mutation safety: the layer owns the *rule* (a mutation validates through the read path and refuses atomically — an invalid transform leaves the image untouched); each format implements it for its own layout. Idempotence-by-LSN needs a per-kind stamp position: each format's header defines where its `page_lsn` lives (heap: offset 8), and the replayer checks it before applying; the BPM frame stamp remains the compute-side authority while nothing replays from page images (T6.1's M6 stance).
 
@@ -250,7 +258,8 @@ The heap format authority is the one legal writer of heap page bytes — and §9
 
 ```rust
 pub fn apply_heap_insert(img: &mut [u8; PAGE_SIZE], cell: &[u8]) -> Result<u16, PageError>;
-pub fn apply_delete_mark(img: &mut [u8; PAGE_SIZE], slot: u16, xmax: VersionWord) -> Result<(), PageError>;
+pub fn apply_stamp_deleter(img: &mut [u8; PAGE_SIZE], slot: u16, xmax: VersionWord, flags: LockFlags) -> Result<(), PageError>;
+// relink writes the pointer and HEAP_ONLY only, preserving the lock flags (heap §4.2)
 pub fn apply_relink(img: &mut [u8; PAGE_SIZE], slot: u16, next: NextWord) -> Result<(), PageError>;
 pub fn apply_prune(img: &mut [u8; PAGE_SIZE], plan: &PrunePlan) -> Result<(), PageError>;
 pub fn apply_slot_free(img: &mut [u8; PAGE_SIZE], slot: u16) -> Result<(), PageError>;
@@ -277,7 +286,7 @@ The format contributes the walk's vocabulary; the engine owns every visibility d
 
 ### Concurrency, in one paragraph
 
-Everything a scope owns — its heap pages, its indexes, its prune and vacuum — runs serialized on the owning core (WP5 D8's message-to-owner reads), so two mutators never touch one page and prune never races an index cleanup. Page-level exclusion is the BPM pin protocol: mutators hold the frame's exclusive pin (a replayer instead writes its own private image), and readers take copy-out snapshots — a coherent 8 KiB copy taken under the frame mutex. A snapshot taken before a prune keeps the versions it captured; a pin taken after it sees the pruned page with the same visible rows, because prune only removes versions older than the cleanup watermark, and the watermark always trails the oldest active snapshot. No page pin is ever held across an await (the F3 copy-out discipline).
+A scope is a shared-memory engine across its write core set (layer §8, A4): any core of the set may read or mutate any of the scope's pages, so two mutators can reach one page and prune can run beside index cleanup on another core. Page-level exclusion is the BPM pin protocol alone, and it is enough: mutators hold the frame's exclusive pin (a replayer instead writes its own private image), and readers take copy-out snapshots — a coherent 8 KiB copy taken under the frame mutex. A snapshot taken before a prune keeps the versions it captured; a pin taken after it sees the pruned page with the same visible rows, because prune only removes versions older than the cleanup watermark, and the watermark always trails the oldest active snapshot. No page pin is ever held across an await (the F3 copy-out discipline).
 
 ## 5. Invariants
 
@@ -342,7 +351,7 @@ impl PageMut<'_> {
 /// D4 — replay-side primitives over raw images (record decode lives elsewhere).
 pub mod redo {
     pub fn apply_heap_insert(img: &mut [u8; PAGE_SIZE], cell: &[u8]) -> Result<u16, PageError>;
-    pub fn apply_delete_mark(img: &mut [u8; PAGE_SIZE], slot: u16, xmax: VersionWord) -> Result<(), PageError>;
+    pub fn apply_stamp_deleter(img: &mut [u8; PAGE_SIZE], slot: u16, xmax: VersionWord, flags: LockFlags) -> Result<(), PageError>;
     pub fn apply_relink(img: &mut [u8; PAGE_SIZE], slot: u16, next: NextWord) -> Result<(), PageError>;
     pub fn apply_prune(img: &mut [u8; PAGE_SIZE], plan: &PrunePlan) -> Result<(), PageError>;
     pub fn apply_slot_free(img: &mut [u8; PAGE_SIZE], slot: u16) -> Result<(), PageError>;

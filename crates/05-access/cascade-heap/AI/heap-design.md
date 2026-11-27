@@ -1,8 +1,10 @@
 # cascade-heap design — the heap engine
 
-**Status:** Draft v0.2 for review, 2026-11-26. v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): the chain walk, row locks, speculative abort, the re-check, vacuum's treatment of indexes and the free-space map are corrected (R3, R4, R5, R10, R11, R21, R24, R27).
+**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-3 review ([`access-design-review-2026-11-27.md`](../../AI/access-design-review-2026-11-27.md): V2, V4–V8, V13, V14, V17, V22, V35, V36). v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): the chain walk, row locks, speculative abort, the re-check, vacuum's treatment of indexes and the free-space map are corrected (R3, R4, R5, R10, R11, R21, R24, R27).
 
 **What this document is.** The detailed design of `cascade-heap`, the PostgreSQL-style engine behind the `AnyTable::Heap` arm: row versions appended to pages, HOT chains, incremental prune and vacuum. The *format* half is the page design's — the heap page, its slot states, its prune plans and its redo primitives (page D1–D6), already pinned by golden tests. This document is the *engine* half: the DML paths, the visibility walks, free space, vacuum, out-of-line storage, and the landing sequence.
+
+**Background for readers new to PostgreSQL's heap (round-3 fix V36).** PostgreSQL stores a table as unordered pages of *tuples* (row versions). Each page has an array of *line pointers* (here, slots) so that a row's address, its Tid, stays fixed while the bytes move within the page. An update never overwrites a tuple: it writes a new version and links the old one to it (PostgreSQL's `t_ctid`, here the `next` word). Each version carries the id of the transaction that created it (`xmin`) and the one that deleted or replaced it (`xmax`); a reader decides which version it sees from those two words alone. When an update changes no indexed column and the new version fits on the same page, it is a *HOT* ("heap-only tuple") update: no index entry is added, and readers reach the new version through the old one's link. Dead versions are removed in two steps: *prune*, a quick per-page cleanup on access, and *vacuum*, which frees slots. **What differs here:** version words are commit timestamps or in-flight transaction ids rather than 32-bit transaction ids, so there is no wraparound and no freezing for correctness; index entries carry their own visibility words, so there is no visibility map; every page change is a logged mini-transaction applied by the same redo function the page store runs; and there is no undo.
 
 **Upstream:** the [layer design](../../AI/access-layer-design.md) — §6 (the contract), §7 (a worked write), §8 (execution model), §9 (the write path; §9.1 defines the mini-transaction), §11.2, §13.1 (a blocking dependency). The storage design's §12.1–§12.6. The [kept document](../../AI/engine-semantics.md) §2. The page design. Citation prefixes are defined in layer §2.2; terms in layer §3.
 
@@ -12,11 +14,11 @@
 
 ## 1. Scope
 
-The page design owns the bytes: the heap page layout, the slot states (page D1: live, redirect, dead, unused), the plan-carried prune (page D2), compaction (page D3), the redo primitives (`apply_heap_insert`, `apply_delete_mark`, `apply_relink`, `apply_prune`, `apply_slot_free`; page D4), and the traversal vocabulary (page D5). This engine obeys those bytes. A format change is the page design's to make.
+The page design owns the bytes: the heap page layout, the slot states (page D1: live, redirect, dead, unused), the plan-carried prune (page D2), compaction (page D3), the redo primitives (`apply_heap_insert`, `apply_stamp_deleter`, `apply_relink`, `apply_prune`, `apply_slot_free`; page D4), and the traversal vocabulary (page D5). This engine obeys those bytes. A format change is the page design's to make.
 
 This document says who calls each primitive and when, what the engine computes as against what it merely applies, the relation-level structures, the DML paths, and the landing sequence.
 
-**Two things this engine is not.** It makes no in-place updates: every update writes a new version. It keeps no undo: rollback is the abort record plus the status table (kept §2, and layer §13.1 for what that costs). The row header's third word is the forward chain pointer, not an undo reference (format F2).
+**Two things this engine is not.** It makes no in-place updates: every update writes a new version. It keeps no undo: rollback is the abort record plus the status table (kept §2, and layer §13.1 for what that costs). `ROLLBACK TO SAVEPOINT` works the same way: every word written since the savepoint names a subtransaction id that the rollback marks aborted (layer §6.6, round-3 fix V2), so those versions read as an aborted transaction's do, with nothing on the page undone. The row header's third word is the forward chain pointer, not an undo reference (format F2).
 
 ---
 
@@ -28,13 +30,17 @@ A heap relation has one **main segment** and, once out-of-line storage lands, on
 
 ### Placement while the insert record is type 5 (H9 — accepted)
 
-`HEAP_INSERT` (record type 5) names its segment, not its page. Replay has to work out the page, and `cascade-redo` fixes how: the **sequential-fill rule**. A segment's inserts fill page 0, then page 1, and so on, by the page format's exact append arithmetic, spilling whole cells. `SegmentFill::route` is the one authority for it.
+**The problem.** Today's insert record (type 5) says which segment a row went to, but not which page. So when the log is replayed, replay has to work the page out again, and the leader's pages must come out the same as replay's, or a page fetched back from the page store would not match what the leader had.
+
+**The rule.** Replay places inserts by **sequential fill**: a segment's inserts fill page 0, then page 1, and so on, using the page format's exact space arithmetic, with whole cells only. One function in `cascade-redo`, `SegmentFill::route`, decides it, for the leader and for replay.
 
 The rule binds this engine. Until the record names its page and slot (type 10, §9), every insert goes where the fill cursor says. There is no free-space-map choice, no slot reuse and no prune.
 
 **The cursor advances in LSN order.** The page is chosen inside the same critical section as the record's LSN reservation: a short per-relation mutex over reserve, route and fill, never held across an `await`. If two cores reserved LSNs in one order and chose pages in the other, the leader would hold a layout replay cannot reproduce. That matters because, once storage M8 lands, the leader fetches an evicted page back from the page store, in replayed layout: a scan crossing the eviction could skip or repeat rows, and a fetch by Tid could return a different row.
 
-On open, the cursor is rebuilt with `SegmentFill::from_page_header` from the segment's open page. The mutex is a lock on the insert path, accepted because the record format leaves no alternative. It is deleted at the switch.
+On open, the cursor is rebuilt from the segment's open page (`SegmentFill::from_page_header`). The mutex is a lock on the insert path, accepted because the record format leaves no alternative. It is deleted at the switch.
+
+*Sources:* `cascade-redo` (`SegmentFill`); storage M8 (the page store serves evicted pages back); the runtime plan's FR-46. Round-3 fix V35 moved these out of the opening sentences.
 
 *Provenance.* H9 was decided on 2026-11-26. It replaces the runtime plan's earlier acceptance (FR-46) that live layout may differ from replay layout, which predates the page store serving pages back to the leader. The plan is updated.
 
@@ -59,7 +65,9 @@ A heap row's versions form a **chain**, linked old → new by each version's `ne
 **A locator names one version.** `RowLocator::Tid` addresses a version, and the engine resolves it by walking forward from that version (heap §5.2). What a locator names depends on where it came from:
 
 - A scan returns the Tid of the version it showed.
-- An index entry names the version that was current when the entry was written. A HOT update writes no entries, so they keep naming the version they were written for. An update that is not HOT writes entries for the new version.
+- An index entry names the version that was current when the entry was written, which is always the **root** of a HOT chain: the first version on its page. A HOT update writes no entries, so they keep naming the root. An update that is not HOT writes entries for the new version, which becomes the root of a new HOT chain on its page.
+
+**Finding a version's root (round-3 fix V4).** A delete or a non-HOT update must stamp the row's existing index entries, and in a non-unique index the tree key includes the root's Tid (btree B8). The engine may hold a later version, reached by a scan or a chain walk, and chains have no back pointer. But a HOT chain never leaves its page (law 1 below), so the root is on the same page as the version: under the exclusive pin, the engine builds the page's predecessor map from every slot's `next` word and redirect, and walks back from the version until it reaches a slot that is not `HEAP_ONLY`. That slot is the root, and its Tid is what the entries carry. PostgreSQL derives the root the same way (`heap_get_root_tuples`). The key values to look up are the version's own: a HOT chain shares its indexed values, because a HOT update changes none of them. The cost is one pass over the page's slot array, paid only when the version is `HEAP_ONLY`.
 - An update's `Done` returns the new version's Tid when the locator moved, and the same locator when it did not.
 
 **Two laws bind the chain.**
@@ -73,7 +81,7 @@ A locator is valid for the statement that produced it, in the same transaction (
 
 ## 4. DML Paths
 
-Every path begins with the epoch check (layer §6.7) and works through the mini-transaction seam (layer §9.1): the engine builds records, and the seam applies them to frames the engine has pinned exclusively. When a group touches two pages, both frames are pinned first: made resident, then pinned fail-fast in a fixed order, as btree §3.4 describes.
+Every path begins with the epoch check (layer §6.7) and works through the mini-transaction seam (layer §9.1): the engine builds records, and the seam applies them to frames the engine has pinned exclusively. When a group touches two heap pages, both frames are pinned first: made resident, then pinned fail-fast in ascending `(segment, page_no)` order, and on a refusal both pins are dropped and the group starts again after a yield (round-3 fixes V6, V28). Index changes are never in the same group as the row's records: each is its own mini-transaction, after the row's, in the same statement (layer §11.4).
 
 ### 4.1 Insert
 
@@ -109,19 +117,22 @@ update(txn, loc, new_row, changed):
   key       = changed ∩ key_columns ≠ ∅
   hot       = not indexed and the new version fits on newest's page
   if hot:
-      group = [ DELETE_MARK(newest, xmax = uncommitted(own)),
+      group = [ STAMP_DELETER(newest, xmax = uncommitted(own)),
                 RELINK(newest, next = (same page, new slot) with HEAP_ONLY),
                 HEAP_INSERT_V2(new slot, cell) ]
       return Done { locator: loc }                          # entries and locators unchanged
   page      = fsm.find or a new page
-  group     = [ DELETE_MARK(newest, xmax = uncommitted(own); XMAX_UPDATES_KEY if key),
+  group     = [ STAMP_DELETER(newest, xmax = uncommitted(own); XMAX_UPDATES_KEY if key),
                 RELINK(newest, next = (page, new slot)),
                 HEAP_INSERT_V2(page, new slot, cell) ]
-  + index: delete words on newest's entries; entries for the new version   # §4.6
+  then, one mini-transaction per index:                    # §4.6, layer §11.4
+        delete words on the entries of root(newest); entries for the new version
   return Done { locator: Tid(page, new slot) }
 ```
 
-The records are **one mini-transaction group**. The old version's death, the chain link and the new version's birth are never separated by a replay boundary. The two records on the old version are on one page; the insert may be on another.
+The three row records are **one mini-transaction group**. The old version's death, the chain link and the new version's birth are never separated by a replay boundary. The two records on the old version are on one page; the insert may be on another. `root(newest)` is the HOT chain root of §3.
+
+**One name per operation (round-3 fix V17).** Stamping a heap version's deleter word is called `STAMP_DELETER` in pseudo-code, `HEAP_STAMP_DELETER` as a record, and `apply_stamp_deleter(img, slot, word, flags)` as a page primitive. "Delete-mark" is reserved for the IOT's `DELETE_MARK` flag. Record 11 writes the deleter word and the two lock flags. Record 12, `HEAP_RELINK`, writes only the pointer and the `HEAP_ONLY` bit of the `next` word and preserves every other flag bit, so a relink after a stamp cannot clear `XMAX_LOCK_ONLY` or `XMAX_UPDATES_KEY`.
 
 **Why a non-HOT update writes entries even when no indexed column changed.** The new version lives at a new Tid. Index entries must reach it, so they are written for the new version, and the old version's entries receive delete words. Older snapshots still see the old entries, because their delete words are not yet visible to them. A HOT update avoids all of that, which is its point.
 
@@ -131,7 +142,7 @@ When the row moves, its locks move with it: none is left behind on the old versi
 
 ### 4.3 Delete
 
-Find the newest version, run §4.4, then one group: `DELETE_MARK(newest, xmax = uncommitted(own))` with `XMAX_UPDATES_KEY`, and delete words on every entry of the row (§4.6). The tuple's bytes stay where they are. Prune removes them once the cleanup watermark has passed the delete (§7.1).
+Find the newest version, run §4.4, then one group: `STAMP_DELETER(newest, xmax = uncommitted(own))` with `XMAX_UPDATES_KEY`. Then, one mini-transaction per index, delete words on every entry of the row, found through the chain's root (§3, §4.6). The tuple's bytes stay where they are. Prune removes them once the cleanup watermark has passed the delete (§7.1).
 
 ### 4.4 Conflicts, waits and row locks (H3)
 
@@ -168,7 +179,7 @@ The contract is layer §6.9. The heap's part of it:
 
 - **`insert_speculative`** is an insert (§4.1). Its arbitration is the primary-key index's entry, whose create word is the writer's uncommitted word. A second transaction inserting the same key meets that entry and waits, or does not.
 - **`complete_speculative`** changes nothing.
-- **`abort_speculative`** stamps the tuple's deleter word and the index entry's delete word with `uncommitted(own)`, as one mini-transaction. The transaction goes on running, so the row has to disappear now: it is `Deleted { own: true }` for the writer and invisible to every other transaction whatever becomes of the writer, because one transaction both created and deleted it. An entry whose create and delete words name the same in-progress transaction is not a conflict for the unique check, and a waiter for that key is woken when the delete word lands.
+- **`abort_speculative`** stamps the tuple's deleter word and the index entry's delete word with `uncommitted(own)`, as one mini-transaction. The transaction goes on running, so the row has to disappear now: it is `Deleted { own: true }` for the writer and invisible to every other transaction whatever becomes of the writer, because one transaction both created and deleted it. An entry whose create and delete words name the same in-progress transaction is not a conflict for the unique check, and a waiter for that key, sleeping on `WaitFor::Key`, is woken when the engine signals the key right after the delete word lands (layer §6.9, round-3 fix V13).
 
 ### 4.6 Index maintenance
 
@@ -182,7 +193,7 @@ Every insert, update and delete changes the row's index entries in the same stat
 
 The scan walks pages in `page_no` order up to the segment's extent. For each page it takes a copy, which it holds nothing from once it moves on; it yields between pages. For each slot:
 
-- `Unused` is a bug: assert.
+- `Unused` is skipped: vacuum leaves unused slots behind in normal operation, and slots are never removed (page D1). Only a fetch through a locator treats `Unused` as a bug (§5.2; round-3 fix V14).
 - `Dead` and `Redirect` are skipped. The scan reads every live cell, so a redirect's target is visited anyway.
 - `Live`: decode the cell and apply `row_visible(xmin, Some(xmax))` — with no deleter when `XMAX_LOCK_ONLY` is set (§4.4). A `Live` result is emitted, with **this version's own Tid** as the locator.
 
@@ -200,10 +211,15 @@ fetch(snap, loc):
       Redirect(t) → slot = t
       Live        → switch row_visible(xmin, deleter)             # layer §6.6; no deleter if XMAX_LOCK_ONLY
                       Live       → return this version
-                      Deleted    → if next.has_next(): (page, slot) = next
-                                   else             return None
+                      Deleted    → if not next.has_next(): return None
+                                   succ = next
+                                   if succ is not a Live slot, or creator(succ) ≠ deleter(this):
+                                       return None                         # a stale link (V5)
+                                   (page, slot) = succ
                       NotBornYet → return None
 ```
+
+**A hop is checked (round-3 fix V5).** The walk follows `next` only if the successor's creator word is exactly the predecessor's deleter word: the same (sub)transaction id, since one update stamps both. Otherwise the link is stale and the walk ends. A stale link arises when an update that crossed pages is rolled back: the old version stays live with `next` still set, the successor is pruned and its slot vacuumed and reused, and a later transaction deletes the old version without relinking. Without the check, a reader that sees that delete would follow the link to whatever row now occupies the slot. PostgreSQL guards the same case by comparing the next tuple's `xmin` with the previous one's `xmax`. An update always overwrites `next`, so only a delete or a lock can leave such a link behind.
 
 **`Deleted` is not "gone".** When an update replaces a version, the old version is `Deleted` and its successor is the row. The hop is what makes an update reached through an old locator work.
 
@@ -217,6 +233,7 @@ A chain v1 (created at t1), v2 (at t2), v3 (at t3):
 | t1 to t2 | v1 | `NotBornYet` → none |
 | t2 to t3 | v1 is `Deleted` → hop → v2 | v2 |
 | after t3 | v1 is `Deleted` → v2 is `Deleted` → v3 | v2 is `Deleted` → v3 |
+| v2's update rolled back, v2's slot reused by row R, then v1 deleted by Y at t4; snapshot after t4 | v1 is `Deleted`; R's creator is not Y → none | (v2's Tid now names R: an ordinary fetch of R) |
 
 The walk is bounded by the chain's length. A link to the page it is on that revisits a slot is corruption and asserts.
 
@@ -224,9 +241,9 @@ The walk is bounded by the chain's length. A link to the page it is on that revi
 
 Read committed uses this after `CommittedAfterSnapshot`. "Now" needs a definition, so the procedure is:
 
-1. **Take a fresh snapshot** (`TxnCtx::fresh_snapshot`, layer §6.7): a new read timestamp, waited for until it is closed. Everything committed before it is visible, nothing after it, and no later commit can slip in under it.
-2. **Wait for the row's holders.** Any transaction still writing the row, or holding a lock that conflicts, is waited for, with the bound; each is resolved through `VisibilitySource` and `WaitSource`.
-3. **Walk forward from the locator** with the fresh snapshot, by the walk above, and return the first `Live` version with its own Tid.
+1. **Wait for the row's holders.** Any transaction still writing the row, or holding a lock that conflicts, is waited for, with the bound; each is resolved through `VisibilitySource` and `WaitSource`.
+2. **Then take a fresh snapshot** (`TxnCtx::fresh_snapshot`, layer §6.7). Taking it after the wait is what makes a holder that committed during the wait visible: its commit timestamp is below the new read timestamp (round-3 fix V7).
+3. **Walk forward from the locator** with the fresh snapshot, by the walk above, and return the first `Live` version with its own Tid. If the walk meets a version whose writer is again in progress, go back to step 1.
 
 The executor then re-evaluates its predicate on that row and decides.
 
@@ -260,7 +277,7 @@ The engine has no visibility logic of its own. `Snapshot::row_visible` with the 
 
 **Applying.** The plan goes through `apply_prune`, which validates it against the image and transforms or refuses as a whole (page D2). The plan is the `HEAP_PRUNE` record (§9), so replay reproduces the verdicts without a status table.
 
-The **cleanup watermark** is injected as a function, never derived here. In version 1 it is the oldest read timestamp still in use (layer §11.7).
+The **cleanup watermark** is injected as a function, never derived here. It is the oldest read timestamp still in use on the leader, its followers and its replicas, because prune verdicts are replayed there (layer §11.7, round-3 fix V8).
 
 ### 7.2 The free space map (H12)
 
@@ -282,7 +299,7 @@ Most inserts never ask the map: they go to the hint page.
 
 **Why that is safe.**
 
-1. Every index entry of a row receives its delete word in the same mini-transaction group as the row's delete-mark or update (§4.6).
+1. Every index entry of a row receives its delete word from the same transaction, in the same statement, as the row's deleter stamp (§4.6). The entries are found through the HOT chain's root (§3), so every entry is reached however the engine found the row. What matters is the transaction, not the log group: the entry's delete word commits or aborts exactly when the row's deleter does. A crash between the two leaves the transaction in flight, and recovery aborts it, so neither stamp ever takes effect (round-3 fixes V4, V6).
 2. An entry's visibility is decided by its own two words (layer §6.6). No reader consults the heap to decide whether an entry is visible.
 3. Once the delete word's commit is older than the cleanup watermark, no snapshot that can still run sees the entry. So no reader follows the entry to the Tid. An entry that is still physically present points at a reused slot, but it is skipped before that.
 
@@ -306,7 +323,8 @@ A value too large for a row is stored apart from it, in a **hidden segment of th
 
 - **Chunks.** The value is cut into chunks, each a row of a hidden heap relation with a unique index on `(chunk_id, chunk_no)`. That is why this lands with `cascade-index` (Step 8) rather than with a page kind of its own.
 - **The pointer.** Where the value would sit in the row, the payload holds `[magic u32][chunk_id u64][total_len u32]`, and the row's `HAS_TOAST` flag is set. The magic word and the flag are the only format commitments made now; the chunk format, and whether values are compressed, are decided when this lands (§12).
-- **Writing.** A row's chunks are written in the row's statement. Deleting the row delete-marks its chunk rows in the same statement's work; they are then ordinary dead versions.
+- **Writing.** A row's chunks are written in the row's statement.
+- **Who owns the chunks (round-3 fix V22).** Chunks belong to a *value*, not to a version. An update that does not change a stored-apart value copies the pointer into the new version and leaves the chunks alone, so all versions that carry the pointer share them. The chunks are stamped deleted, in the same statement, only when the value stops being carried forward: when the row is deleted, or when an update replaces that value. They are then ordinary dead versions, and the usual watermark rule keeps them for exactly as long as an older snapshot can still see a version that names them. This is PostgreSQL's rule for TOAST.
 - **Reading.** `RowRef::value` reports that a column is stored apart, and `toast_value` fetches its chunks through the index and into the row's own buffer.
 
 ## 9. Redo Records (H8)
@@ -318,7 +336,7 @@ Record type bytes extend `cascade-wal-format`'s table and are never renumbered. 
 | 5 | `HEAP_INSERT` | `[segment u32][cell verbatim]` | Landed. Kept forever for replay of existing logs; **not emitted** once Step 4 lands |
 | 10 | `HEAP_INSERT_V2` | `[segment][page_no][slot][cell verbatim]` | Places the cell at the named slot. Replay reproduces the leader's layout exactly |
 | 11 | `HEAP_STAMP_DELETER` | `[segment][page_no][slot][deleter word][flag bits]` | Writes the deleter word and the flags. Used by delete, update and an exclusive row lock |
-| 12 | `HEAP_RELINK` | `[segment][page_no][slot][next word]` | Writes the chain word |
+| 12 | `HEAP_RELINK` | `[segment][page_no][slot][pointer and HEAP_ONLY bit]` | Writes the chain pointer and `HEAP_ONLY`; preserves the lock flags (round-3 fix V17) |
 | 13 | `HEAP_PRUNE` | `[segment][page_no][the plan's verdicts]` | Transforms the page by the plan. Verdicts, never a watermark (page D2) |
 | 14 | `HEAP_SLOT_FREE` | `[segment][page_no][slot]` | Marks the slot unused |
 | 40 | `FSM_SPAN_UPDATE` | `[segment][span page][heap page][value]` | Writes one span entry |
@@ -326,7 +344,7 @@ Record type bytes extend `cascade-wal-format`'s table and are never renumbered. 
 
 Three rules apply to all of them: the four redo laws (storage §12.4); a page's LSN is the end of its last record (layer §9.3); and replay applies a record only if its start is at or above the page's LSN.
 
-A group is the unit of atomicity. A HOT update is one group of records 11, 12 and 10. An update that is not HOT adds the index family's records to the same group. Nothing below a group is ever a replay boundary.
+A group is the unit of atomicity. A HOT update is one group of records 11, 12 and 10, and so is the row part of an update that is not HOT; its index changes follow as their own groups (layer §11.4). Nothing below a group is ever a replay boundary.
 
 **The gate before the log.** The cell encoder's own ceiling is the 16-bit length field, 65 509 bytes of payload, which is far above what a page holds. The engine refuses a cell larger than the most a fresh page holds — 8158 bytes, 8132 of payload — before anything is logged (§4.1). Until §8 lands such a row is refused with PostgreSQL's `54000`. The page format's fit rule, which determines that number, counts the slot entry an append writes for itself; it did not always do so, and the fix that made it is recorded in layer §16.
 
@@ -338,7 +356,7 @@ The page design's §6 pins the format: marker goldens, the parse refusal matrix,
 
 - **The chain walk.** For every chain shape and every snapshot time, `fetch` from every Tid in the chain returns what §5.2's table says. A property test over random update chains and random snapshots.
 - **Visibility end to end.** Random interleavings of begin, write, commit and abort through the in-memory seam and a scripted `VisibilitySource`; every snapshot's scan result equals the reference model's.
-- **Chain invariants.** A `HEAP_ONLY` link never leaves its page. No cycles.
+- **Chain invariants.** A `HEAP_ONLY` link never leaves its page. No cycles. A stale link left by a rolled-back cross-page update is never followed after its successor's slot is reused (V5). The root found for any version is the slot its index entries name (V4).
 - **The conflict table**, every row under every `WaitPolicy`, including the expiry of the wait bound and the poisoned paths.
 - **Row locks.** Two transactions cannot hold conflicting locks on one row; several can hold `FOR SHARE`; a plain read never waits; a lock survives an update that moves the row.
 - **Speculative insertion.** Two transactions race on one key; the loser's wait ends when the winner aborts the speculative insert, not when the winner's transaction ends.
@@ -388,13 +406,14 @@ Statuses mean: **Proposed**, awaiting the project owner; **Accepted**, by whom a
 | H1 | One main segment per relation, and a hidden one for out-of-line storage. Pages are scanned in `page_no` order; there is no page chain | Proposed |
 | H2 | A locator names one version. A HOT chain never crosses a page. A dead slot answers "no row" | Proposed |
 | H3 | The conflict check of §4.4. An exclusive row lock is recorded in the row's header; a shared one in the lock manager. `abort_speculative` stamps the deleter word and the entry's delete word | Proposed |
+| H2a | A delete or non-HOT update finds the row's index entries through the HOT chain root, derived from the page (§3) | Proposed (round-3 V4) |
 | H4 | A version is prunable when its creator and its deleter are resolved and older than the cleanup watermark. An in-progress stamp never is | Proposed |
 | H5 | The free-space map is kept on ordinary logged pages, kind 6, with values rounded to 32 bytes | Proposed |
-| H6 | Vacuum frees a slot once the row's death is older than the cleanup watermark. It does not wait for the row's index entries. Index vacuum is a separate pass | Proposed. It replaces kept §2's ordering rule |
+| H6 | Vacuum frees a slot once the row's death is older than the cleanup watermark. It does not wait for the row's index entries, because every entry is stamped by the same transaction that stamps the row (§7.3). Index vacuum is a separate pass | Proposed. It replaces kept §2's ordering rule. Restated in round 3 (V4, V6) |
 | H7 | Out-of-line values are chunks of a hidden heap relation with a unique index. The pointer format is reserved now and frozen at Step 8 | Proposed |
 | H8 | `HEAP_INSERT_V2` (type 10) names its page and slot. Emission switches at Step 4; type 5 stays replayable forever | Proposed |
 | H9 | While the record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order. Free-space placement and slot reuse begin with type 10 | **Accepted** (Kenneth, 2026-11-26). It supersedes the runtime plan's FR-46 acceptance that the two layouts may differ |
-| H10 | The chain walk of §5.2: `Deleted` hops to a successor, `NotBornYet` is "no row" | Proposed |
+| H10 | The chain walk of §5.2: `Deleted` hops to a successor whose creator equals the deleter, `NotBornYet` is "no row" | Proposed (hop check added in round 3, V5) |
 | H11 | A prune plan is computed while the page is pinned exclusively | Proposed |
 | H12 | The free-space map is a tree of maxima: span pages over 2048 heap pages, a root over spans | Proposed |
-| H13 | The re-check takes a fresh snapshot and waits for the row's holders before it walks (§5.2.1) | Proposed |
+| H13 | The re-check waits for the row's holders, then takes a fresh snapshot, then walks (§5.2.1) | Proposed (order corrected in round 3, V7) |
