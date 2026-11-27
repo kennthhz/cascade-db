@@ -1,6 +1,6 @@
 # Cascade DB Access Layer: Contracts, Engines and Migration
 
-**Status:** Draft v0.2 for review, 2026-11-26. v0.2 applies the review of v0.1 ([`access-design-review.md`](access-design-review.md), 30 findings): the contract types and the visibility rule are now stated in this document instead of being cited from retired ones, the migration steps are renamed and re-sequenced, and the design errors the review found are corrected (§16 lists them). This document is the single source of truth for the access layer (L5): the table access contract, the table engines, secondary indexes, sequences, temporary tables and maintenance. The detailed engine designs live beside their crates: the [btree design](../cascade-btree/AI/btree-design.md), the [heap design](../cascade-heap/AI/heap-design.md) and the [page design](../cascade-page/AI/storage-page-mutation-design.md). The engine semantics they refine are kept in [`engine-semantics.md`](engine-semantics.md).
+**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for access-api decisions C1, C5, C6 and C10 (accepted by Kenneth; see the [access-api design](../cascade-access-api/AI/access-api-design.md) and the [decision register](decision-register.md)). v0.2 applies the review of v0.1 ([`access-design-review.md`](access-design-review.md), 30 findings): the contract types and the visibility rule are now stated in this document instead of being cited from retired ones, the migration steps are renamed and re-sequenced, and the design errors the review found are corrected (§16 lists them). This document is the single source of truth for the access layer (L5): the table access contract, the table engines, secondary indexes, sequences, temporary tables and maintenance. The detailed engine designs live beside their crates: the [btree design](../cascade-btree/AI/btree-design.md), the [heap design](../cascade-heap/AI/heap-design.md) and the [page design](../cascade-page/AI/storage-page-mutation-design.md). The engine semantics they refine are kept in [`engine-semantics.md`](engine-semantics.md).
 
 **Upstream:** [`architecture-design.md`](../../../docs/architecture-design.md) v0.10.2 — §4.5 (transactions), §4.6 (access), §4.8 (core sets), §1 (design rules). Where the two disagree, the architecture wins unless layer §13.2 says this document proposes a change. **Storage foundations:** [`storage-layer-design.md`](../../02-storage/AI/storage-layer-design.md) v0.5 §12, whose rules bind every engine. **Formats:** in code, not in documents — `cascade-types` (version words), `cascade-page` (page layouts), `cascade-wal-format` (records), `cascade-pgtypes` (keys).
 
@@ -170,7 +170,9 @@ The decisions of the retired WP5 design (its D1–D15) are part of the contract 
 
 | Crate | Status | Contains | Depends on |
 | :--- | :--- | :--- | :--- |
-| `cascade-access-api` | To create | The contract of layer §6: the types, the in-memory fake and the conformance suite | `cascade-types`, `cascade-pgtypes` (A7), `cascade-telemetry` |
+| `cascade-txn-api` | To create (L4) | The transaction seams engines consume: `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule (layer §6.6), `WaitSource` (§6.5), `TxnCtx` and `StmtCtx` (§6.7), and a scripted fake of all of them. Started early, with only what the access contract needs (access-api C1) | `cascade-types` |
+| `cascade-access-api` | To create | The contract of layer §6: the types, the suite's trait, the in-memory fake and the conformance suite | `cascade-types`, `cascade-txn-api`, `cascade-pgtypes` (A7), `cascade-telemetry` |
+| `cascade-access` | To create | The dispatch enums `AnyTable`, `TableScan` and `Maintenance` (layer §6.1). It sits above the engines, because the enums name their types | `cascade-access-api` and every engine crate |
 | `cascade-page` | Landed | The page layer: prologue, kind registry and the heap format (kind 1); the B-tree and free-space-map formats as they land (A3) | `cascade-types` |
 | `cascade-btree` | Stub | The B+tree mechanism: descent, latching, structure changes, operations on byte keys | `cascade-types`, `cascade-page`, the page cache contract |
 | `cascade-heap` | Stub | The heap engine | `cascade-types`, `cascade-page`, the page cache contract, `cascade-access-api`, `cascade-index` once it exists |
@@ -186,7 +188,7 @@ Engines reach pages only through the page cache contract and never through `casc
 
 - **`cascade-page` is in this directory but is an L1 format authority.** The architecture's layer map puts every page layout there. The repository directory is historical: the page design §1 keeps the page format below both the engine and the storage-side consumers of its bytes.
 - **The key contract edge (A7).** `KeyBytes`, `KeyRange` and `IndexEntry::Locator` live in `crates/07-sql/cascade-pgtypes`. Their long-term home is `cascade-datum` (L1), which does not exist yet. Until then `cascade-access-api` depends on `cascade-pgtypes`, an upward edge (05 → 07) that breaks the repository's layering convention. It is a named exception in the layering check and it ends when the key contract moves. No access-layer type may name any other `07-sql` item. `Datum`, `Row`, `Projection` and `ColumnSet` (layer §6.2) move with it.
-- **The visibility seam (A8).** Engines name `Snapshot` and `VisibilitySource`, never the runtime. Both are implemented by the runtime's `txnmgr` today and by `cascade-scope-txn` after the transaction layer is split out, with no engine change.
+- **The visibility seam (A8).** Engines name `Snapshot` and `VisibilitySource`, never the runtime. Both are declared in `cascade-txn-api` (L4), as architecture §4.5 places them (access-api C1, decided 2026-11-27). No implementation exists yet: the runtime's `txnmgr` is only a clock today (decision register D-2). `cascade-scope-txn` will implement them, with no engine change.
 - **The mini-transaction seam.** Engines name one injected type (layer §9.1). Its owner is the page cache, which is the only crate allowed to change a page.
 - **`cascade-mvcc` and `cascade-undo` are pre-pivot stubs.** Their context files describe a design that was replaced. `cascade-heap`'s dependency on them is removed at Step 5. `cascade-undo` returns as a dependency of `cascade-iot` only: the heap has no undo (page §2).
 
@@ -199,10 +201,13 @@ This section is the whole contract. Every type the executor sees is defined here
 ### 6.1 Dispatch — an enum, not `dyn` or generics
 
 ```rust
+// In cascade-access, above the engine crates (access-api C1).
 pub enum AnyTable { Iot(IotTable), Heap(HeapTable), Temp(TempTable) }
 ```
 
-`AnyTable` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in the executor, in this repository, so adding it is a compile-time change and not a contract break.
+`AnyTable` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in this repository, so adding it is a compile-time change and not a contract break.
+
+**Where the enum lives (access-api C1).** Not in `cascade-access-api`: the enum names `IotTable`, `HeapTable` and `TempTable`, and every engine crate depends on the contract crate, so the enum there would be a dependency cycle. It lives in `cascade-access`, a thin crate above all the engines.
 
 **Why there is also a trait (A13).** The rule behind it is one sentence: **write the tests once, and make every engine pass the same tests.** If each engine had its own hand-written tests, bugs would hide in the gaps between them. Running one test suite against four different engines needs a common plug — in Rust, a trait. But the official API must not be a trait, for the reasons above. So there are two doors with different jobs: the **trait is the private plug the test suite uses**, and the **enum is the public front door, whose methods only forward** to the plug. Since the front door only forwards, whatever a user can ask for goes to the thing the tests tested — there is no side door for an untested path to hide in. The trait is never in a production signature, so the rejection of traits above is about the public API and does not change.
 
@@ -366,6 +371,9 @@ pub enum WaitFor {
 /// What one wait ended with.
 pub enum Waited { Resolved, TimedOut }
 
+// Declared in cascade-txn-api (access-api C1). Because L4 cannot name an L5 type, the
+// shared-lock target is an opaque lock key built from the relation and the locator's bytes
+// in the final form (access-api C8).
 pub trait WaitSource: Send + Sync {
     fn wait<'a>(&'a self, ctx: &'a OpCtx<'_>, waiter: TxnId, what: WaitFor,
                 deadline: Option<Instant>) -> LocalBoxFuture<'a, Waited>;
@@ -387,6 +395,7 @@ pub trait WaitSource: Send + Sync {
 One rule decides every row version and every index entry. Engines and index code call it; nothing else interprets a version word.
 
 ```rust
+// Declared in cascade-txn-api (access-api C1).
 pub struct Snapshot { pub read_ts: Hlc, pub own: Option<TxnId> }
 
 pub enum TxnStatus { InProgress, Committed { ts: Hlc }, Aborted }
@@ -451,11 +460,13 @@ pub struct TxnCtx { /* scope and epoch, the writer's TxnId once assigned, the st
 
 impl TxnCtx {
     /// Read committed: a new snapshot. Repeatable read and serializable: the transaction's.
-    pub fn begin_statement(&mut self) -> &mut StmtCtx;
+    /// Async: a new snapshot waits until its read timestamp is closed (access-api C5).
+    pub async fn begin_statement(&mut self) -> Result<&mut StmtCtx, Fenced>;
     /// Releases statement-scoped state and aborts speculative tokens left unresolved.
-    pub fn end_statement(&mut self);
+    /// Returns the speculative tokens left unresolved; the executor aborts them (access-api C6).
+    pub fn end_statement(&mut self) -> Vec<SpecId>;
     /// A new snapshot, waited for until its read timestamp is closed. For fetch_latest_committed.
-    pub fn fresh_snapshot(&mut self) -> Snapshot;
+    pub async fn fresh_snapshot(&mut self) -> Result<Snapshot, Fenced>;
 }
 
 pub struct StmtCtx {
@@ -465,7 +476,7 @@ pub struct StmtCtx {
 }
 ```
 
-The transaction layer constructs `TxnCtx`; the contract fixes only what engines consume. The context carries the scope's epoch, and every engine call checks it: a call for an epoch the scope no longer holds returns `TamError::Fenced` before touching a page. That is a runtime outcome, not an assertion, because an epoch changes under a running transaction by design — a failover, or a scope reopened after a log failure.
+`TxnCtx` is a concrete struct in `cascade-txn-api`, built by the transaction layer from four injected services: a clock with closed-timestamp waits, the `VisibilitySource`, the `WaitSource` and the scope's epoch (access-api C5). Engines consume it and never construct it. The context carries the scope's epoch, and every engine call checks it: a call for an epoch the scope no longer holds returns `TamError::Fenced` before touching a page. That is a runtime outcome, not an assertion, because an epoch changes under a running transaction by design — a failover, or a scope reopened after a log failure.
 
 ### 6.8 Reads and the scan protocol
 
@@ -488,7 +499,7 @@ Composing an upsert above the contract (look up the key, then insert or update) 
 2. **`complete_speculative(txn, token)`** changes nothing in storage. The insert becomes an ordinary one.
 3. **`abort_speculative(txn, token)`** **does change bytes.** The transaction goes on running (`ON CONFLICT DO UPDATE`, `DO NOTHING`), so the row must stop existing at once. The engine stamps the row's deleter and the entry's delete word with the writer's uncommitted word, as one mini-transaction. From then on the row is `Deleted { own: true }` for the writer, and for every other transaction it is invisible whatever the writer's outcome, because the same transaction created and deleted it.
 
-Two consequences for the conflict protocol. An entry whose create and delete words name the same in-flight transaction is not a conflict. Waiters for a key are woken when its delete word lands, not only when a transaction ends. A token that the statement leaves unresolved is aborted by the engine at `end_statement`.
+Two consequences for the conflict protocol. An entry whose create and delete words name the same in-flight transaction is not a conflict. Waiters for a key are woken when its delete word lands, not only when a transaction ends. A token that the statement leaves unresolved is returned by `end_statement`, and the executor aborts it through `AnyTable::abort_unresolved` (access-api C6); `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches a list that is dropped.
 
 ### 6.10 Row locks (A11)
 
@@ -575,7 +586,7 @@ An engine is constructed from a descriptor and a `TableEnv`. Engines never read 
 
 This section is A13 applied. The rule: **write the tests once; every engine takes the same test.** The tests plug into a private trait (§6.1); four implementations plug in beside them — the fake always, the three engines as they land. What each of the four is:
 
-- **A fake engine**: a multi-version table in memory with no pages and no log. Versions are `(creator, deleter, payload)` triples resolved through the same visibility rule, and conflicts come from a scripted `VisibilitySource`. It implements the trait like a real engine. It is the executor's test double, and its machinery is the base of the temporary-table engine (§11.6) — which is why the temporary arm is cheap to add.
+- **A fake engine**: a multi-version table in memory with no pages and no log. Versions are `(creator, deleter, payload)` triples resolved through the same visibility rule, and conflicts come from a scripted `VisibilitySource`. It implements the trait like a real engine, in two locator flavours: `Heap`, where a locator names one version and every update moves it, and `Iot`, where the locator is the primary key and moves only when the key changes (access-api C10). The suite checks locator movement against both, and each engine is compared with its flavour. It is the executor's test double, and its machinery is the base of the temporary-table engine (§11.6) — which is why the temporary arm is cheap to add.
 - **A conformance suite**: one test per promise of §6, written as generic functions over the test-only trait, and run against every implementation of it — the fake and, as they land, the three engines. Because `AnyTable` delegates to the trait (§6.1), passing the suite is not a parallel obligation the engines can drift away from: it is the same code the executor reaches.
 
 The suite covers: every outcome under each `WaitPolicy`; the read-committed re-check; locator movement; the scan protocol (rescan, mark/restore, drop); speculative arbitration, including two transactions racing on one key; poisoning and fencing; and the visibility truth table against a scripted status source.

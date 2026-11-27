@@ -34,17 +34,6 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Blocks** | Step 4; the real conformance runs of every engine |
 | **Status** | Open |
 
-### D-3. Where `Snapshot` and the visibility rule live
-
-| | |
-| :--- | :--- |
-| **Question** | Architecture §4.5 puts `Snapshot` and `Snapshot::visible` in `cascade-txn-api` (L4). The layer design §6.6 (A8) defines them in `cascade-access-api` (L5). `TxnCtx` is likewise "constructed by the transaction layer" but defined in L5. |
-| **Options** | (a) Move `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule and `TxnCtx` to `cascade-txn-api`; `cascade-access-api` depends on it. (b) Keep them in `cascade-access-api` and change the architecture. |
-| **Recommendation** | (a). Index kinds and the undo walk use the same rule, and L4 owning it matches the architecture. Until `cascade-txn-api` exists, they can sit in a module of `cascade-access-api` that moves without changing signatures. |
-| **Owner** | Kenneth |
-| **Blocks** | Step 1 (the contract's crate layout) |
-| **Status** | Open |
-
 ### D-4. The mini-transaction seam and the page cache
 
 | | |
@@ -110,10 +99,26 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | D-9e | In the Step 3 slice a row is reserved and applied in the commit path, so a transaction cannot read its own uncommitted inserts | Accept for Step 3 and say so in the step's notes, or apply at insert and filter by an in-memory "own rows" set | Step 3 |
 | D-9f | A shared free-space predicate for `cascade-page` and `cascade-redo` instead of a mirror | Do it with the next change to either | — |
 
+### D-10. The access-api implementation design (Step 1)
+
+| | |
+| :--- | :--- |
+| **Question** | Accept decisions C1–C13 of the [access-api design](../cascade-access-api/AI/access-api-design.md)? |
+| **Highlights** | C1: three crates, because `AnyTable` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `AnyTable` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
+| **Recommendation** | Accept as written, or comment on the PR |
+| **Owner** | Kenneth |
+| **Blocks** | Step 1 |
+| **Status** | Partly decided. C1, C5, C6 and C10 accepted by Kenneth on 2026-11-27, and C8's opaque lock key with them, since C1 forbids L4 naming an L5 type. C2, C3, C4, C7, the rest of C8, and C9, C11, C12, C13 are still open |
+
 ## 2. Decided
 
 | # | Decision | By, when |
 | :--- | :--- | :--- |
+| D-3 | `Snapshot`, the visibility rule, `WaitSource` and `TxnCtx` live in a new, small `cascade-txn-api` (L4), created now with only what the access contract consumes (access-api C1) | Kenneth, 2026-11-27 |
+| C1 | Three crates: `cascade-txn-api`, `cascade-access-api`, and `cascade-access` for the dispatch enums above the engines | Kenneth, 2026-11-27 |
+| C5 | `TxnCtx` is concrete in `cascade-txn-api`; `begin_statement` and `fresh_snapshot` are async | Kenneth, 2026-11-27 |
+| C6 | `end_statement` returns unresolved speculative tokens; the executor aborts them | Kenneth, 2026-11-27 |
+| C10 | One fake engine with two locator flavours, `Heap` and `Iot` | Kenneth, 2026-11-27 |
 | H9 | While the heap insert record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order | Kenneth, 2026-11-26 |
 
 ## 3. Deferred
