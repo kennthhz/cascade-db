@@ -269,9 +269,6 @@ impl Router {
         nic_numa: Option<u32>,
         handshake_timeout_ms: u64,
         tick_init: crate::orchestrator::OrchestratorInit,
-        designated: Vec<(u32, SharedSender<crate::handoff::ControlMsg>)>,
-        checkpoint: crate::checkpointer::CheckpointStats,
-        recycle: Option<crate::recycler::RecycleInit>,
         shutdown: Option<crate::shutdown::ServingShutdown>,
         drain: Vec<(u32, bool, SharedSender<crate::shutdown::DrainMsg>)>,
         reap: Option<crate::reaper::ReapInit>,
@@ -310,9 +307,12 @@ impl Router {
             // The orchestrator is serving-thread-local (its jobs may hold
             // executor-bound state). Assemble it here, before the accept
             // loop, so the first tick can never fire into an unregistered
-            // job: the stall watch first (T4.1), then the checkpointer's
-            // fanout (T4.2, FR-31) over this executor-connected control
-            // senders.
+            // job: the stall watch (T4.1). (The checkpointer's fanout and
+            // the WAL recycler that registered after it retired with
+            // storage migration step M8: the buffer pool no longer writes
+            // pages back, so there is no flush pass to fan out and no
+            // truncatable frontier for a recycler to consume — the log
+            // store owns retention, storage design §5.6.)
             let wakeups = tick_init.wakeups;
             let mut orchestrator = crate::orchestrator::Orchestrator::from_counters(
                 tick_init.interval,
@@ -324,31 +324,8 @@ impl Router {
                 tick_init.stall_soft,
                 tick_init.stall_hard,
             )));
-            let mut sites = Vec::with_capacity(designated.len());
-            for (numa, tx) in designated {
-                sites.push((numa, tx.connect().await));
-            }
-            // The recycler (T4.3, FR-32) registers AFTER the fanout (T4.2):
-            // it consumes the frontier the checkpointer's passes advance,
-            // so on one tick the recycler observes the fresh value. It
-            // rides its OWN channel — SPSC means it cannot share the
-            // fanout's senders — whose receiving end sits on the WAL-home
-            // NUMA's designated reactor; the targeting is the isolation,
-            // and the fanout's set stays exactly the T4.2 full one.
-            orchestrator.register(Box::new(crate::checkpointer::CheckpointFanout::new(
-                sites, checkpoint,
-            )));
-            if let Some(init) = recycle {
-                let sender = init.sender.connect().await;
-                orchestrator.register(Box::new(crate::recycler::WalRecycler::new(
-                    init.db,
-                    sender,
-                    init.truncatable,
-                    init.stats,
-                )));
-            }
-            // The drain channels (T4.4) are the third signal family —
-            // connected here on the serving executor, held as plain locals
+            // The drain channels (T4.4) — connected here on the serving
+            // executor, held as plain locals
             // (they are NOT tick jobs; only the drain uses them, and the
             // drain is one-shot). The middle flag marks the WAL-home
             // reactor — the drain keys step 3's ack on it, never on slot
@@ -357,7 +334,9 @@ impl Router {
             // Family order here is load-bearing (T4.5): a `connect` blocks
             // until the peer endpoint connects on its own executor, so the
             // serving side must connect the families in the SAME order the
-            // workers do (handoff → control → recycle → drain → reap).
+            // workers do (handoff → drain → reap; the control and recycle
+            // families that used to sit between handoff and drain retired
+            // with storage M8).
             // Connecting the reaper BEFORE the drain deadlocked the boot:
             // the serving thread waited inside reap-sender #0 for a worker
             // that was itself still waiting inside its drain connect — for
@@ -366,12 +345,12 @@ impl Router {
             for (numa, is_home, tx) in drain {
                 drain_senders.push((numa, is_home, tx.connect().await));
             }
-            // The reaper (T4.5, FR-34) registers last: unlike the
-            // recycler it has no producer/consumer dependency on the
-            // others (it reads no frontier, writes no LSN), so the tick
-            // order carries no correctness here — the CONNECT order above
-            // is what must mirror the workers. Its fanout targets EVERY
-            // worker: idle connections live on all rings, not just
+            // The reaper (T4.5, FR-34) runs after the drain: unlike the
+            // retired recycler it has no producer/consumer dependency on
+            // the others (it reads no frontier, writes no LSN), so the
+            // tick order carries no correctness here — the CONNECT order
+            // above is what must mirror the workers. Its fanout targets
+            // EVERY worker: idle connections live on all rings, not just
             // designated ones.
             if let Some(init) = reap {
                 let mut senders = Vec::with_capacity(init.senders.len());

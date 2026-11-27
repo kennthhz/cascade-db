@@ -58,10 +58,6 @@ fn temp_dir(tag: &str) -> PathBuf {
 struct Fixture {
     addr: String,
     wal_dir: PathBuf,
-    /// The checkpointer's counters, cloned out before `shutdown` consumes
-    /// the runtime — the Arcs stay live, so `passes()` read afterwards is
-    /// the workers' real total (proves the final flush RAN).
-    checkpoint: Option<cascade_runtime::CheckpointStats>,
     rt: Runtime,
 }
 
@@ -92,11 +88,9 @@ fn boot(wal: bool, tick_ms: u64, drain_deadline_s: u64) -> Fixture {
     cascade_runtime::testutil::arm_suite_watchdog();
     let rt = Runtime::boot_routed(&cfg, &topo, Some(listener), AuthConfig::default(), None)
         .expect("boot routed");
-    let checkpoint = rt.checkpoint_stats().cloned();
     Fixture {
         addr: format!("127.0.0.1:{port}"),
         wal_dir: wal_dir.expect("fixture asked for a wal dir"),
-        checkpoint,
         rt,
     }
 }
@@ -147,13 +141,9 @@ fn drain_order_is_the_102_sequence() {
         // Clean Terminate: the connection drops, the gauge drains — the
         // shutdown below waits on an idle fleet.
     }
-    // Baseline before shutdown: no ticks fired (10 s grid), so no pass
-    // signal ever reached a worker.
-    assert_eq!(
-        fx.checkpoint.as_ref().expect("serving boot").passes(),
-        0,
-        "an idle 10s tick grid must not have flushed anything yet"
-    );
+    // (The old baseline — "the 10 s tick grid sent no flush pass yet" —
+    // retired with storage M8: there are no flush passes at all anymore;
+    // the trace assertions below carry the proof the drain behaved.)
 
     let wal = fx.rt.debug_wal().cloned().expect("wal booted");
     let started = Instant::now();
@@ -169,7 +159,7 @@ fn drain_order_is_the_102_sequence() {
             "refuse-new",
             "sessions-drained",
             "final-wal-flush",
-            "final-bpm-flush",
+            "final-flush-acks",
             "reactors-dropped",
         ],
         "the drain order is the §10.2 sequence"
@@ -180,14 +170,10 @@ fn drain_order_is_the_102_sequence() {
         elapsed < Duration::from_secs(4),
         "an idle fleet drains in well under the 5s deadline: {elapsed:?}"
     );
-    // The final pass RAN on the designated reactor — unconditionally, not
-    // gated on "nothing dirty" (the live pool scans nothing; the trace's
-    // `final-bpm-flush` plus this counter is the proof it was not skipped).
-    assert_eq!(
-        fx.checkpoint.as_ref().expect("serving boot").passes(),
-        1,
-        "exactly one pass — the final flush's"
-    );
+    // The final flush acked on every designated reactor — unconditionally,
+    // not gated on "anything dirty" (storage M8: pages are never written
+    // back, so the acks plus the trace's `final-flush-acks` are the proof
+    // the drain reached every reactor and the tail was flushed).
     // The WAL tail is fully durable: what was written is what was synced.
     assert_eq!(
         wal.durable(),
@@ -358,7 +344,7 @@ fn ddl_in_flight_at_shutdown_drains_cleanly() {
             "refuse-new",
             "sessions-drained",
             "final-wal-flush",
-            "final-bpm-flush",
+            "final-flush-acks",
             "reactors-dropped",
         ],
         "the drain carried the bounce to a fully clean shutdown: {:?}",

@@ -44,7 +44,7 @@ pub struct Tick {
 /// housekeeper thread. No `Send` bound on purpose: the orchestrator is
 /// serving-thread-local by construction (boot ships [`OrchestratorInit`],
 /// the serving thread assembles), so a job may hold executor-bound state
-/// — the checkpointer's fanout holds connected channel senders.
+/// — connected channel senders, as the retired checkpointer fanout held.
 pub trait TickJob {
     fn name(&self) -> &str;
     fn tick(&mut self, info: &Tick);
@@ -53,8 +53,8 @@ pub trait TickJob {
 /// The `Send` ingredient set boot hands the serving thread: everything
 /// the orchestrator and its boot-time jobs need, minus the orchestrator
 /// itself (which the serving thread assembles via
-/// [`Orchestrator::from_counters`] and populates — stall watch, then the
-/// checkpointer's fanout).
+/// [`Orchestrator::from_counters`] and populates — the stall watch, since
+/// the checkpointer's fanout and the recycler retired with storage M8).
 pub struct OrchestratorInit {
     pub interval: Duration,
     pub ticks: Arc<AtomicU64>,

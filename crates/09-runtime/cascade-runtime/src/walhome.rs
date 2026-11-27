@@ -100,17 +100,18 @@ pub fn derive_wal_home(db: DatabaseId, pools: &PoolRegistry) -> Option<u32> {
 
 /// The registry-free form of [`derive_wal_home`]: same hash, same order,
 /// over bare NUMA numbers. Boot needs this BEFORE the pool registry
-/// exists — the T4.3 recycler's target (`db` → home NUMA) must be
+/// exists — the dev DB's WAL home (`db` → home NUMA; the shutdown tail
+/// flush's target since the recycler retired with storage M8) must be
 /// resolved before the housekeepers spawn, because resolution reads the
 /// persisted-homes file and the housekeeper must never touch I/O at tick
 /// time (the syscall-layer no-I/O tests would catch it).
 ///
 /// The list must be the DESIGNATED numas — one entry per numa that has a
-/// worker (and so a reactor that can flush the tail and stamp the clean
-/// marker), not every pool numa (M4, post-M5 review): a home derived
+/// worker (and so a reactor that can flush the tail), not every pool
+/// numa (M4, post-M5 review): a home derived
 /// onto a worker-less pool numa has no designated reactor, the drain
-/// finds no flagged sender, and the marker is refused every shutdown —
-/// every restart would replay as a crash. Boot passes the designated
+/// finds no flagged sender, and the tail flush is refused every
+/// shutdown. Boot passes the designated
 /// set; the registry form above cannot know it, so it documents the
 /// burden.
 pub fn derive_wal_home_from_numas(db: DatabaseId, designated_numas: &[u32]) -> Option<u32> {
@@ -126,7 +127,7 @@ pub fn derive_wal_home_from_numas(db: DatabaseId, designated_numas: &[u32]) -> O
 /// when it is still a DESIGNATED numa — one a reactor lives on, the only
 /// place the tail can flush and the marker can stamp (else warns and
 /// re-derives) — falling back to derivation on first boot. Boot resolves
-/// each DB's home once, early — the recycler's target and the writer
+/// each DB's home once, early — the shutdown tail flush and the writer
 /// construction both consume the same value, so the two can never drift.
 pub fn resolve_wal_home(
     db: DatabaseId,

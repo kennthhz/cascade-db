@@ -36,11 +36,10 @@ use cascade_storage_api::KeyRef;
 use cascade_wal::WalWriter;
 
 use crate::{
-    checkpointer::{CheckpointSite, CheckpointStats, TruncatableLsn},
     config::{AuthConfig, RuntimeConfig, SmtMode},
     coop::{self, ReactorStall},
     deployment,
-    handoff::{ControlMsg, Handoff},
+    handoff::Handoff,
     pin::{self, PinError},
     pools::PoolRegistry,
     router::Router,
@@ -87,14 +86,6 @@ pub struct Runtime {
     /// listener was given — D9 centralizes background work on the
     /// *serving* housekeeper, so a compute-only boot never ticks.
     orchestrator: Option<crate::orchestrator::OrchestratorStats>,
-    /// The checkpointer's orchestration counters (T4.2, FR-31), same
-    /// presence rule as `orchestrator`: nothing orchestrates without a
-    /// serving housekeeper.
-    checkpoint: Option<CheckpointStats>,
-    /// The recycler's orchestration counters (T4.3, FR-32). Present only
-    /// when something serves AND a WAL exists — no listener means nothing
-    /// orchestrates; no `wal_dir` means there is nothing to recycle.
-    recycle: Option<crate::recycler::RecycleStats>,
     /// The reaper's orchestration counters (T4.5, FR-34). Present only
     /// when something serves AND a reap rule is enabled: a nonzero
     /// `idle_reap_ms` (opt-in — a default that kills idle client
@@ -102,12 +93,6 @@ pub struct Runtime {
     /// (the default — the wedged-backend containment bounds a stuck
     /// statement at 30 s).
     reap: Option<crate::reaper::ReapStats>,
-    /// The per-DB WAL-truncatable frontier (T4.3's recycler reads it),
-    /// present whenever a WAL was configured. Stays at 0 until passes
-    /// actually flush stamped pages — which, with no live worker BPM yet,
-    /// means the whole log stays reclaimable-by-nothing (the module doc's
-    /// safety argument).
-    truncatable: Option<Arc<TruncatableLsn>>,
     /// The flag [`Runtime::shutdown`] sets to start §10.2 on the serving
     /// thread (T4.4) — and to release the parked housekeepers (their park
     /// loop checks it on every wake, so a listenerless boot's shutdown is
@@ -390,19 +375,14 @@ impl Runtime {
         let n_workers: usize = cfg.worker_cores.iter().map(|w| w.cores.len()).sum();
         let mut senders = Vec::with_capacity(n_workers);
         let mut receivers = Vec::with_capacity(n_workers);
-        let mut control_tx = Vec::with_capacity(n_workers);
-        let mut control_rx = Vec::with_capacity(n_workers);
         let mut counters: Vec<Arc<crate::stats::WorkerCounters>> =
             Vec::with_capacity(n_workers);
         let mut tenant_counters: Vec<Arc<TenantCounters>> = Vec::with_capacity(n_workers);
         let mut stalls: Vec<Arc<ReactorStall>> = Vec::with_capacity(n_workers);
         for _ in 0..n_workers {
             let (tx, rx) = new_bounded::<Handoff>(1024);
-            let (ctx, crx) = new_bounded::<ControlMsg>(64);
             senders.push(tx);
             receivers.push(rx);
-            control_tx.push(ctx);
-            control_rx.push(crx);
             counters.push(Arc::new(crate::stats::WorkerCounters::new()));
             tenant_counters.push(Arc::new(TenantCounters::new()));
             stalls.push(Arc::new(ReactorStall::new()));
@@ -481,12 +461,12 @@ impl Runtime {
         // pointer copy afterwards.
         let tierc = Arc::clone(&tierc_plane.catalog);
         // T4.1 (D9, FR-5, FR-31's frame): when serving, the first
-        // housekeeper owns the orchestrator tick loop — §M4 background jobs
-        // (stall sampling, checkpointer fanout now; recycler, reaper,
-        // statistics later) run on its thread between accepts. Boot ships
-        // only the Send ingredient bundle; the serving thread assembles
-        // the orchestrator and registers its jobs (some hold
-        // executor-bound state — connected control senders — so the
+        // housekeeper owns the orchestrator tick loop — background jobs
+        // (stall sampling, reaper; the checkpointer fanout and the WAL
+        // recycler retired with storage M8) run on its thread between
+        // accepts. Boot ships only the Send ingredient bundle; the serving
+        // thread assembles the orchestrator and registers its jobs (some
+        // hold executor-bound state — connected drain senders — so the
         // orchestrator itself never crosses a thread). Without a listener
         // nothing serves and nothing ticks: the compute-only `boot` shape.
         let (tick_init, orchestrator_stats) = if listener.is_some() {
@@ -512,51 +492,39 @@ impl Runtime {
         } else {
             (None, None)
         };
-        // T4.2 (FR-31): the checkpointer. The truncatable frontier exists
-        // whenever a WAL exists (the recycler reads it, T4.3); the fanout
-        // job exists only when something orchestrates (D9: the serving
-        // housekeeper — it registers on that thread, once the control
-        // senders are connected against its executor). Designated reactor
-        // per NUMA pool = the first worker on that pool's NUMA; the other
-        // workers' control senders drop here (their loops end quietly;
-        // nothing can signal them).
-        let truncatable = cfg
-            .wal_dir
-            .is_some()
-            .then(|| Arc::new(TruncatableLsn::new()));
-        let checkpoint_passes = Arc::new(AtomicU64::new(0));
-        let recycle_passes = Arc::new(AtomicU64::new(0));
-        let recycle_reclaimed = Arc::new(AtomicU64::new(0));
-        let mut designated: Vec<(u32, glommio::channels::shared_channel::SharedSender<ControlMsg>)> =
-            Vec::new();
+        // The designated NUMA set: the first worker's NUMA per pool, in
+        // config order — the WAL-home derivation's honest candidate set
+        // and the drain channels' targeting. (The checkpointer's fanout
+        // and the recycler that used to ride the per-worker control
+        // channels retired with storage migration step M8: the buffer
+        // pool no longer writes pages back — the log is the only durable
+        // write and only the page store writes pages — so there is no
+        // flush pass to fan out, no truncatable frontier for a recycler
+        // to consume, and the log store owns retention (§5.6).)
+        let mut designated_numas: Vec<u32> = Vec::new();
         {
             let mut seen = HashSet::new();
-            for (numa, tx) in worker_numas.iter().zip(control_tx) {
+            for numa in &worker_numas {
                 if seen.insert(*numa) {
-                    designated.push((*numa, tx));
+                    designated_numas.push(*numa);
                 }
             }
         }
-        let checkpoint_stats = listener
-            .is_some()
-            .then(|| CheckpointStats::new(Arc::clone(&checkpoint_passes)));
-        // T4.3 (FR-32): the recycler's target — the dev DB's WAL-home
-        // NUMA — is resolved HERE, before the housekeepers spawn. Tick
-        // time is too late: resolution reads the persisted-homes file,
-        // and the housekeeper must never touch I/O (the syscall-layer
-        // tests would catch it). The writer-construction step below
-        // reuses the same decision, so the two can never drift.
-        // Derivation runs over the DESIGNATED numas, not every pool
-        // numa (M4, post-M5 review): a home on a worker-less pool numa
-        // has no designated reactor to flush its tail or stamp its
-        // marker, so the honest candidate set is exactly the numas the
-        // drain flags — `designated`, built above.
+        // The dev DB's WAL-home NUMA — the shutdown tail-flush's target —
+        // is resolved HERE, before the housekeepers spawn (the T4.3
+        // reasoning, now serving the drain's final flush): tick time is
+        // too late, resolution reads the persisted-homes file, and the
+        // housekeeper must never touch I/O (the syscall-layer tests would
+        // catch it). The writer-construction step below reuses the same
+        // decision, so the two can never drift. Derivation runs over the
+        // DESIGNATED numas, not every pool numa (M4, post-M5 review): a
+        // home on a worker-less pool numa has no designated reactor to
+        // flush its tail, so the honest candidate set
+        // is exactly `designated_numas`, built above.
         let (persisted_homes, dev_home) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
                 let persisted = walhome::read_homes(dir);
-                let designated_numas: Vec<u32> =
-                    designated.iter().map(|(numa, _)| *numa).collect();
                 let home = walhome::resolve_wal_home(
                     dev,
                     &initial.resolve(Some("dev")),
@@ -567,39 +535,13 @@ impl Runtime {
             }
             None => (HashMap::new(), None),
         };
-        let recycle_stats = (listener.is_some() && cfg.wal_dir.is_some()).then(|| {
-            crate::recycler::RecycleStats::new(
-                Arc::clone(&recycle_passes),
-                Arc::clone(&recycle_reclaimed),
-            )
-        });
-        // The recycler's dedicated channel (T4.3): SPSC means it cannot
-        // share a sender with the checkpoint fanout, and that is the
-        // point — the fanout's set stays whole while the recycle signal
-        // is structurally unable to reach any reactor but the home one.
-        let (recycle_tx, recycle_rx) = recycle_stats
-            .is_some()
-            .then(|| new_bounded::<crate::recycler::RecycleSignal>(64))
-            .unzip();
-        let recycle_init = match (recycle_tx, dev_home, recycle_stats.clone()) {
-            (Some(sender), Some(_home), Some(stats)) => {
-                let trunc = Arc::clone(truncatable.as_ref().expect("wal dir implies a frontier"));
-                Some(crate::recycler::RecycleInit {
-                    db: crate::tenant::dev_context().db,
-                    sender,
-                    truncatable: trunc,
-                    stats,
-                })
-            }
-            _ => None,
-        };
         let mut computed_plan: Option<crate::recovery::RecoveryPlan> = None;
         let (wal, wal_homes) = match cfg.wal_dir.as_ref() {
             Some(dir) => {
                 let dev = crate::tenant::dev_context().db;
-                // The same home the recycler targets (resolved above,
-                // before the housekeepers spawned) — one decision, two
-                // consumers.
+                // The same home the drain's tail flush targets (resolved
+                // above, before the housekeepers spawned) — one decision,
+                // two consumers.
                 let home = dev_home.expect("wal dir implies a resolved home");
                 // M6 (storage §9): boot opens the LOCAL LOG STORE, runs
                 // recovery through it, and opens the writer on its sink —
@@ -742,28 +684,30 @@ impl Runtime {
             }
         });
         // The drain channels (T4.4): one SPSC channel per designated
-        // reactor — the third signal family (control: T4.2, recycle:
-        // T4.3), so §10.2's one-shot final flushes never queue behind tick
-        // traffic and vice versa. The HOME IDENTITY rides the tuple —
-        // the home is derived over the designated set (M4), so a flagged
-        // sender always exists; the flag check remains the honest
+        // reactor, so §10.2's one-shot final flushes never queue behind
+        // tick traffic and vice versa. (The control and recycle families
+        // that preceded it retired with storage M8; the drain is now the
+        // first background signal family.) The HOME IDENTITY rides the
+        // tuple — the home is derived over the designated set (M4), so a
+        // flagged sender always exists; the flag check remains the honest
         // backstop (a persisted home naming a since-undesignated numa
         // re-derives above, but the drain never assumes). Empty on a
         // listenerless boot.
         let (drain_tx, drain_rx_by_numa) = if listener.is_some() {
             let mut txs = Vec::new();
             let mut rxs = Vec::new();
-            for (numa, _) in &designated {
+            for &numa in &designated_numas {
                 let (tx, rx) = new_bounded::<crate::shutdown::DrainMsg>(8);
-                txs.push((*numa, Some(*numa) == dev_home, tx));
-                rxs.push((*numa, rx));
+                txs.push((numa, Some(numa) == dev_home, tx));
+                rxs.push((numa, rx));
             }
             (txs, rxs)
         } else {
             (Vec::new(), Vec::new())
         };
-        // The reap channels (T4.5, FR-34): the FOURTH signal family
-        // (control: T4.2, recycle: T4.3, drain: T4.4) — SPSC forbids
+        // The reap channels (T4.5, FR-34): the SECOND signal family (the
+        // drain: T4.4; the control and recycle families that preceded it
+        // retired with storage M8) — SPSC forbids
         // sharing, and targeting = scope again, but the scope differs:
         // idle connections live on EVERY worker, not just designated
         // ones, so this family fans out one channel per worker core
@@ -821,9 +765,6 @@ impl Runtime {
             tierc_plane,
             initial,
             tick_init,
-            designated,
-            checkpoint_stats.clone(),
-            recycle_init,
             serving_shutdown,
             drain_tx,
             reap_init,
@@ -843,8 +784,6 @@ impl Runtime {
                 // before refusing. The alternative was detached threads
                 // holding the listener forever.
                 drop(receivers);
-                drop(control_rx);
-                drop(recycle_rx);
                 drop(drain_rx_by_numa);
                 drop(reap_receivers);
                 drop(tierc_write_inits);
@@ -883,8 +822,6 @@ impl Runtime {
                         // exactly the kind of config arithmetic a bad
                         // demo_rows trips.
                         drop(receivers);
-                        drop(control_rx);
-                        drop(recycle_rx);
                         drop(drain_rx_by_numa);
                         drop(reap_receivers);
                         drop(tierc_write_inits);
@@ -903,24 +840,8 @@ impl Runtime {
             }
         };
 
-        // The recycle channel's receiving end lands on the FIRST worker of
-        // the WAL-home NUMA — the same per-NUMA designated-reactor rule the
-        // checkpoint fanout's senders follow. A boot with no recycler (no
-        // listener, or no WAL) hands every worker `None`: no loop, no
-        // channel, nothing to drain.
-        let mut recycle_rx_slot = recycle_rx;
-        let recycle_receivers: Vec<Option<_>> = worker_numas
-            .iter()
-            .map(|numa| {
-                if recycle_rx_slot.is_some() && Some(*numa) == dev_home {
-                    recycle_rx_slot.take()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        // The drain channels' receiving ends follow the same rule (T4.4):
-        // the first worker of each NUMA pool is that pool's designated
+        // The drain channels' receiving ends (T4.4): the first worker of
+        // each NUMA pool is that pool's designated
         // reactor, and `drain_rx_by_numa` was created in designated order,
         // so the k-th distinct NUMA takes the k-th receiver.
         let mut drain_rx_left = drain_rx_by_numa.into_iter();
@@ -938,8 +859,6 @@ impl Runtime {
         let workers = match spawn_workers(
             cfg,
             receivers,
-            control_rx,
-            recycle_receivers,
             drain_receivers,
             reap_receivers,
             tierc_write_inits,
@@ -950,9 +869,6 @@ impl Runtime {
             draining,
             inflight,
             dev_home,
-            &checkpoint_passes,
-            &recycle_passes,
-            &recycle_reclaimed,
             &counters,
             &tenant_counters,
             &stalls,
@@ -989,10 +905,7 @@ impl Runtime {
             tierc_write_stats: tierc_write_stats_runtime,
             demo_heap,
             orchestrator: orchestrator_stats,
-            checkpoint: checkpoint_stats,
-            recycle: recycle_stats,
             reap: reap_stats,
-            truncatable,
             shutdown_flag,
             shutdown_trace,
             listen_dup,
@@ -1014,20 +927,6 @@ impl Runtime {
         self.orchestrator.as_ref()
     }
 
-    /// The checkpointer's orchestration counters (T4.2, FR-31): pass
-    /// signals sent / dropped-full / passes workers ran. `None` when
-    /// nothing orchestrates (no listener, D9).
-    pub fn checkpoint_stats(&self) -> Option<&CheckpointStats> {
-        self.checkpoint.as_ref()
-    }
-
-    /// The recycler's orchestration counters (T4.3, FR-32): recycle
-    /// signals to the WAL-home reactor / dropped-full / recycles run /
-    /// bytes computed reclaimable. `None` without a listener or a WAL.
-    pub fn recycle_stats(&self) -> Option<&crate::recycler::RecycleStats> {
-        self.recycle.as_ref()
-    }
-
     /// The reaper's orchestration counters (T4.5, FR-34): reap signals
     /// fanned out / dropped-full / connections condemned across all
     /// workers. `None` without a listener or with both reap rules
@@ -1045,14 +944,6 @@ impl Runtime {
     pub fn stats(&self) -> crate::stats::StatsSnapshot {
         let counters: Vec<_> = self.workers.iter().map(|w| Arc::clone(&w.stats)).collect();
         crate::stats::StatsSnapshot::sum(&counters)
-    }
-
-    /// The WAL-truncatable frontier (T4.2/FR-31, consumed by the T4.3
-    /// recycler): WAL strictly below this LSN is reclaimable. `None`
-    /// without a WAL; `Some(Lsn(0))` means nothing is reclaimable — the
-    /// live engine's standing truth until durable page images exist.
-    pub fn truncatable_lsn(&self) -> Option<cascade_types::Lsn> {
-        self.truncatable.as_ref().map(|t| t.get())
     }
 
     /// One housekeeper-style stall sample over every worker reactor (A15),
@@ -1297,9 +1188,6 @@ fn spawn_housekeepers(
     tierc_plane: TierCPlane,
     initial: ClusterSnapshot,
     tick_init: Option<crate::orchestrator::OrchestratorInit>,
-    designated: Vec<(u32, SharedSender<ControlMsg>)>,
-    checkpoint: Option<CheckpointStats>,
-    recycle: Option<crate::recycler::RecycleInit>,
     shutdown: Option<crate::shutdown::ServingShutdown>,
     drain: Vec<(u32, bool, SharedSender<crate::shutdown::DrainMsg>)>,
     reap: Option<crate::reaper::ReapInit>,
@@ -1324,9 +1212,9 @@ fn spawn_housekeepers(
         }
         found
     });
-    let mut serving = match (listener, tick_init, checkpoint, recycle, shutdown, drain, reap) {
-        (Some(loop_), Some(init), Some(stats), recycle, shutdown, drain, reap) => {
-            Some((loop_, auth, senders, worker_numas, counters, tierc_plane, initial, init, designated, stats, recycle, shutdown, drain, reap))
+    let mut serving = match (listener, tick_init, shutdown, drain, reap) {
+        (Some(loop_), Some(init), shutdown, drain, reap) => {
+            Some((loop_, auth, senders, worker_numas, counters, tierc_plane, initial, init, shutdown, drain, reap))
         }
         _ => None,
     };
@@ -1342,9 +1230,6 @@ fn spawn_housekeepers(
                 tierc_plane,
                 initial,
                 tick_init,
-                designated,
-                stats,
-                recycle,
                 shutdown,
                 drain,
                 reap,
@@ -1360,7 +1245,7 @@ fn spawn_housekeepers(
                 let _ = tx.send((core, pin::pin_current(core), 0));
                 Router::serve(
                     loop_, auth, senders, numas, counters, tierc_plane, initial, max_conns,
-                    nic_numa, handshake_timeout_ms, tick_init, designated, stats, recycle,
+                    nic_numa, handshake_timeout_ms, tick_init,
                     shutdown, drain, reap,
                 );
             }),
@@ -1439,8 +1324,6 @@ fn spawn_housekeepers(
 fn spawn_workers(
     cfg: &RuntimeConfig,
     receivers: Vec<SharedReceiver<Handoff>>,
-    control_receivers: Vec<SharedReceiver<ControlMsg>>,
-    recycle_receivers: Vec<Option<SharedReceiver<crate::recycler::RecycleSignal>>>,
     drain_receivers: Vec<Option<SharedReceiver<crate::shutdown::DrainMsg>>>,
     reap_receivers: Vec<Option<SharedReceiver<crate::reaper::ReapTick>>>,
     tierc_write_inits: Vec<crate::submit::SubmitInit>,
@@ -1451,9 +1334,6 @@ fn spawn_workers(
     draining: Arc<AtomicBool>,
     inflight: Vec<Arc<AtomicU64>>,
     dev_home: Option<u32>,
-    checkpoint_passes: &Arc<AtomicU64>,
-    recycle_passes: &Arc<AtomicU64>,
-    recycle_reclaimed: &Arc<AtomicU64>,
     counters: &[Arc<crate::stats::WorkerCounters>],
     tenant_counters: &[Arc<TenantCounters>],
     stalls: &[Arc<ReactorStall>],
@@ -1471,12 +1351,10 @@ fn spawn_workers(
         .iter()
         .flat_map(|w| w.cores.iter().map(move |&c| (w.numa, c)))
         .collect();
-    for (((((((((((( (numa, core), rx), ctrl_rx), recycle_rx), drain_rx), reap_rx), tierc_write_init), tierc_publish_rx), tierc_publish_stat), tierc_catalog), counter), inflight), (tenant_counters, stall)) in
+    for (((((((((( (numa, core), rx), drain_rx), reap_rx), tierc_write_init), tierc_publish_rx), tierc_publish_stat), tierc_catalog), counter), inflight), (tenant_counters, stall)) in
         per_core
             .into_iter()
             .zip(receivers)
-            .zip(control_receivers)
-            .zip(recycle_receivers)
             .zip(drain_receivers)
             .zip(reap_receivers)
             .zip(tierc_write_inits)
@@ -1497,17 +1375,14 @@ fn spawn_workers(
         let task_counter = Arc::clone(counter);
         let task_tenants = Arc::clone(tenant_counters);
         let task_stall = Arc::clone(stall);
-        let task_site = CheckpointSite::new(Arc::clone(checkpoint_passes));
-        let task_recycle = crate::recycler::RecycleSite::new(
-            Arc::clone(recycle_passes),
-            Arc::clone(recycle_reclaimed),
-        );
         // The drain plane (T4.4): the designated reactors get their own
-        // loop over the drain channel, with a site over the same pass
-        // counter and — on the WAL-home reactor — a cloned WAL pair for
-        // the final tail flush. `is_home` is the same dev-home decision
-        // the boot thread made (one decision, two consumers again).
-        let task_drain_site = CheckpointSite::new(Arc::clone(checkpoint_passes));
+        // loop over the drain channel, with a counter for the final-flush
+        // acks it lands and — on the WAL-home reactor — a cloned WAL pair
+        // for the final tail flush. `is_home` is the same dev-home
+        // decision the boot thread made (one decision, two consumers
+        // again). (The checkpoint and recycle loops that used to sit next
+        // to it retired with storage M8.)
+        let task_drain_passes = Arc::new(AtomicU64::new(0));
         let task_env = crate::session::SessionEnv {
             draining: Arc::clone(&draining),
             inflight: Arc::clone(&inflight),
@@ -1560,19 +1435,6 @@ fn spawn_workers(
                 // through flush_wal_sink on whichever core runs them.
                 let wal = task_writer.map(|writer| (writer, ()));
                 let handoffs = rx.connect().await;
-                // The control plane (T4.2): checkpoint signals arrive on
-                // their own channel and run as a sibling task on this
-                // same ring — never queued behind connection handoffs.
-                let controls = ctrl_rx.connect().await;
-                glommio::spawn_local(crate::checkpointer::control_loop(controls, task_site))
-                    .detach();
-                // The recycle plane (T4.3): its own channel, its own loop,
-                // on the WAL-home NUMA's first worker only.
-                if let Some(recycle_rx) = recycle_rx {
-                    let recycles = recycle_rx.connect().await;
-                    glommio::spawn_local(crate::recycler::recycle_loop(recycles, task_recycle))
-                        .detach();
-                }
                 // The drain plane (T4.4, §10.2 steps 3+4): §10.2's final
                 // flushes arrive on their own channel — designated
                 // reactors only. The loop dies when the serving side drops
@@ -1585,7 +1447,7 @@ fn spawn_workers(
                     };
                     glommio::spawn_local(crate::shutdown::drain_loop(
                         drains,
-                        task_drain_site,
+                        task_drain_passes,
                         Some(final_flush),
                     ))
                     .detach();

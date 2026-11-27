@@ -18,7 +18,8 @@
 //! The read path is the staged stand-in for the T5.1 `submit_to` fan-in
 //! (the counters' Arc-atomic substrate makes the direct sum exact; see
 //! `crate::stats`' module doc) — same staging discipline as the
-//! checkpointer's control channel.
+//! background signal families' channels (the checkpointer's control
+//! channel that set the pattern retired with storage M8).
 
 use std::{
     sync::Mutex,

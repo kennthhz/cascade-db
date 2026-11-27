@@ -1,13 +1,16 @@
 //! What crosses from the housekeeper to a worker (FR-13).
 //!
-//! Two planes, two channels, never mixed: connection handoffs (`Handoff`)
-//! ride the routing channel the least-loaded pick feeds; control signals
-//! (`ControlMsg`) ride a dedicated per-worker channel the housekeeper's
-//! background jobs feed (T4.2, FR-31 — the formal `submit_to` semantics
-//! land with T5.1; this channel is the staged stand-in with the same
-//! topology: housekeeper → designated reactor, never reactor-to-reactor).
-//! A control signal is data, not a descriptor: nothing here shares a file
-//! handle, ring, or connection object.
+//! Connection handoffs (`Handoff`) ride the routing channel the
+//! least-loaded pick feeds. (The control-signal plane of T4.2/FR-31 — the
+//! dedicated per-worker channel the checkpointer's fanout and the
+//! recycler's signals rode — retired with storage migration step M8: the
+//! buffer pool stopped writing pages back, so there is no flush pass to
+//! fan out and no frontier for a recycler to consume; the log store owns
+//! retention (§5.6). Background signal families that remain — the drain
+//! (T4.4) and the reaper (T4.5) — keep the same topology rule:
+//! housekeeper → designated reactor, never reactor-to-reactor, and a
+//! signal is data, not a descriptor: nothing here shares a file handle,
+//! ring, or connection object.)
 //!
 //! Channel construction rule (learned the hard way in the T4.2 tests):
 //! the two endpoints of a `shared_channel` must `connect()` on
@@ -29,12 +32,4 @@ pub struct Handoff {
     pub peer: SocketAddr,
     pub user: String,
     pub database: Option<String>,
-}
-
-/// Control-plane signal from the housekeeper to one worker (T4.2).
-#[derive(Debug)]
-pub enum ControlMsg {
-    /// Run one in-pool flush pass over this reactor's local dirty state
-    /// (FR-31: the housekeeper decides, the reactor touches its own pool).
-    FlushPass,
 }

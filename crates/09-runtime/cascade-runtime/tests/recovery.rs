@@ -10,8 +10,9 @@
 //! | clean marker at log end            | clean — replay still runs*    |
 //! | bytes past the marker              | crash after clean: unclean    |
 //!
-//! \* the debug slice's WAL is the only durable state home (no page
-//! checkpoints until M4), so replay is not optional even after a clean
+//! \* the debug slice's WAL is the only durable state home (and since
+//! storage M8 there are no page checkpoints at all — pages are never
+//! written back), so replay is not optional even after a clean
 //! stop; the marker decides the boot's *character*, not whether to walk.
 //!
 //! The end-to-end test runs the real loop: crash-shaped log → prepare →

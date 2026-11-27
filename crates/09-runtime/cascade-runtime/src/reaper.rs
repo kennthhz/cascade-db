@@ -2,11 +2,13 @@
 //! housekeeper times out *idle* connections and signals each worker
 //! reactor to drop its own.
 //!
-//! Division of labor (§9), same shape as the checkpointer/recycler: the
+//! Division of labor (§9), the background-signal shape (its first
+//! instances were the checkpointer and recycler, retired with storage
+//! M8): the
 //! housekeeper-side [`IdleReaper`] is a [`TickJob`] that — every tick —
 //! `try_send`s a [`ReapTick`] down each worker's dedicated channel. The
-//! worker-side [`reap_loop`] (a sibling task on that ring, like
-//! `control_loop`/`recycle_loop`) walks the reactor-local
+//! worker-side [`reap_loop`] (a sibling task on that ring, like the
+//! drain loop) walks the reactor-local
 //! [`ReapRegistry`] and condemns overdue entries. Idle connections live
 //! on *every* worker, not just designated ones, so this family fans out
 //! to all of them — and like every signal family it owns its own channel

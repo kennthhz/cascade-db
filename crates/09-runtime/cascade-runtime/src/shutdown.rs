@@ -38,20 +38,21 @@
 //!                           survive;
 //! 3+4. final flushes      — one `DrainMsg::FinalFlush` down a *dedicated
 //!                           drain channel* to each designated reactor
-//!                           (the third signal family, after the control
-//!                           and recycle channels — SPSC forbids sharing
-//!                           a sender, T4.3's lesson): the WAL-home
-//!                           reactor flushes the per-DB WAL tail first
-//!                           (step 3), then every designated reactor runs
-//!                           one last flush pass (step 4 — advancing the
-//!                           per-DB checkpoint LSN is `flush_pass`'s own
-//!                           job). Each worker acks through the channel
-//!                           carried in the message — the staged form of
-//!                           T5.1's `submit_to` return path. The flushes
-//!                           run unconditionally: a frontier pinned at 0
-//!                           still passes and still acks, which is how
-//!                           the trace proves the flushes RAN rather than
-//!                           were skipped as "nothing dirty";
+//!                           (its own channel family — SPSC forbids
+//!                           sharing a sender, T4.3's lesson; the control
+//!                           and recycle families that preceded it
+//!                           retired with storage M8): the WAL-home
+//!                           reactor flushes the per-DB WAL tail (step
+//!                           3), and every designated reactor acks
+//!                           through the channel carried in the message —
+//!                           the staged form of T5.1's `submit_to` return
+//!                           path. The acks run unconditionally, which is
+//!                           how the trace proves the flushes RAN rather
+//!                           than were skipped; (storage M8: there is no
+//!                           page flush pass here anymore — pages are
+//!                           never written back, the log is the only
+//!                           durable write, so the WAL tail is the whole
+//!                           final flush);
 //! 5. drop reactors        — `Runtime::shutdown` joins every
 //!                           housekeeper and worker thread; joining a
 //!                           worker drops its ring, and a dropped ring
@@ -83,15 +84,16 @@ use glommio::channels::shared_channel::{ConnectedReceiver, ConnectedSender};
 pub const ADMIN_SHUTDOWN: &str = "57P01";
 
 /// The drain-plane signal from the serving housekeeper to one designated
-/// reactor (T4.4). Its own channel family — the control channel stays
-/// pure flush-family (T4.2) and the recycle channel stays pure recycle
-/// (T4.3); SPSC means no sender is ever shared, and isolation means one
-/// family's backlog can never delay another's signal.
+/// reactor (T4.4). Its own channel family — SPSC means no sender is ever
+/// shared, and isolation means one family's backlog can never delay
+/// another's signal (the control and recycle families that shared this
+/// rule retired with storage M8).
 #[derive(Debug)]
 pub enum DrainMsg {
     /// §10.2 steps 3+4 on this reactor: flush the per-DB WAL tail (home
-    /// only), run one final flush pass, then ack through the carried
-    /// channel — the staged form of T5.1's `submit_to` return path.
+    /// only — the whole final flush since storage M8), then ack through
+    /// the carried channel — the staged form of T5.1's `submit_to`
+    /// return path.
     FinalFlush {
         ack: std::sync::mpsc::Sender<Result<(), String>>,
     },
@@ -109,13 +111,15 @@ pub struct FinalFlushCtx {
     pub is_home: bool,
 }
 
-/// The worker-side drain loop: a sibling task next to `control_loop` and
-/// `recycle_loop`, on the designated reactor's own ring. Dies when the
-/// serving side drops its sender (serve returns → drain senders drop →
-/// `recv` yields `None`) or with the ring itself.
+/// The worker-side drain loop: a sibling task next to the session accept
+/// loop, on the designated reactor's own ring. `passes` counts the
+/// final-flush acks this reactor lands (the observable the shutdown
+/// trace's step-4 records assert). Dies when the serving side drops its
+/// sender (serve returns → drain senders drop → `recv` yields `None`) or
+/// with the ring itself.
 pub async fn drain_loop(
     recv: ConnectedReceiver<DrainMsg>,
-    site: crate::checkpointer::CheckpointSite,
+    passes: Arc<AtomicU64>,
     final_flush: Option<FinalFlushCtx>,
 ) {
     while let Some(msg) = recv.recv().await {
@@ -126,21 +130,23 @@ pub async fn drain_loop(
                         None => Err("no WAL on this boot".to_string()),
                         Some(ctx) if ctx.is_home => {
                             let writer = ctx.wal.as_ref().expect("is_home implies wal");
-                            // §10.2 step 3: the per-DB WAL tail, first —
-                            // through the sink (M6).
+                            // §10.2 step 3: the per-DB WAL tail, through
+                            // the sink (M6) — the log is the only durable
+                            // write, so this is the whole final flush
+                            // (storage M8: there is no page flush pass
+                            // next to it anymore).
                             writer
                                 .flush_wal_sink(writer.filled())
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            // Then step 4: the last flush pass.
-                            site.run_pass().await;
+                            passes.fetch_add(1, Ordering::Relaxed);
                             Ok(())
                         }
                         Some(_) => {
-                            // Step 4 only: the final pass. The frontier
-                            // may not move (debug engine pins it at 0) —
-                            // the pass RAN, and the ack says so.
-                            site.run_pass().await;
+                            // No page work exists for a non-home
+                            // designated reactor (storage M8): the ack
+                            // says the drain reached this reactor.
+                            passes.fetch_add(1, Ordering::Relaxed);
                             Ok(())
                         }
                     }
@@ -303,9 +309,12 @@ pub async fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSe
         "sessions-drained"
     });
 
-    // Steps 3+4: final per-DB WAL flush (home reactor, first) and the
-    // final BPM flush (every designated reactor), each acked through the
-    // message-carried channel. The ack waits share ONE deadline budget —
+    // Steps 3+4: the final per-DB WAL flush (home reactor) and the drain
+    // acks (every designated reactor), each acked through the
+    // message-carried channel. (Storage M8: pages are never written back,
+    // so the BPM flush pass that step 4 used to run is gone — the WAL
+    // tail is the whole final flush, and the acks prove the drain reached
+    // every designated reactor.) The ack waits share ONE deadline budget —
     // a wedged set of workers delays shutdown by the deadline *once* in
     // total, then the reactor drop in step 5 finishes the job; telemetry
     // notes it rather than hanging forever.
@@ -356,7 +365,7 @@ pub async fn run_drain(ctx: &ServingShutdown, senders: &[(u32, bool, ConnectedSe
         }
     }
     if all_ok {
-        ctx.trace.record("final-bpm-flush");
+        ctx.trace.record("final-flush-acks");
     } else {
         // Recorded honestly: some sites never confirmed. Step 5's
         // reactor drop closes whatever they held.

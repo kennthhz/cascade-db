@@ -18,7 +18,9 @@
 //! (the increments are already the Arc-atomic substrate §4 prescribes
 //! for Tier B; Relaxed loads over sums of monotonic counters are exact
 //! at the read instant) and documented as the deviation, same shape as
-//! the checkpointer's staged control channel.
+//! the background signal families' staged channels (the drain, the
+//! reaper — the checkpointer's control channel, the pattern's origin,
+//! retired with storage M8).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

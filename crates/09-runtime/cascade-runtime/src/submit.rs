@@ -20,7 +20,8 @@
 //! rather than hanging it.
 //!
 //! Backpressure follows the codebase's counted-refusal discipline (the
-//! checkpointer's control channel, the reaper's fanout): the job queue
+//! reaper's fanout; the checkpointer's control channel that set the
+//! pattern retired with storage M8): the job queue
 //! is bounded, and a submit onto a full one is refused and counted,
 //! never blocking the caller's ring. §6.1 is explicit that this is a
 //! coordination primitive — "use sparingly"; the OLTP query hot path
