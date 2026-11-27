@@ -11,7 +11,7 @@ Resource-quota enforcement layer for §6.1.
 ## Pillar Reservations
 
 - **§6.1:** the entire reason this crate exists.
-- Coordinates with: `cascade-tenant` (carrier), `cascade-runtime` (CPU), `cascade-bpm` (memory), `cascade-storage` (I/O), `cascade-pgwire` (connections).
+- Coordinates with: `cascade-tenant` (carrier), `cascade-runtime` (CPU), `cascade-bpm` (memory), `cascade-blockdev`/`cascade-pagestore` (I/O), `cascade-pgwire` (connections).
 
 ## Hard Invariants
 
@@ -23,7 +23,7 @@ Resource-quota enforcement layer for §6.1.
 
 - `cascade-tenant::TenantContext` propagated end-to-end.
 - Per-DB page residency counter in `cascade-bpm`.
-- Per-DB I/O submission tag in `cascade-storage`.
+- Per-DB I/O submission tag in the storage stack (`cascade-blockdev`/`cascade-pagestore`).
 - Per-DB connection count in `cascade-pgwire`.
 
 ## Open Design Questions

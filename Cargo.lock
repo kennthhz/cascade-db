@@ -223,7 +223,6 @@ dependencies = [
  "cascade-error",
  "cascade-mvcc",
  "cascade-pgtypes",
- "cascade-storage",
  "cascade-telemetry",
  "cascade-types",
 ]
@@ -399,7 +398,6 @@ dependencies = [
  "cascade-page",
  "cascade-pg-parser",
  "cascade-rt-api",
- "cascade-storage",
  "cascade-storage-api",
  "cascade-telemetry",
  "cascade-tenant",
@@ -434,7 +432,6 @@ dependencies = [
  "cascade-runtime",
  "cascade-sql-exec",
  "cascade-sql-planner",
- "cascade-storage",
  "cascade-storage-api",
  "cascade-telemetry",
  "cascade-types",
@@ -468,18 +465,6 @@ dependencies = [
  "cascade-pgtypes",
  "cascade-telemetry",
  "cascade-types",
-]
-
-[[package]]
-name = "cascade-storage"
-version = "0.1.0"
-dependencies = [
- "cascade-error",
- "cascade-telemetry",
- "cascade-types",
- "crc32fast",
- "glommio",
- "static_assertions",
 ]
 
 [[package]]
@@ -518,7 +503,6 @@ version = "0.1.0"
 dependencies = [
  "cascade-bpm",
  "cascade-error",
- "cascade-storage",
  "cascade-telemetry",
  "cascade-types",
 ]

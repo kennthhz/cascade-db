@@ -23,7 +23,6 @@ cascade-storage-api  = { workspace = true }
 cascade-types       = { workspace = true }
 cascade-blockdev  = { workspace = true }
 cascade-pgwire    = { workspace = true }
-cascade-storage   = { workspace = true }
 cascade-wal       = { workspace = true }
 cascade-bpm       = { workspace = true }
 cascade-catalog   = { workspace = true }

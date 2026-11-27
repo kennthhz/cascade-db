@@ -46,8 +46,8 @@ has no undo; undo chains are IOT, §11). Fresh cells stamp `xmax`/`next` zero.
 
 ## Hard Invariants
 
-1. **CRC32 over the page — OWNED BY `cascade-storage`, not this crate.** The stored page image is `[u32 LE CRC32 of the rest][payload]`, recomputed on write and validated on read by the storage layer. This crate deliberately carries no checksum field; nesting two CRCs over the same bytes would double validation cost and blur which layer answers for integrity. (The original stub sketched a header `crc32` field — deleted at T6.1 when the division was settled.)
-2. **PageLSN is the high-water mark** of WAL records applied to this page. Used by WAL-before-data enforcement (`cascade-bpm`). In M6 the on-page field stays zero and the BPM frame stamp (`AtomicU64`) is authoritative; the field exists so later milestones need no format change.
+1. **CRC32 over the page — OWNED BY the page store (`cascade-pagestore`), not this crate.** The stored page's integrity lives in the page store's per-page record beside the image (storage §6.3), recomputed on write and validated on read there. This crate deliberately carries no checksum field; nesting two CRCs over the same bytes would double validation cost and blur which layer answers for integrity. (The original stub sketched a header `crc32` field — deleted at T6.1 when the division was settled; the old `cascade-storage` CoreStorage that stamped the on-image CRC was deleted at storage M9.)
+2. **PageLSN is the high-water mark** of WAL records applied to this page. On compute it lives on the BPM frame stamp (S17: raised by `write_logged`, read by §12.5's eviction rule); the page store keeps its own in the sidecar record. The on-page field stays zero (reserved); it exists so later milestones need no format change.
 3. **Endianness fixed** at format-definition time. Little-endian (matches x86_64, ARM64). Golden byte-literal tests in `src/lib.rs` pin every header and cell byte.
 4. **No pointers into the page from outside.** Access methods reconstruct row references from `(PageId, SlotId)`, never raw addresses. `CellRef::payload` borrows the page image only.
 5. **Format is versioned.** Header carries a format version (`FORMAT_VERSION = 1`); `parse` refuses other versions and `is_initialized` (nonzero version bytes) distinguishes a never-written page — a normal empty page, not corruption.
@@ -58,7 +58,7 @@ has no undo; undo chains are IOT, §11). Fresh cells stamp `xmax`/`next` zero.
 - Index-specific node layout (B+Tree internals live in `cascade-btree`).
 - Heap-specific row encoding (lives in `cascade-heap`).
 - Columnar segment format (lives in `cascade-columnar` — different format, different crate, same 8 KB unit).
-- The outer integrity CRC (lives in `cascade-storage`, see invariant 1).
+- The outer integrity CRC (lives in the page store's per-page record, see invariant 1).
 
 ## Existing Code (T6.1, amended T1.1)
 

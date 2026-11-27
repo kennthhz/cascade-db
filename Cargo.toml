@@ -6,7 +6,6 @@ members = [
     "crates/01-foundation/cascade-error",
     "crates/01-foundation/cascade-telemetry",
     # 02-storage
-    "crates/02-storage/cascade-storage",
     "crates/02-storage/cascade-wal",
     "crates/02-storage/cascade-wal-format",
     "crates/02-storage/cascade-storage-api",
@@ -98,7 +97,6 @@ prost = "0.13.5"
 cascade-types     = { path = "crates/01-foundation/cascade-types" }
 cascade-error     = { path = "crates/01-foundation/cascade-error" }
 cascade-telemetry = { path = "crates/01-foundation/cascade-telemetry" }
-cascade-storage   = { path = "crates/02-storage/cascade-storage" }
 cascade-wal       = { path = "crates/02-storage/cascade-wal" }
 cascade-wal-format = { path = "crates/02-storage/cascade-wal-format" }
 cascade-storage-api = { path = "crates/02-storage/cascade-storage-api" }

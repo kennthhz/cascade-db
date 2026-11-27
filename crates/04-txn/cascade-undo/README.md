@@ -15,7 +15,6 @@ Layer **04-txn**. Implements the storage side of pillar §3.3 — when a row is 
 ## Dependencies
 
 - `cascade-bpm` (undo pages live in the buffer pool)
-- `cascade-storage` (extents, allocation)
 - `cascade-types`, `cascade-error`, `cascade-telemetry`
 
 ## See also

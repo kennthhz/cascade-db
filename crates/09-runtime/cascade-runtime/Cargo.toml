@@ -21,7 +21,6 @@ cascade-storage-api = { workspace = true }
 cascade-logstore   = { workspace = true }
 cascade-blockdev   = { workspace = true }
 cascade-bpm       = { workspace = true }
-cascade-storage   = { workspace = true }
 cascade-pg-parser = { workspace = true }
 
 libc        = { workspace = true }

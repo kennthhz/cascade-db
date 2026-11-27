@@ -6,9 +6,9 @@ Per-database Write-Ahead Log.
 
 Layer **02-storage**. Implements pillar §3.4 (Per-Database WAL & LSN). Hosts the §6.3 (logical CDC) reservation in the WAL record format.
 
-## Why a separate crate from `cascade-storage`
+## Why WAL is its own crate
 
-WAL has different access patterns (append-only, fsync-heavy) and may eventually live on a different physical tier than data pages (§6.4 — fast NVMe WAL, object-storage data). Keeping `WalStore` separate from `PageStore` makes that pluggability cheap.
+WAL has different access patterns (append-only, fsync-heavy) and may eventually live on a different physical tier than data pages (§6.4 — fast NVMe WAL, object-storage data). Keeping the WAL writer separate from the page stores makes that pluggability cheap.
 
 ## Public API (initial)
 

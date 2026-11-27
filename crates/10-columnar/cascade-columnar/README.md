@@ -15,7 +15,7 @@ Layer **10-columnar**. Implements pillar §3.7 — opt-in per-table columnar pro
 
 ## Dependencies
 
-- `cascade-storage`, `cascade-bpm` — segment pages live in the same pool as row pages.
+- `cascade-bpm` — segment pages live in the same pool as row pages.
 - `cascade-mvcc` — visibility under shared XID/snapshot rules.
 - `cascade-pgtypes` — column types match the row store.
 
