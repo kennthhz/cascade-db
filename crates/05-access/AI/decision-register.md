@@ -12,17 +12,6 @@
 
 Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-15 to D-17, the DDL gaps, were added on 2026-11-27 at Kenneth's request. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
 
-### D-1. How version words become self-describing
-
-| | |
-| :--- | :--- |
-| **Question** | Engines only ever write `uncommitted(xid)`, so the status table must keep an entry for every transaction any live row still names, forever. How is that bounded? |
-| **Options** | (a) Stamp through the log: each transaction records the positions it stamped; at commit and abort it emits stamp records that `cascade-redo` applies everywhere, after which its status entry can be retired. (b) Keep the words and bound the table in memory some other way: no sound method is known, because commit order is not txn-id order. (c) Transaction status pages, which the architecture already lists (§4.2): a logged, paged array indexed by transaction id, holding state, commit timestamp and top-level id, cached like any other page (added by round-3 review V12). |
-| **Recommendation** | Changed again 2026-11-27 by the round-4 review (W5): (a), with stamps written by a background stamper *after* the commit, off its path, and (c) status pages as the bounded store for transactions whose stamps are still pending. Round 3's lazy freezing could not bound the status pages without a pass over every heap and index page, which the product promises to avoid (layer §13.1). |
-| **Owner** | Transaction layer, ratified by Kenneth |
-| **Blocks** | Step 4 (the MVCC milestone) for every engine |
-| **Status** | Open |
-
 ### D-2. Who builds the transaction-side seams, and when
 
 | | |
@@ -50,7 +39,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Accept the three changes of layer §13.2 and update `docs/architecture-design.md`? |
-| **Items** | (1) A13: callers see an enum `Table` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids (D-11). The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
+| **Items** | (1) A13: callers see an enum `Table` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids, accepted by Kenneth on 2026-11-27 through D-11, so only the architecture text remains to update. The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
 | **Recommendation** | Accept all five. |
 | **Owner** | Kenneth |
 | **Blocks** | (1) Step 1. (2) Step 4. (3) Step 2. (4) Step 4. (5) Step 1. |
@@ -112,28 +101,6 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Blocks** | Step 1 |
 | **Status** | Partly decided. C1, C5, C6 and C10 accepted by Kenneth on 2026-11-27, and C8's opaque lock key with them, since C1 forbids L4 naming an L5 type. C2, C3, C4, C7, the rest of C8, and C9, C11, C12, C13 are still open |
 
-### D-11. Statement visibility and savepoints (round-3 review V1, V2)
-
-| | |
-| :--- | :--- |
-| **Question** | A statement must not see its own changes (the Halloween problem), and `ROLLBACK TO SAVEPOINT` must work on the heap, which has no undo. How? |
-| **Options** | (a) Subtransaction ids: each writing statement and each savepoint stamps a fresh id recorded with its top-level transaction; a snapshot carries the statement's horizon; savepoint rollback marks sub-ids aborted. (b) A command id in each row header, as PostgreSQL does, plus a separate savepoint mechanism. (c) A per-transaction in-memory map from written versions to statements. |
-| **Recommendation** | (a), now written into layer §6.6 as A14. It needs no row-format change and solves both problems with one mechanism. Cost: one status entry per writing statement, and the status table must map sub-ids to their top. |
-| **Owner** | Transaction layer, ratified by Kenneth |
-| **Blocks** | Step 1 (it changes `Snapshot` and `TxnStatus` in `cascade-txn-api`) |
-| **Status** | Open |
-
-### D-14. A failure after a write's row step (round-4 review W2)
-
-| | |
-| :--- | :--- |
-| **Question** | Index steps run after the row step. If one of them returns a value, the executor can skip the row and commit a half-done write. |
-| **Options** | (a) Such a failure is `TamError::StatementFailed`, which blocks commit until a savepoint rollback or an abort, as PostgreSQL does (layer A17). (b) Run every unique check before the row step. (c) A subtransaction id per row. |
-| **Recommendation** | (a), now in layer §6.5. Changes the contract: unique violations from secondary indexes become errors, not values. |
-| **Owner** | Kenneth |
-| **Blocks** | Step 1 (the error type) |
-| **Status** | Open |
-
 ### D-15. Who drops a table's or an index's storage
 
 | | |
@@ -192,6 +159,9 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 
 | # | Decision | By, when |
 | :--- | :--- | :--- |
+| D-1 | Version words become self-describing by **stamping after commit**: a background stamper replaces each in-flight id with the commit timestamp (or zero after an abort or savepoint rollback) through small log records, in rows and index entries, and the transaction's status entries are retired once its stamps are durable. Persistent status pages hold only transactions whose stamps are pending (layer §13.1) | Kenneth, 2026-11-27 |
+| D-11 | Statement visibility and savepoints use **subtransaction ids**: each writing statement and savepoint stamps its own id, a snapshot carries the statement horizon, and a savepoint rollback marks sub-ids aborted (layer §6.6, A14) | Kenneth, 2026-11-27 |
+| D-14 | A failure after a write's row step is **`TamError::StatementFailed`**, which blocks commit until a savepoint rollback or an abort (layer §6.5, A17) | Kenneth, 2026-11-27 |
 | D-3 | `Snapshot`, the visibility rule, `WaitSource` and `TxnCtx` live in a new, small `cascade-txn-api` (L4), created now with only what the access contract consumes (access-api C1) | Kenneth, 2026-11-27 |
 | C1 | Three crates: `cascade-txn-api`, `cascade-access-api`, and `cascade-access-dispatch` for the dispatch enums above the engines | Kenneth, 2026-11-27 |
 | C5 | `TxnCtx` is concrete in `cascade-txn-api`; `begin_statement` and `fresh_snapshot` are async | Kenneth, 2026-11-27 |
