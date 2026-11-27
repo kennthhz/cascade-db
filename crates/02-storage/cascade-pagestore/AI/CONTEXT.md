@@ -292,7 +292,9 @@ manifest, and the pre-fix ingest loop.
   without page versions; a leader's requests move forward with its writes.
 - The pool's write-back and the checkpointer go away; the housekeeper calls
   `flush(scope)` (or relies on the dirty bound) and `catch_up` ahead of
-  read misses.
+  read misses. *(M8, 2026-11-27: done — the pool is a read cache over
+  this store's `PageSource` face; misses fetch at the scope's durable
+  LSN, and the runtime checkpointer is gone.)*
 - Logs holding `LegacyInsert` (type 4) are refused by this store: their
   pages are not materialized here. Fixtures that still write type 4 need
   rewriting before they run against pages.

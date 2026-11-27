@@ -23,7 +23,7 @@ flowchart TB
         LISTEN["PG listening socket"]
         ROUTE["Connection router — affinity-aware least-loaded (§5.2)"]
         CW["Tier C writer — serialized cluster_state (§6.4)"]
-        BG["Background orchestrator — checkpointer · WAL recycler · stats · reaper · stall sampler (§9)"]
+        BG["Background orchestrator — stats · reaper · stall sampler (§9; checkpointer + WAL recycler retired with storage M8)"]
         LISTEN --> ROUTE
     end
 

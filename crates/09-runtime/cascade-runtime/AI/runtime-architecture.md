@@ -54,7 +54,7 @@ The Linux kernel is asked to stop scheduling on most of the machine. Concurrency
 
 | Role | Cores | Responsibilities |
 |---|---|---|
-| **Housekeeper** | `0..H` (default `H = 1`) | OS daemons, SSH, logging, NIC IRQs, listening socket, connection accept + dispatch, background work (checkpointer, stats, Tier C publication). Subject to normal CFS scheduling. |
+| **Housekeeper** | `0..H` (default `H = 1`) | OS daemons, SSH, logging, NIC IRQs, listening socket, connection accept + dispatch, background work (stats, reaper, Tier C publication — the checkpointer and the WAL recycler retired with storage M8: pages are never written back, so no flush pass and no truncatable frontier exist; retention is the log store's, storage §5.6). Subject to normal CFS scheduling. |
 | **Worker (Fortress)** | `H..N` | Database execution. Pinned, isolated from CFS, NUMA-aware, one `glommio` reactor each. |
 
 `H` is configurable. Single-core dev boxes still work (you give up isolation). The `H..N` notation above is the idealized contiguous case; the actual worker set is computed from the discovered topology (§2.2) and may be non-contiguous in `physical` mode (§2.4).
@@ -516,7 +516,7 @@ How Tier B stays lock-free / fine-grained on the hot path.
 
 **Eviction:** within each NUMA pool, sharded by `hash(PageId) mod cores_on_this_numa`. Each core handles eviction decisions for "its" page-table shard *of its NUMA's pool*. Reads from any core on the same NUMA; writes (eviction, dirty-flush scheduling) handled by the shard's home core.
 
-**Ring ownership:** shared BPM state (frames, page table, atomics) is plain memory — only I/O is reactor-bound. Each reactor opens its own `PageStore` file handles (handles never escape `cascade-storage`, I2) and submits page-in reads on its private ring (§3.3). Writeback I/O is submitted by the shard-home reactor and by the checkpointer via `submit_to` (§9). No BPM object carries a file handle across reactors.
+**Ring ownership:** shared BPM state (frames, page table, atomics) is plain memory — only I/O is reactor-bound. Each reactor opens its own `PageSource` handles (handles never escape the page store layer, I2) and submits page-in reads on its private ring (§3.3). *(Storage M8: pages are never written back — the writeback and checkpointer I/O this paragraph used to describe is gone; the only page I/O left is the miss path's read.)* No BPM object carries a file handle across reactors.
 
 **Memory sizing:** each NUMA's BPM is configured independently. For asymmetric NUMA nodes (uncommon but possible), the runtime accepts per-NUMA sizing rather than splitting one total uniformly.
 
@@ -580,15 +580,15 @@ v1: **all background work runs on the housekeeper.** This is the simplest viable
 
 | Background task | Owner | What it does |
 |---|---|---|
-| Checkpointer | Housekeeper | Orchestrates only: for each NUMA's BPM pool, `submit_to` a reactor on that pool's NUMA to iterate its dirty pages and schedule flushes **in-pool**, fanning flush I/O out to the shard-home cores (§8.1) — the housekeeper never touches another NUMA's Tier B state directly (§6.2); advances per-DB WAL-truncatable LSN. |
-| WAL segment recycler | Housekeeper | Orchestrates only: `submit_to` the reactor owning the DB's WAL home to reclaim segments below the per-DB truncatable LSN — the bound NUMA for `single`-affinity DBs, the designated home NUMA for `cross` (§6.2, §8.2). |
+| Checkpointer | Housekeeper | *(Retired with storage M8, 2026-11-27: pages are never written back — the log is the only durable write, only the page store writes pages (§12.5). There is no dirty set to flush, no truncatable LSN to advance.)* |
+| WAL segment recycler | Housekeeper | *(Retired with storage M8, 2026-11-27: log retention is the log store's own contract — `set_retained_from` + `retention_holders`, storage §5.6 — not a runtime decision from a frontier.)* |
 | Statistics collector | Housekeeper | Aggregates per-core counters via `submit_to(*)` for views like `pg_stat_database`. |
 | Catalog publisher | Housekeeper | Serializes Tier C writes; broadcasts snapshots. |
 | Idle-connection reaper | Housekeeper | Times out connections; signals the owning reactor to drop them. |
 | Reactor stall sampler | Housekeeper | Polls per-reactor stall counters; emits aggregated telemetry. (Exact plumbing — housekeeper-side polling vs in-band self-reporting — is the §11 open question; this row assumes polling.) |
 | (Future) Logical CDC decoder | Housekeeper for v1 | Reads each DB's WAL, emits change events. May move to a dedicated reactor per DB in Phase 7. |
 
-**Cross-core coordination:** any background task that needs work done on a specific reactor uses `submit_to(reactor, …)`. Worker reactors never queue work onto each other directly — coordination flows through the housekeeper. For per-NUMA Tier B work (e.g., flushing a `single`-affinity DB's dirty pages), the housekeeper targets a reactor on that DB's bound NUMA.
+**Cross-core coordination:** any background task that needs work done on a specific reactor uses `submit_to(reactor, …)`. Worker reactors never queue work onto each other directly — coordination flows through the housekeeper. For per-NUMA Tier B work, the housekeeper targets a reactor on that NUMA (the drain's tail flush is today's example — the dirty-page flush example retired with storage M8).
 
 ---
 
@@ -635,7 +635,7 @@ Boot is not fully parallel — Tier C must be published before workers start ser
    d. Any txn still active at deadline is force-aborted.
    e. Release locks, pins, undo refs.
 3. Final per-DB WAL flush (each per-DB WalWriter flushes its tail on its home NUMA).
-4. Final BPM flush across all NUMA pools: write dirty pages, advance per-DB checkpoint LSN.
+4. Designated-reactor acks (the final BPM flush this step used to describe retired with storage M8 — pages are never written back; the runtime's trace records `final-flush-acks`).
 5. Drop reactors; close io_uring rings; close files.
 ```
 
@@ -681,7 +681,7 @@ The invariants below are the *enforcement contract* for every crate in the works
 | I4c | For `cross`-affinity DBs: cross-NUMA hot-path reads of Tier B state are expected and accepted as the documented trade. | B |
 | I5 | All hot-path operations carry a `TenantContext` (README §6.1 reservation). | All |
 | I6 | All hot-path operations accept `&Span` (README §6.2 reservation). | All |
-| I7 | WAL-before-data: no dirty page is flushed until the WAL covering its mutations is durable. | B |
+| I7 | WAL-before-data: no dirty page is flushed until the WAL covering its mutations is durable. *(Storage M8: supersedes the writeback form — pages are never flushed at all; the surviving rules are §12.5's: a page whose LSN is above the durable LSN is never evicted, and cached pages change only through applied mini-transaction groups.)* | B |
 | I8 | WAL records carry full row images sufficient for logical decoding (README §6.3). | B |
 | I9 | Tier C state is read via `ArcSwap::load()` only; writes go through the housekeeper. | C |
 | I10 | Long-running operators yield at every batch boundary and call the runtime's deadline-aware `yield_point()` at internal sub-boundaries. | A |

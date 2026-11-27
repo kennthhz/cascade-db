@@ -99,8 +99,8 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - **FR-30** — The writer waits at most `tierc_fanout_wait_ms` (default 1 s) for stores; the ack says *applied everywhere* or *pending N*; laggards adopt lazily; the issuing reactor stores first. (R11)
 
 ### Background
-- **FR-31** — The checkpointer orchestrates only: per NUMA pool it `submit_to`s a reactor on that pool's NUMA to iterate dirty pages and fan flush I/O to shard-home cores, advancing per-DB WAL-truncatable LSN — never touching another NUMA's Tier B state directly. (§9)
-- **FR-32** — The WAL recycler `submit_to`s the reactor owning the DB's WAL home to reclaim segments below the per-DB truncatable LSN. (§9)
+- **FR-31** — The checkpointer orchestrates only: per NUMA pool it `submit_to`s a reactor on that pool's NUMA to iterate dirty pages and fan flush I/O to shard-home cores, advancing per-DB WAL-truncatable LSN — never touching another NUMA's Tier B state directly. (§9) **Retired 2026-11-27 by storage M8** (storage-layer-design §9, §12.5): pages are never written back — the log is the only durable write and only the page store writes pages — so there is no flush pass to orchestrate and no truncatable frontier to advance. The landed machinery was removed; the housekeeper keeps the stall watch and the reaper.
+- **FR-32** — The WAL recycler `submit_to`s the reactor owning the DB's WAL home to reclaim segments below the per-DB truncatable LSN. (§9) **Retired 2026-11-27 by storage M8**, same reason: log retention is the log store's own contract (`set_retained_from` + `retention_holders`, storage §5.6), not a runtime decision from a frontier.
 - **FR-33** — The statistics collector aggregates per-core counters (summed on read, §4) for `pg_stat_database`-style views. (§9)
 - **FR-34** — The idle-connection reaper times out idle connections and signals the owning reactor to drop them. (§9)
 
@@ -112,18 +112,18 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 
 ### Real engine (M6; added 2026-11-08, post-M5)
 - **FR-39** — Heap tuples live in 8 KiB pages defined by `cascade-page`: a fixed little-endian header (format version, page kind, slot count, free-space offset, page LSN) followed by a u16 slot array and row cells carrying `xmin`/`xmax`/undo-ref headers; the outer 4-byte CRC over the page image is `cascade-storage`'s, recomputed on write and validated on read. (§4, cascade-page AI/CONTEXT)
-- **FR-40** — One BPM per NUMA shared by that node's cores: the BPM is `Send + Sync`, owns no file handle, and every miss is read through the calling reactor's own `PageStore` handle on its own ring — "no BPM object carries a file handle across reactors" is structural. (§8.1, I2)
+- **FR-40** — One BPM per NUMA shared by that node's cores: the BPM is `Send + Sync`, owns no file handle, and every miss is read through the calling reactor's own `PageStore` handle on its own ring — "no BPM object carries a file handle across reactors" is structural. (§8.1, I2) **M8 amendment:** the per-call store is now the `PageSource` contract (cascade-storage-api §4.5), and the miss reads at the scope's durable LSN; with write-back gone the pool is a read cache (§12.5).
 - **FR-41** — Frame access is safe under sharing: readers copy out under the frame mutex (`PageGuard` owns its snapshot), writers mutate only inside the sync closure under an exclusive pin (write-flag protocol), and no lock is ever held across an await point. (§8.1, I11)
 - **FR-42** — BPM frames are allocated from a NUMA-bound mapping built per pool (mbind, warn-and-degrade like pool placement), never from the `PoolRegistry` memory the demo heap occupies. (§2.3, I4a)
 - **FR-43** — The frozen FNV-1a placement hash `hash(PageId) mod num_numas` lives in `cascade-bpm` (`home_numa`); the runtime's `pool_for_page` becomes a delegating wrapper over it. (§8.1, §2.5.1, I3)
-- **FR-44** — A full pool evicts in-pool: a pinned-free clean frame first, else one pinned-free dirty page through the WAL gate, else `PoolFull`; WAL-before-data holds on every writeback including eviction; CLOCK-sweep (reference bit) is deferred until measured. (§8.1, I7)
+- **FR-44** — A full pool evicts in-pool: a pinned-free clean frame first, else one pinned-free dirty page through the WAL gate, else `PoolFull`; WAL-before-data holds on every writeback including eviction; CLOCK-sweep (reference bit) is deferred until measured. (§8.1, I7) **M8 amendment:** the write-back rung is gone — the ladder drops a durable-covered dirty page in place (§12.5: dropping a page whose LSN is at or below the durable LSN loses nothing) and refuses pages above it; a full pool with undurable victims is the honest pressure signal.
 - **FR-45** — The WAL carries heap mutations as full row images: a `HeapInsert` record holds the segment id plus the cell bytes exactly as the page lays them down; the legacy debug `Insert` type stays decodable, but the runtime stops emitting it. (README §6.3, I8)
 - **FR-46** — The heap access method places rows by sequential fill routed through `home_numa`, stamps `page_lsn` with the commit's end LSN via `write_logged`, scans by page iteration with no visibility logic (committed pages plus the session's own pending rows), and returns `Tid` without persisting it. Placement follows `cascade-redo`'s sequential-fill rule with the fill cursor advanced in LSN order, so live layout equals replayed layout (decided 2026-11-26; heap design H9 — it replaces the earlier acceptance that the two could differ while Tids never escape to disk). (§4, cascade-heap AI/CONTEXT)
 - **FR-47** — The wire path is behavior-identical through the real engine: same statement set, same error codes, uncommitted rows never visible to another session. (§4, I5)
-- **FR-48** — The checkpointer advances the per-DB truncatable LSN only after a fully drained pass — zero refused pages, post-flush dirty set empty, no in-flight applies — to the minimum resident page LSN; every page writeback is `fdatasync`ed before it reports success. (§9, I7)
-- **FR-49** — Every committing session registers an in-flight-apply slot before its first WAL reservation and clears it only after page apply; the frontier can never outrun an applied commit. (§9)
-- **FR-50** — Recovery is frontier-aware: `prepare` replays the WAL in commit order and returns the post-frontier redo list (legacy type-4 records mapped to equivalent cells); boot applies redo after the pools exist and before workers spawn; the clean marker seeds the frontier. (§10.1, §10.3, FR-7)
-- **FR-51** — The crash matrix gains page-survival rows: commit + checkpoint → restart serves from pages with no redo; commit only → full redo; kill mid-flush-pass → frontier unmoved, full redo; torn-tail semantics unchanged. (§10.3)
+- **FR-48** — The checkpointer advances the per-DB truncatable LSN only after a fully drained pass — zero refused pages, post-flush dirty set empty, no in-flight applies — to the minimum resident page LSN; every page writeback is `fdatasync`ed before it reports success. (§9, I7) **Retired 2026-11-27 by storage M8**: there is no page writeback and no checkpoint — durability follows the log (§12.6), and no commit ever waits on a page flush.
+- **FR-49** — Every committing session registers an in-flight-apply slot before its first WAL reservation and clears it only after page apply; the frontier can never outrun an applied commit. (§9) **Retired 2026-11-27 by storage M8**: with no frontier there is nothing to fence; a commit's durability is its log append's, full stop.
+- **FR-50** — Recovery is frontier-aware: `prepare` replays the WAL in commit order and returns the post-frontier redo list (legacy type-4 records mapped to equivalent cells); boot applies redo after the pools exist and before workers spawn; the clean marker seeds the frontier. (§10.1, §10.3, FR-7) **M8 amendment:** the frontier and the clean marker are gone — pages are served by the page store as of the durable LSN (storage §12.6, M6/M7 landed this on the storage side); the runtime's own replay exists only for the debug engine until the heap AM replaces it, and it replays the whole durable log.
+- **FR-51** — The crash matrix gains page-survival rows: commit + checkpoint → restart serves from pages with no redo; commit only → full redo; kill mid-flush-pass → frontier unmoved, full redo; torn-tail semantics unchanged. (§10.3) **M8 amendment:** the checkpoint rows become page-store rows — pages a restart serves come from the page store's materialized state (storage M7's crash tests own that side); the runtime matrix keeps commit-then-crash (full replay) and torn-tail rows.
 
 ## 4. Milestones & tasks
 
@@ -327,14 +327,14 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - Code review: tick overtaking itself (re-entrant scheduling); timer drift compounding.
 - Test review: is the wakeup-count assertion tolerant enough for CI yet strict enough to catch a `loop {}`?
 
-**T4.2 Checkpointer (orchestrates-only).**
+**T4.2 Checkpointer (orchestrates-only).** *(Landed in the T4.2 milestone; the landed machinery retired 2026-11-27 with storage M8 — pages are never written back, so there is nothing to orchestrate. The housekeeper's no-storage-I/O instrumentation discipline survives in the reaper/drain families.)*
 - Goal: housekeeper decides, workers flush in-pool, truncatable LSN advances.
 - FRs: FR-31.
 - Tests: dirty pages flushed through worker `submit_to`; housekeeper thread never issues I/O (instrumented assertion); truncatable LSN advances; re-run of the T3.2 gate through this path.
 - Code review: any direct housekeeper I/O; cross-NUMA Tier B touch (§9/§6.2 violation); flush fan-out missing a shard.
 - Test review: does the "never touches I/O" assertion instrument the *syscall layer* (can't be fooled by an abstraction change)?
 
-**T4.3 WAL recycler + truncatable LSN.**
+**T4.3 WAL recycler + truncatable LSN.** *(Landed in the T4.3 milestone; retired 2026-11-27 with storage M8 — retention is the log store's own contract, storage §5.6.)*
 - Goal: old segments recycle, never needed ones.
 - FRs: FR-32.
 - Tests: recycle only below the per-DB truncatable LSN; needed-segment protection under concurrent checkpoint; per-DB isolation (one DB's recycle never touches another's segments).
@@ -463,6 +463,7 @@ untouched. The concurrent-BPM decisions are ADR-0003 (A17 closes there).
 - Test review: is the page-boundary fill exact (64-row page) or approximate?
 
 **T6.5 Runtime wiring + live checkpoint + the frontier rule.**
+*(Superseded in part, 2026-11-27: storage M8 removed the checkpoint — no `flush_pass`, no frontier, no `fdatasync`'d writeback, FR-48/FR-49 retired. What remains of this task: boot builds per-NUMA BPMs + `Arc<[Arc<Bpm>]>` + the heap view into the session env; the commit path is register-in-flight → reserve/fill HeapInsert → heap apply `write_logged` (the log is the only durable write; the page store materializes independently by replaying the same log); the wire suites pass unchanged; the second-connection-never-sees-uncommitted-rows wire test stays pinned; and the runtime's `DurableLsn` adapter over the log store lands here — the BPM's constructor argument needs its first real impl.)*
 - Goal: the wire path goes through pages; the frontier leaves 0 without lying.
 - FRs: FR-47, FR-48, FR-49.
 - Do: boot builds per-NUMA BPMs + `Arc<[Arc<Bpm>]>` + heap view into the session env (§10.1 step 6c, the shape `Worker.pool_index` anticipates); per-worker `CoreStorage`; commit = register in-flight → reserve/fill HeapInsert (barrier phases `reserved`/`midfill`/`synced` preserved) → heap apply `write_logged(commit_end)` → clear in-flight; `flush_pass(bpm, own_store, db, trunc, inflight)` on each NUMA's designated worker under the drained-pass rule; `CoreStorage::write_page` gains `fdatasync`; shutdown's final flush runs per NUMA (FR-8).
@@ -471,6 +472,7 @@ untouched. The concurrent-BPM decisions are ADR-0003 (A17 closes there).
 - Test review: does the frontier test prove monotonicity across multiple passes, or read once?
 
 **T6.6 Recovery + crash matrix.**
+*(Superseded in part, 2026-11-27: storage M8 removed the frontier and the clean marker — see FR-50/FR-51's amendments. The runtime replay walks the whole durable log for the debug engine; page-survival rows belong to the page store's boot (storage M6/M7, already landed there), and the runtime matrix keeps commit-then-crash and torn-tail rows.)*
 - Goal: restart serves pages; redo only past the frontier.
 - FRs: FR-50, FR-51.
 - Tests: `prepare` returns the post-frontier redo list in commit order (legacy type-4 mapped); boot applies redo post-pool-construction pre-worker-spawn on a throwaway executor; boot-order assertion extended (redo done before the first session); matrix rows: checkpointed-clean restart (no redo, pages serve) · commit-then-crash (full redo) · kill mid-flush-pass (frontier unmoved → full redo) · torn tail unchanged; fixtures' log builders rewritten to HeapInsert; exact row sets asserted, page layout explicitly NOT asserted.
@@ -560,8 +562,8 @@ Run on the new/changed tests; findings block the commit.
 | FR-28 | T5.2 | lock-free read path; race + reclamation tests |
 | FR-29 | T5.3, T5.4 | fan-out integration; cross-worker visibility |
 | FR-30 | T5.3 | stalled-reactor pending-ack; issuing-reactor-first |
-| FR-31 | T4.2 | in-pool flush; housekeeper-no-I/O instrumentation |
-| FR-32 | T4.3 | boundary ±1 recycle; per-DB isolation |
+| FR-31 | T4.2 | in-pool flush; housekeeper-no-I/O instrumentation *(retired — storage M8)* |
+| FR-32 | T4.3 | boundary ±1 recycle; per-DB isolation *(retired — storage M8)* |
 | FR-33 | T4.6 | multi-worker aggregation; double-count test |
 | FR-34 | T4.5 | reaper timeout; active-conn untouched |
 | FR-35 | T5.1 | thread-id, internal-`!Send`, compile-fail closure |
@@ -573,14 +575,14 @@ Run on the new/changed tests; findings block the commit.
 | FR-41 | T6.2 | write-vs-flush race stress, CRC-valid read-back; exclusive-pin retry |
 | FR-42 | T6.2 (+ T5.7 entry point) | NUMA-binding `#[ignore]` numa_maps check |
 | FR-43 | T6.2 | FNV golden literals moved into cascade-bpm; runtime parity test |
-| FR-44 | T6.2 | eviction reuses frames; dirty eviction gated; full-pool behavior |
+| FR-44 | T6.2 | eviction reuses frames; dirty eviction gated; full-pool behavior *(M8: dirty rung now drops durable-covered pages; the gated-writeback tests are gone)* |
 | FR-45 | T6.3 | encode/decode roundtrip; golden bytes |
 | FR-46 | T6.4 | page-boundary fill; scan completeness; append-during-scan progress |
 | FR-47 | T6.5 | existing wire suites pass unchanged; uncommitted-invisibility pinned |
-| FR-48 | T6.5 | SyncCountingStore sync-precedes-advance; frontier monotone; drained-pass units |
-| FR-49 | T6.5 | in-flight-blocks-advance unit test |
-| FR-50 | T6.6 | redo-from-frontier boot test; boot-order assertion |
-| FR-51 | T6.6 | crash-matrix page-survival rows ×4 |
+| FR-48 | T6.5 | SyncCountingStore sync-precedes-advance; frontier monotone; drained-pass units *(retired — storage M8)* |
+| FR-49 | T6.5 | in-flight-blocks-advance unit test *(retired — storage M8)* |
+| FR-50 | T6.6 | redo-from-frontier boot test; boot-order assertion *(M8: full-log replay; page survival via the page store)* |
+| FR-51 | T6.6 | crash-matrix page-survival rows ×4 *(M8: page-store rows; runtime keeps full-replay + torn-tail)* |
 
 ## 7. Deferred — deliberate non-goals of *this plan* (not gaps)
 

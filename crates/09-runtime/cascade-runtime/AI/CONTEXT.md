@@ -117,65 +117,27 @@ loop. The orchestrator is serving-thread-local by construction —
 boot ships an all-`Send` `OrchestratorInit` bundle and the serving
 thread assembles via `Orchestrator::from_counters` + `register`.
 
-**Checkpointer (T4.2, FR-31) — orchestrates only.** `src/checkpointer.rs`:
-the housekeeper-side `CheckpointFanout` (a `TickJob`) `try_send`s
-`ControlMsg::FlushPass` over each NUMA pool's *designated* reactor's
-dedicated control channel (`new_bounded::<ControlMsg>(64)`, separate
-from the connection handoff channel; the formal `submit_to` is T5.1 —
-this is the staged stand-in with the same topology). A full channel
-refuses (counted in `CheckpointStats::refused`); the next tick
-re-signals — the housekeeper never blocks on a worker. The worker side
-runs `control_loop` as a sibling task on its own ring; `flush_pass`
-iterates the reactor-local BPM's `dirty_pages()` (filter: this DB),
-writes each back through the T3.2 gate, and advances the per-DB
-`TruncatableLsn` (monotonic `fetch_max`). The frontier rule is
-PostgreSQL-conservative: advance to the **minimum stamp over all pages
-dirty at pass start** (refused pages' stamps still constrain — their
-state lives only in the log), only when something stamped was dirty;
-nothing-dirty ⇒ no advance. Live engine truth: workers host no BPM yet,
-so live passes scan nothing and the frontier stays `Lsn(0)` — the whole
-WAL stays reclaimable-by-nothing, which the T4.3 recycler must respect.
-Observables on `Runtime`: `checkpoint_stats()` (requested/refused/
-passes; `None` without a listener) and `truncatable_lsn()` (`Some`
-whenever `wal_dir` is configured — the recycler reads it even on a
-compute boot). The no-housekeeper-I/O property is tested at the
-*syscall* layer: kernel per-task accounting
-(`/proc/self/task/<tid>/io`; network never appears there), threads
-located by comm name via `tid_named`.
-
-**WAL recycler (T4.3, FR-32) — orchestrates only, own channel.**
-`src/recycler.rs`: the housekeeper-side `WalRecycler` (a `TickJob`)
-`try_send`s a `RecycleSignal { db, below }` — the frontier snapshot —
-down the DB's **dedicated recycle channel** to the designated reactor
-of the DB's WAL-home NUMA. The channel is the design: SPSC means the
-recycler cannot share a sender with the checkpoint fanout, so the
-fanout's set stays exactly the T4.2 whole one while a recycle signal is
-*structurally* unable to reach any reactor but its DB's home one
-(cross-DB isolation is topology, not a filter a refactor could drop).
-The receiving end lands on the first worker of the home NUMA (boot
-assigns it via `recycle_receivers`, mirroring the per-NUMA designated
-rule); that worker runs `recycle_loop` as a sibling task next to
-`control_loop` — no dispatch, the channel carries nothing else. The
-home NUMA is resolved at boot **before the housekeepers spawn**
-(`walhome::resolve_wal_home`, extracted so the recycler target and the
-writer construction consume one decision): tick-time resolution would
-read the persisted-homes file on the housekeeper and break the no-I/O
-property. Registration order in the serving orchestrator: StallWatch →
-CheckpointFanout → WalRecycler — consumer after producer, so a tick's
-recycle observes the same tick's frontier advance. The worker-side
-`RecycleSite` computes `cascade_wal::recycle_decision` (strictly-below
-the snapshot, quantized to whole 16 MB windows, saturating at seg=0)
-and never touches the frontier — only the checkpointer writes it.
-Refusals (full channel) are counted; recycle is idempotent per
-snapshot, so a drop costs one tick of staleness. Live engine truth:
-frontier pinned at 0 (no worker BPM), so a live recycle reclaims zero
-bytes and `db_<db>.log` stays **byte-identical** across a full second
-of ticks while recovery still replays every committed row — the
-boundary math itself (±1 at exactly the truncatable LSN) is pinned at
-the cascade-wal level. The physical rotate-and-retire lands with the
-segmented WAL (§8.2). Observable: `Runtime::recycle_stats()`
-(signals/refused/passes/reclaimed_bytes; `None` without a listener or
-a WAL).
+**Checkpointer and WAL recycler — RETIRED (storage M8, 2026-11-27).**
+`src/checkpointer.rs`, `src/recycler.rs`, `src/walgate.rs`, and
+`handoff::ControlMsg` (whose only variant was `FlushPass`) are gone,
+with their control/recycle channel families, the `TruncatableLsn`
+frontier, and the `checkpoint_stats()`/`recycle_stats()`/
+`truncatable_lsn()` observables. Storage migration step M8 made pages
+a pure cache: the buffer pool never writes pages back (the log is the
+only durable write; only the page store writes pages — storage design
+§9 M8, §12.5), so there is no flush pass to fan out, no truncatable
+frontier for a recycler to consume, and log retention is the log
+store's own contract (`set_retained_from` + `retention_holders`,
+storage §5.6). The housekeeper keeps the stall watch (T4.1) and the
+reaper (T4.5); the orchestrator's tick jobs shrank accordingly. The
+per-worker control channel topology lesson (endpoints connect on
+different executors; a sequential same-executor pair deadlocks
+spinning) lives on in `handoff.rs`'s doc — the drain and reap families
+keep the rule. The runtime's `DurableLsn` adapter over the log store
+(replacing the gate glue) lands with the heap-AM wiring task, its
+first real consumer. The syscall-layer no-I/O testing discipline
+(kernel per-task accounting, `tid_named`) stays as the pattern for
+every "orchestrates only" claim.
 
 **Graceful shutdown (T4.4, FR-8) — §10.2 verbatim, in order, on the
 serving housekeeper.** `src/shutdown.rs`: the whole sequence runs where
@@ -198,14 +160,15 @@ the deadline (the force-abort half is finished by step 5's reactor
 drop), and the gauge is balanced by an RAII `GaugeGuard` — a manual
 decrement would miss an unwinding panic and stick the gauge forever,
 silently converting every later shutdown into the deadline path.
-Final flushes ride the **third dedicated channel family**
+Final flushes ride a **dedicated channel family**
 (`DrainMsg::FinalFlush` to each designated reactor; SPSC — the control
-channel stays pure T4.2-flush, the recycle channel pure T4.3-recycle):
-the WAL-home reactor flushes the per-DB WAL tail first (step 3), then
-every designated reactor runs one final pass (step 4) — passes run
-**unconditionally**, so the trace proves flushes RAN rather than were
-skipped as "nothing dirty" (the live frontier pins at 0 and the pass
-still acks). The home site is identified by a **flag carried in the
+and recycle families that used to sit next to it retired with storage
+M8): the WAL-home reactor flushes the per-DB WAL tail (step 3) — since
+storage M8 the whole final flush, there being no page flush pass at
+all — and every designated reactor **acks unconditionally** (step 4's
+shape), so the trace proves the drain RAN rather than was skipped
+(`final-flush-acks` phase; the retired name `final-bpm-flush` would
+now lie). The home site is identified by a **flag carried in the
 sender tuple, never by ack slot position**: a persisted WAL home on a
 pooled NUMA with no workers yields no flagged sender, and the drain
 then refuses the marker (`shutdown_no_wal_home_reactor`) instead of
@@ -337,8 +300,8 @@ read instant; none can go backwards). The read is the STAGED stand-in
 for §6.1's `submit_to` fan-in (ask each reactor to produce its own
 slice, which is what would make these Tier A): T5.1 is not built, so
 the sum reads the shared atomics directly from the caller — correct on
-the §4 Tier B substrate, documented as the deviation, same discipline
-as the checkpointer's staged control channel. Tests answer the plan's
+the §4 Tier B substrate, documented as the deviation, the counted-staging
+discipline the background signal families share. Tests answer the plan's
 review question with real traffic, not synthetic sums: one real txn
 per worker with the split OBSERVED (least-loaded pick, per-worker
 gauges assert exactly two reactors at load 1) and exact totals — any
@@ -387,7 +350,7 @@ an `Rc` is rejected at compile time with E0277 on the `F: Send` bound
 (the `.stderr` is rustc-version-sensitive — regenerate with
 `TRYBUILD=overwrite` on toolchain upgrades). Boot wiring is
 deliberately absent until T5.3 (the first real consumer) — the same
-staging discipline as the checkpointer's channel.
+staging discipline as the background signal families' channels.
 
 **Tier C snapshot + pointer-load reads (T5.2, FR-28, §6.3/§8.4) —
 the pointer is the lock-free read.** `src/tierc.rs`: the T2.4 static
