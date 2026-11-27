@@ -304,7 +304,7 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - Code review: waiter missed in the race window between "flush in flight" check and enqueue; sync batching starving a latecomer; leader dying mid-sync (who re-leads?).
 - Test review: is the "exactly once" assertion idempotent-tolerant or does it count wakeups precisely? Is the stress sized to actually hit the race windows (or fault-injected instead of hoping)?
 
-**T3.2 WAL-before-data gating.**
+**T3.2 WAL-before-data gating.** *(Landed in the T3.2 milestone; the gate and its whole surface — the write-back it protected, the checkpointer path it fed — retired 2026-11-27 with storage M8: pages are never written back, so there is no dirty page that can reach disk ahead of its WAL. The surviving WAL-before-data rules are §12.5's: never evict above the durable LSN; pages change only through applied groups whose bytes are in the log.)*
 - Goal: no dirty page reaches disk ahead of its WAL.
 - FRs: FR-24.
 - Tests: planted dirty page with undurable LSN — writeback blocks until flush advances; fault-injection at the gate; checkpointer path (once it exists, T4.2) re-tested through the same gate.
@@ -421,6 +421,8 @@ The M0–M5 runtime drives a debug stand-in: rows live only in the WAL, the fron
 is pinned at 0, no worker BPM exists. M6 swaps the substrate — real heap tuples on
 real 8 KiB pages through the per-NUMA BPM — so the machinery M3–M5 built (the
 writeback gate, `flush_pass`, the recycle decision) finally does physical work.
+*(M8 note, 2026-11-27: it did, and was then retired — the write-back machinery this
+paragraph anticipated no longer exists; pages are a cache, storage §9/§12.5.)*
 Scope guards (§7 stands): no MVCC visibility logic (`xmin` stamped, `xmax`/undo-ref
 reserved — the slice stays single-writer-per-row), no btree/index (scan + id filter),
 no planner/extended protocol, no segmented-WAL physical recycle, single dev DB,
@@ -505,7 +507,7 @@ Keyed to spec §12 invariants (I1–I13) plus crash/lifecycle classes. Run again
 4. **I4a/b/c** — NUMA-local allocation for per-reactor memory; `single`-DB Tier B touched only from its bound NUMA (background work goes via `submit_to` to the bound NUMA); `cross`-DB cross-NUMA reads stay within the documented trade.
 5. **I5** — hot-path ops carry `TenantContext`.
 6. **I6** — hot-path ops accept `&Span`.
-7. **I7** — every dirty-page writeback path is gated on durable WAL. *All of them.*
+7. **I7** — every dirty-page writeback path is gated on durable WAL. *All of them.* *(M8: the writeback paths are gone entirely — the surviving rule is §12.5's, on the BPM's eviction and stamps.)*
 8. **I8** — WAL records carry full row images.
 9. **I9** — Tier C read via `ArcSwap::load()` only; writes only through the housekeeper.
 10. **I10** — long operators yield at batch boundaries and internal sub-boundaries.
@@ -555,7 +557,7 @@ Run on the new/changed tests; findings block the commit.
 | FR-21 | T1.6 | signature shape; span propagation test |
 | FR-22 | T1.9, T2.3, T2.5 | pool mapping, per-NUMA sizing, hash determinism |
 | FR-23 | T1.9 | hit/miss/pin; panic-pin release; I2 shape |
-| FR-24 | T3.2 | writeback gating + fault-injection |
+| FR-24 | T3.2 | writeback gating + fault-injection *(retired — storage M8; the gate's laws live on in §12.5's eviction/stamp rules, pinned in cascade-bpm's tests)* |
 | FR-25 | T1.10, T3.1, T3.3 | torn-fill (incl. panic); watermark probe; crash matrix |
 | FR-26 | T1.10, T3.1 | leader CAS stress; exactly-once; multi-handle coverage |
 | FR-27 | T1.10, T1.11, T2.6, T3.3 | kill-after-ack replay; homing + persistence |

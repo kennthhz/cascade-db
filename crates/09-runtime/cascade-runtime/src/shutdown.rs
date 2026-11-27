@@ -112,14 +112,14 @@ pub struct FinalFlushCtx {
 }
 
 /// The worker-side drain loop: a sibling task next to the session accept
-/// loop, on the designated reactor's own ring. `passes` counts the
-/// final-flush acks this reactor lands (the observable the shutdown
-/// trace's step-4 records assert). Dies when the serving side drops its
-/// sender (serve returns → drain senders drop → `recv` yields `None`) or
-/// with the ring itself.
+/// loop, on the designated reactor's own ring. The ack each message
+/// carries is the observable — the serving side's `recv_timeout` per ack
+/// is what the trace's `final-flush-acks` phase records; no separate
+/// counter exists (a write-only one would suggest coverage it does not
+/// have). Dies when the serving side drops its sender (serve returns →
+/// drain senders drop → `recv` yields `None`) or with the ring itself.
 pub async fn drain_loop(
     recv: ConnectedReceiver<DrainMsg>,
-    passes: Arc<AtomicU64>,
     final_flush: Option<FinalFlushCtx>,
 ) {
     while let Some(msg) = recv.recv().await {
@@ -139,14 +139,12 @@ pub async fn drain_loop(
                                 .flush_wal_sink(writer.filled())
                                 .await
                                 .map_err(|e| e.to_string())?;
-                            passes.fetch_add(1, Ordering::Relaxed);
                             Ok(())
                         }
                         Some(_) => {
                             // No page work exists for a non-home
                             // designated reactor (storage M8): the ack
                             // says the drain reached this reactor.
-                            passes.fetch_add(1, Ordering::Relaxed);
                             Ok(())
                         }
                     }

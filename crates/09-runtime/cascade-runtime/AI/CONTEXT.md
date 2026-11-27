@@ -197,8 +197,9 @@ but unbounded in total — a total handshake deadline belongs to the
 pgwire slice.
 
 **Idle-connection reaper (T4.5, FR-34) — the idle definition is the
-design.** `src/reaper.rs`: the fourth dedicated channel family (SPSC —
-control stays T4.2-flush, recycle T4.3-recycle, drain T4.4-final-flush).
+design.** `src/reaper.rs`: a dedicated channel family (SPSC; the
+second survivor after the drain — the control and recycle families
+that preceded them retired with storage M8).
 The serving housekeeper's `IdleReaper` (a `TickJob`) `try_send`s an
 empty `ReapTick` to **every** worker — idle connections live on all
 rings, not just designated ones; the signal carries no timeout
@@ -256,7 +257,8 @@ WAL rows − acked ≤ kills). Revisit both bounds on bare metal.
 boot deadlock: all executors spinning at 100%)**: a `connect()` blocks
 until the peer endpoint connects on its own executor, so the serving
 side must connect the signal families in the same order the workers do
-(handoff → control → recycle → drain → reap) — connecting the reaper
+(handoff → drain → reap; the control and recycle families that used to
+sit between handoff and drain retired with storage M8) — connecting the reaper
 before the drain deadlocked: the serving thread waited inside a
 reap-sender connect for a worker still waiting inside its drain connect
 for this thread's drain senders, sequenced after the reapers. The rule
@@ -492,7 +494,7 @@ proximity holds at 0 across it; `None` NIC discovery is inert the same
 way). Strict `<` keeps first-route-wins on full ties — the T2.4
 determinism survives the composite. The CPU half is
 `src/cpuload.rs`: each reactor spawns a sibling sampler task (next to
-control/recycle/drain/reap) that reads ITS OWN thread's
+the drain and reap loops) that reads ITS OWN thread's
 `getrusage(RUSAGE_THREAD)` every `load_sample_ms` (default 1 000 ms,
 A2; `0` disables), computes `ewma ← (ewma + sample) / 2` in integer
 milli-units (α = 0.5; the FIRST sample seeds rather than halves in

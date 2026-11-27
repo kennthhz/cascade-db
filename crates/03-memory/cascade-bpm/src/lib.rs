@@ -58,7 +58,11 @@
 //!   LSN** (§12.5): the page store may not have its changes yet. Once
 //!   durability covers the stamp, dropping the page loses nothing — the
 //!   store rebuilds it — so a durable-covered dirty page is dropped in
-//!   place, with no write.
+//!   place, with no write. The stamp itself keeps two rules: it never
+//!   moves backward (pin order need not match LSN order, and the image
+//!   carries both applies), and any mutation without a covering boundary
+//!   (plain `write`, or the `Lsn(0)` sentinel) clears it — an uncovered
+//!   change must never hide behind an older, covered stamp.
 //! - **Unlogged changes are never evicted in v1**: a frame modified
 //!   through plain `write` (no stamp) cannot be rebuilt from the log, so
 //!   eviction would lose the image outright. Such a frame is skipped by
@@ -672,7 +676,14 @@ impl Bpm {
         // Fill under the claim: the frame is table-absent (unobservable to
         // hits and victim scans) until the publish below. The frame
         // remembers the IMAGE's page LSN (S17), not the read point — that
-        // is what the eviction rule compares against durability.
+        // is what the eviction rule compares against durability. Promise 1
+        // (§4.5) says the image's stamp is at or below the read point; a
+        // source that breaks it would poison the eviction rule, so the
+        // boundary is asserted at the only place it enters.
+        debug_assert!(
+            image.page_lsn <= at_lsn,
+            "the page source returned an image stamped above the read point (§4.5 promise 1)"
+        );
         {
             let mut inner = frame.lock();
             inner.page_id = Some(page_id);
@@ -744,7 +755,12 @@ impl Bpm {
 
         let idx = self.acquire_frame()?;
         let frame = &self.frames[idx as usize];
-        // Fill under the claim — same discipline as `page`.
+        // Fill under the claim — same discipline as `page`, same promise-1
+        // assertion at the boundary.
+        debug_assert!(
+            image.page_lsn <= at_lsn,
+            "the page source returned an image stamped above the read point (§4.5 promise 1)"
+        );
         {
             let mut inner = frame.lock();
             inner.page_id = Some(page_id);
@@ -846,9 +862,12 @@ impl Bpm {
 
     /// Scans for an unpinned clean resident frame, claims it, and unmaps
     /// it straight onto the free list (`true` = one frame freed). Clean
-    /// victims are the ladder's cheap rung: no rule to check beyond the
-    /// re-verify. The claim exists so the re-verify (the metadata could
-    /// move between peek and claim) and the unmap are exclusive.
+    /// victims are the ladder's cheap rung; the claim exists so the
+    /// re-verify (the metadata could move between peek and claim) and
+    /// the unmap are exclusive. The re-verify runs the §12.5 rule in
+    /// full — the design's letter makes no clean/dirty distinction, and
+    /// a source that violated promise 1 (an image stamped above the read
+    /// point) must not turn into a droppable clean frame.
     fn unmap_one_clean_victim(&self) -> bool {
         for (idx, frame) in self.frames.iter().enumerate() {
             {
@@ -860,15 +879,22 @@ impl Bpm {
             if !frame.try_claim() {
                 continue;
             }
-            // Re-verify under the claim: the dirty bit may have moved
+            // Re-verify under the claim: the metadata may have moved
             // between the unlocked peek and the claim.
             let page_id = {
                 let inner = frame.lock();
-                if inner.dirty || inner.page_id.is_none() {
-                    frame.release_claim();
-                    continue;
+                match inner.page_id {
+                    Some(p)
+                        if !inner.dirty
+                            && self.evictable(inner.scope, inner.dirty, inner.page_lsn) =>
+                    {
+                        p
+                    }
+                    _ => {
+                        frame.release_claim();
+                        continue;
+                    }
                 }
-                inner.page_id.unwrap()
             };
             self.unmap_claimed(idx as u32, page_id);
             return true;
@@ -1154,12 +1180,16 @@ impl PageGuardMut {
     ///
     /// Unlogged modification is the caller's contract (like PG's unlogged
     /// tables): the image keeps the change, but the page store cannot
-    /// rebuild it, so this page will refuse eviction until it is dropped
-    /// by an explicit decision of the layer above (a temp store, later).
+    /// rebuild it. The stamp CLEARs — the image no longer equals
+    /// replay-through-page_lsn, so a stale stamp must not make the frame
+    /// look rebuildable — and an unlogged-modified frame refuses eviction
+    /// until the layer above drops it by explicit decision (a temp store,
+    /// later).
     pub fn write<R>(&mut self, f: impl FnOnce(&mut [u8]) -> R) -> R {
         let frame = &self.bpm.frames[self.idx as usize];
         let mut inner = frame.lock();
         inner.dirty = true;
+        inner.page_lsn = None;
         // SAFETY: idx < max_frames; the EXCL pin excludes every other
         // mutator, and the frame mutex excludes concurrent snapshots.
         let result = unsafe {
@@ -1181,13 +1211,26 @@ impl PageGuardMut {
     /// caller's duty (the mini-transaction rule, §12.5): the group's
     /// bytes are in the log *before or with* this apply reaching the
     /// frame — the log is the only durable write.
+    ///
+    /// Two stamp rules keep the eviction rule sound. **Monotone**: the
+    /// stamp never moves backward. The exclusive pin serializes applies
+    /// to one frame, but pin order need not match LSN order — two groups
+    /// reserving [10,20) and [20,30) can apply in either order, and the
+    /// image carries BOTH once both ran; the stamp must therefore stand
+    /// at the higher boundary, or the frame would look durable-covered
+    /// while its newest applied record ends above the durable LSN. **No
+    /// boundary, no stamp**: `Lsn(0)` (the sentinel — real boundaries are
+    /// ≥ 1) means this mutation is not covered by any record, so the
+    /// stamp clears, exactly as plain [`write`](PageGuardMut::write)
+    /// clears it — an uncovered change must never hide behind an older,
+    /// covered stamp.
     pub fn write_logged<R>(&mut self, wal_end: Lsn, f: impl FnOnce(&mut [u8]) -> R) -> R {
         let frame = &self.bpm.frames[self.idx as usize];
         let mut inner = frame.lock();
         inner.dirty = true;
-        // LSN 0 is the not-stamped sentinel (a reserved record precedes
-        // every real stamp, so boundaries are ≥ 1).
-        if wal_end.0 != 0 {
+        if wal_end.0 == 0 {
+            inner.page_lsn = None;
+        } else if wal_end > inner.page_lsn.unwrap_or(Lsn(0)) {
             inner.page_lsn = Some(wal_end);
         }
         // SAFETY: as `write`.

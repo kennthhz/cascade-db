@@ -69,8 +69,8 @@ flowchart TB
     TA1 -->|"BPM lookup"| BPM1
     TA1 -->|"append_wal / flush_wal"| WAL1
     TA0 -.->|"cross DB: any pool via hash(PageId) (§2.5.1)"| BPM1
-    W0 -->|"page-in · writeback · fdatasync (own ring)"| FILES
-    W1 -->|"page-in · writeback · fdatasync (own ring)"| FILES
+    W0 -->|"page-in reads only (M8: no writeback)"| FILES
+    W1 -->|"page-in reads only (M8: no writeback)"| FILES
 ```
 
 ## B. OLTP hot-path data flow (§7–§8)
@@ -83,14 +83,14 @@ flowchart LR
     EX -->|"every batch boundary"| YP["yield_point()<br/>500 µs deadline (§7.1)"]
     EX --> LK["BPM lookup<br/>single: BPMs[k]<br/>cross: hash(PageId) mod num_numas"]
     LK -->|"hit"| PIN["pin frame<br/>(PageGuard RAII)"]
-    LK -->|"miss"| IO["PageStore read —<br/>this reactor's ring"]
+    LK -->|"miss"| IO["PageSource read at the<br/>durable LSN — this reactor's ring"]
     IO --> PIN
     PIN --> ROWS["rows → batches → results"]
     EX --> TX["COMMIT — append_wal:<br/>reserve LSN → fill record (§8.2)"]
     TX --> FL["flush_wal —<br/>leader election via CAS"]
     FL --> FS["io_uring fdatasync<br/>on leader's own ring"]
     FS --> ACK["durability ≥ filled watermark<br/>→ commit ack"]
-    TX -.->|"I7 WAL-before-data:<br/>dirty pages flush only after WAL durable"| WB["page writeback<br/>(shard-home core)"]
+    TX -.->|"M8: pages are a cache —<br/>apply to the frame, never write back<br/>(§12.5; the old I7 writeback edge is gone)"| CACHE["page store materializes<br/>from the log independently"]
 ```
 
 ## C. Workflow — connection lifecycle, query, commit (§5, §7, §8.2)

@@ -11,11 +11,13 @@ offset  0: format_version u16   (1)
 offset  2: page_kind       u16   (1 = heap)
 offset  4: slot_count      u16
 offset  6: free_offset     u16   cells occupy [free_offset, PAGE_SIZE)
-offset  8: page_lsn        u64   reserved ZERO in M6 — the BPM frame stamp is
-                                 the authoritative writeback boundary while
-                                 nothing replays from page images; the field
-                                 is format-complete so replay-from-pages (the
-                                 FR-50 milestone) needs no format change.
+offset  8: page_lsn        u64   reserved ZERO in M6 — the stamp lives where the
+                                 image lives (the BPM frame since M8: stamped by
+                                 write_logged on the apply path, read by §12.5's
+                                 eviction rule; the page store keeps its own in
+                                 the sidecar record, storage §6.3); the field
+                                 is format-complete so replay-from-pages needs
+                                 no format change.
 offset 16: reserved 16 bytes (zero)
 offset 32: slot array — slot_count × u16 LE cell offsets, growing UP
 tail:     cells growing DOWN from PAGE_SIZE

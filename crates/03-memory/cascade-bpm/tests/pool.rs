@@ -696,6 +696,121 @@ fn miss_on_full_pool_drops_a_durable_covered_victim() {
     drop(loaded);
 }
 
+/// An unlogged mutation AFTER a logged apply clears the stamp: a stale
+/// covered stamp must never make the frame look rebuildable while the
+/// image carries changes the log cannot reproduce. Eviction refuses at
+/// any durable LSN.
+#[test]
+fn unlogged_write_after_a_logged_stamp_refuses_eviction() {
+    let t = Rig::with_frames(1);
+    let stamp = t.seed(0, &[0x01]);
+    let group_end = *t.next_lsn.lock().unwrap();
+    t.durable_to(Lsn(group_end));
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
+    {
+        let mut g = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+            .expect("load");
+        g.write_logged(stamp, |p| p[5] = 0x55);
+    }
+    assert_eq!(t.bpm.page_lsn(&page), Some(Some(stamp)));
+    {
+        let mut g = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+            .expect("re-open");
+        // The unlogged tweak: the image now differs from anything the
+        // log can rebuild.
+        g.write(|p| p[6] = 0x66);
+    }
+    assert_eq!(
+        t.bpm.page_lsn(&page),
+        Some(None),
+        "the unlogged write cleared the stale stamp"
+    );
+    assert!(
+        !t.bpm.evict_page(page).expect("no error — a refusal"),
+        "the mixed frame must not be droppable through its old stamp"
+    );
+    // The ladder refuses too: the only frame is (dirty, no stamp), and
+    // no durable advance changes that — no stamp means no coverage
+    // relation at all.
+    match block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1))) {
+        Err(BpmError::PoolFull { .. }) => {}
+        Ok(_) => panic!("the mixed frame must not be dropped by the ladder"),
+        Err(other) => panic!("expected PoolFull, got {other:?}"),
+    }
+}
+
+/// The stamp never moves backward: two groups whose boundaries landed in
+/// either pin order leave the stamp at the HIGHER end, so the frame
+/// stays undroppable until durability covers the newest applied record.
+#[test]
+fn the_stamp_never_moves_backward() {
+    let t = Rig::with_frames(2);
+    let _stamp = t.seed(0, &[0x01]);
+    let group_end = *t.next_lsn.lock().unwrap();
+    t.durable_to(Lsn(group_end));
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
+    let e_high = Lsn(group_end + 200);
+    let e_low = Lsn(group_end + 100);
+    {
+        let mut g = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+            .expect("load");
+        // The out-of-order fiction: the later group applies first.
+        g.write_logged(e_high, |p| p[5] = 0x55);
+        g.write_logged(e_low, |p| p[6] = 0x66);
+    }
+    assert_eq!(
+        t.bpm.page_lsn(&page),
+        Some(Some(e_high)),
+        "the backward apply must not drag the stamp down"
+    );
+    assert!(
+        !t.bpm.evict_page(page).expect("no error — a refusal"),
+        "undurable at e_low's coverage: the frame must refuse"
+    );
+    t.durable_to(e_low);
+    assert!(
+        !t.bpm.evict_page(page).expect("no error — a refusal"),
+        "durability covering the LOWER boundary is not enough"
+    );
+    t.durable_to(e_high);
+    assert!(
+        t.bpm.evict_page(page).expect("covered now"),
+        "durability covering the true (higher) stamp drops the frame"
+    );
+}
+
+/// The `Lsn(0)` sentinel means "no boundary": it clears the stamp like
+/// plain `write` — an uncovered change must never hide behind an older,
+/// covered stamp.
+#[test]
+fn the_zero_sentinel_clears_the_stamp() {
+    let t = Rig::with_frames(2);
+    let stamp = t.seed(0, &[0x01]);
+    t.durable_to(stamp);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
+    {
+        let mut g = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+            .expect("load");
+        g.write_logged(stamp, |p| p[5] = 0x55);
+        g.write_logged(Lsn(0), |p| p[6] = 0x66);
+    }
+    assert_eq!(
+        t.bpm.page_lsn(&page),
+        Some(None),
+        "the sentinel is an uncovered mutation: the stamp clears"
+    );
+    assert!(
+        !t.bpm.evict_page(page).expect("no error — a refusal"),
+        "the frame keeps its changes until the layer above decides"
+    );
+}
+
 // --- placement ------------------------------------------------------------------
 
 /// An unroutable node degrades to first-touch with node_bound() false —

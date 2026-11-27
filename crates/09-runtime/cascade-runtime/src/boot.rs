@@ -1376,13 +1376,12 @@ fn spawn_workers(
         let task_tenants = Arc::clone(tenant_counters);
         let task_stall = Arc::clone(stall);
         // The drain plane (T4.4): the designated reactors get their own
-        // loop over the drain channel, with a counter for the final-flush
-        // acks it lands and — on the WAL-home reactor — a cloned WAL pair
-        // for the final tail flush. `is_home` is the same dev-home
-        // decision the boot thread made (one decision, two consumers
-        // again). (The checkpoint and recycle loops that used to sit next
-        // to it retired with storage M8.)
-        let task_drain_passes = Arc::new(AtomicU64::new(0));
+        // loop over the drain channel; on the WAL-home reactor it carries
+        // a cloned WAL pair for the final tail flush. `is_home` is the
+        // same dev-home decision the boot thread made (one decision, two
+        // consumers again). The acks are the observable — no counter.
+        // (The checkpoint and recycle loops that used to sit next to it
+        // retired with storage M8.)
         let task_env = crate::session::SessionEnv {
             draining: Arc::clone(&draining),
             inflight: Arc::clone(&inflight),
@@ -1447,7 +1446,6 @@ fn spawn_workers(
                     };
                     glommio::spawn_local(crate::shutdown::drain_loop(
                         drains,
-                        task_drain_passes,
                         Some(final_flush),
                     ))
                     .detach();
