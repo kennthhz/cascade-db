@@ -1,109 +1,178 @@
 # cascade-heap design — the heap engine
 
-**Status:** Draft v0.1 for review, 2026-11-26. This document is the detailed design for `cascade-heap` (layer design §8.2): the PostgreSQL-style heap engine — append-only row versions, HOT chains, incremental prune and vacuum — as the compatibility engine behind the `AnyTable::Heap` arm. The *format* half of the heap (the kind-1 page, slot states, prune plans, redo byte transforms) is already designed and golden-pinned in [`cascade-page/AI/storage-page-mutation-design.md`](../../cascade-page/AI/storage-page-mutation-design.md) (decisions D1–D6); this document is the *engine* half — DML semantics, visibility walks, free space, vacuum, TOAST, and the landing plan from the T6.4 interim slice to the full MVCC engine.
+**Status:** Draft v0.2 for review, 2026-11-26. v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): the chain walk, row locks, speculative abort, the re-check, vacuum's treatment of indexes and the free-space map are corrected (R3, R4, R5, R10, R11, R21, R24, R27).
 
-**Upstream:** [`crates/05-access/AI/access-layer-design.md`](../../AI/access-layer-design.md) §4 (contract), §5 (execution model), §6 (mini-transactions); [`crates/02-storage/AI/storage-layer-design.md`](../../../02-storage/AI/storage-layer-design.md) §12.1–§12.6; HLD v2 §12 (heap engine — retired from the tree, semantics of record); WP1 F1/F2/F4 (version word, row header, key/locator encoding); WP2 D1–D5 (commit section, status table, abort path); the page mutation design D1–D6.
+**What this document is.** The detailed design of `cascade-heap`, the PostgreSQL-style engine behind the `AnyTable::Heap` arm: row versions appended to pages, HOT chains, incremental prune and vacuum. The *format* half is the page design's — the heap page, its slot states, its prune plans and its redo primitives (page D1–D6), already pinned by golden tests. This document is the *engine* half: the DML paths, the visibility walks, free space, vacuum, out-of-line storage, and the landing sequence.
 
-**Depends on:** the landed T6.1 page format; T6.2 BPM; `cascade-redo`'s sequential-fill routing law for the type-5 record (H9); the `AnyTable` contract (layer design §4); the mini-txn seam (§6.1) and `VisibilitySource` (§4.5) contracts; `cascade-index` for vacuum's index-cleanup step (its only cross-engine dependency, landing at migration step L8).
+**Upstream:** the [layer design](../../AI/access-layer-design.md) — §6 (the contract), §7 (a worked write), §8 (execution model), §9 (the write path; §9.1 defines the mini-transaction), §11.2, §13.1 (a blocking dependency). The storage design's §12.1–§12.6. The [kept document](../../AI/engine-semantics.md) §2. The page design. Citation prefixes are defined in layer §2.2; terms in layer §3.
 
----
-
-## 1. Scope: engine semantics vs the locked format
-
-The page mutation design owns the bytes: the kind-1 layout, the D1 slot-state machine (Live / Redirect / Dead / Unused), the D2 plan-carried prune, D3 compact-on-prune, D4's redo primitives (`apply_heap_insert`, `apply_delete_mark`, `apply_relink`, `apply_prune`, `apply_slot_free`), and D5's traversal vocabulary. This engine must obey those bytes and may not amend them — a format change is that document's to make. What this document adds: who calls each primitive and when, what the engine computes vs what it applies, the relation-level structures (segments, FSM), the DML conflict paths, TOAST, and the landing sequence.
-
-Two corrections this engine makes to the *pre-pivot* world still visible in the crate's stubs and old CONTEXT (fixed by the layer design's §12 sync list): the heap does **no in-place updates and keeps no undo** — every update writes a new version, and `cascade-undo`/`cascade-mvcc` leave its dependency list (rollback is the abort record plus status-table invisibility, WP2 D5; HLD §12's "Abort: write the abort record only"). The row header's third word is the forward `next` chain pointer (F2), not an undo reference.
+**Depends on:** the landed page format; the cross-core buffer pool; `cascade-redo`'s sequential-fill rule (heap H9); the contract (layer §6); the mini-transaction seam (layer §9.1); `cascade-index`, which lands at Step 8 and is this engine's only dependency on another engine.
 
 ---
 
-## 2. Relation structure (H1)
+## 1. Scope
 
-A heap relation has one **main segment** (and, once TOAST lands, one hidden TOAST segment — §8). Pages are addressed `(segment, page_no)` within the scope; the scan order is `page_no` order from 0 through the segment's high-water mark. No page chain exists — segment contiguity *is* the order, which is what makes the storage layer's vectored `read_pages` the scan's natural miss path.
+The page design owns the bytes: the heap page layout, the slot states (page D1: live, redirect, dead, unused), the plan-carried prune (page D2), compaction (page D3), the redo primitives (`apply_heap_insert`, `apply_delete_mark`, `apply_relink`, `apply_prune`, `apply_slot_free`; page D4), and the traversal vocabulary (page D5). This engine obeys those bytes. A format change is the page design's to make.
 
-- **Segment allocation** goes through `ScopePages` (layer design §7 / A6): `new_segment` at relation creation and at `truncate`; `page_hint` is the engine's append cursor into the segment — one `fetch_add` per extension (the execution model's single contended atomic is shared with the log writer's; they never contend on the same word).
-- **Placement while type 5 is the record (H9).** `HEAP_INSERT` names a segment, not a page, so replay has to derive the page — and `cascade-redo` fixes how: the **sequential-fill rule**, under which a segment's inserts fill page 0, 1, 2, … by the page format's exact append arithmetic, spilling whole cells (`SegmentFill::route` is the single authority). Its law binds this engine: *the heap appends under the same rule, or accepts that replay re-lays its rows*. Until the type-10 switch (§9) there is therefore no FSM choice, no slot reuse and no prune — every insert goes where the fill cursor says. The cursor must also advance **in LSN order**: the page is chosen inside the same critical section as the record's LSN reservation (a short per-relation mutex over reserve → route → fill, never held across an await). Two cores that reserve LSNs in one order and pick pages in the other give the leader a layout replay cannot reproduce — and once storage M8 lands, the leader refetches an evicted page *from the page store*, in replayed layout, so a scan crossing an eviction could skip or repeat rows and a `fetch(Tid)` could return a different row. On open, the cursor is rebuilt with `SegmentFill::from_page_header` from the segment's open page. The mutex is an insert-path lock, accepted because the record format leaves no alternative; it is deleted at the switch. *Decided 2026-11-26 (Kenneth). This replaces the M6 plan's T6.4 acceptance that "live layout may differ from replay layout", which predates the page store serving pages back to the leader; the plan's FR-46 is updated to match.*
-- **Placement after the switch (type 10 and later).** §4.1's insert path and §7.2's FSM apply from here on, because the record names its page and slot and replay reproduces placement from the record: inserts try the FSM's candidate, then the hint page, then walk forward; when no page in the segment has room (after prune — §7), the engine extends by one page and retries once, then returns the relation-full outcome mapped to PostgreSQL's error at the executor boundary. Fullness is always judged *after* a prune attempt (D3's compaction is where append space comes from), never before.
-- **A heap page is self-describing** (kind 1): no per-relation header page, no metapage — the btree's B1 has no heap analogue because the heap's only relation-level state is the segment id and the hint, both in engine memory and reconstructible from the segment extent.
-- **Tids are stable for the life of their slot's data** (page design invariant 5, HLD §12 invariant): slot indices never renumber, never shrink; `(page_no, slot)` is the locator index entries carry (F4 `Locator::Heap`), and reuse only through Unused after vacuum's index cleanup (§7.3).
+This document says who calls each primitive and when, what the engine computes as against what it merely applies, the relation-level structures, the DML paths, and the landing sequence.
+
+**Two things this engine is not.** It makes no in-place updates: every update writes a new version. It keeps no undo: rollback is the abort record plus the status table (kept §2, and layer §13.1 for what that costs). The row header's third word is the forward chain pointer, not an undo reference (format F2).
 
 ---
 
-## 3. Row identity, locators and the chain law
+## 2. Relation Structure (H1)
 
-`RowLocator::Tid(Tid)` names **a version**, and the walk goes forward from it (`next` links run old→new), evaluating versions until the snapshot's answer appears — D5's vocabulary: `slot_state` branch, `Redirect` jump, `HAS_NEXT` hop, cross-page via the relation-local `PageNo`. Index entries name the version that was current when the entry was written: a HOT update writes no entries, so its entries keep naming the original version (the chain root in the HOT sense); a non-HOT update rewrites entries to name the new version — which is exactly why *the locator moves on a non-HOT heap update* (WP5 D2/HLD §10). Scans emit the visible version's own Tid, and every consumer resolves every locator by the same forward walk, so old locators stay resolvable through the chain for their validity window. Two laws bind the walk (page design invariants 5/8, HLD §12):
+A heap relation has one **main segment** and, once out-of-line storage lands, one hidden segment for it (§8). Pages are `(segment, page_no)` inside the scope. A sequential scan walks pages in `page_no` order from 0 to the segment's extent (`ScopePages::extent`, layer §10). There is no page chain: the segment's order is the scan's order, which also makes the storage layer's sequential page reads the natural way to fill a miss.
 
-1. **A HOT chain never crosses a page** — enforced at update time (§4.2 chooses same-page HOT only when the new version fits); the derivation `HAS_NEXT && next.page_no == own page` (F2) is the format's `is_hot_link` convenience, and this engine is its only producer of the `HEAP_ONLY` flag.
-2. **A fetch on Dead resolves to NotVisible, deterministically** (D1) — never to whatever bytes a later append leaves in the region. The engine's walk treats `Dead` as terminal-and-invisible; `Unused` is an engine bug (assert — the D1 transition table's `apply_slot_free` refusal is what keeps this true).
+**Segment allocation** goes through `ScopePages` (layer §10): a new segment when the relation is created and at `truncate`, a page hint for the tail, and `extend` to grow.
 
-Locator validity is the contract's (WP5 D2): same-statement, same-txn; movement only via `WriteOutcome::Done` — and a non-HOT heap update **moves the locator** (the new version's root is the new tuple), which is exactly why `Done { locator }` exists.
+### Placement while the insert record is type 5 (H9 — accepted)
+
+`HEAP_INSERT` (record type 5) names its segment, not its page. Replay has to work out the page, and `cascade-redo` fixes how: the **sequential-fill rule**. A segment's inserts fill page 0, then page 1, and so on, by the page format's exact append arithmetic, spilling whole cells. `SegmentFill::route` is the one authority for it.
+
+The rule binds this engine. Until the record names its page and slot (type 10, §9), every insert goes where the fill cursor says. There is no free-space-map choice, no slot reuse and no prune.
+
+**The cursor advances in LSN order.** The page is chosen inside the same critical section as the record's LSN reservation: a short per-relation mutex over reserve, route and fill, never held across an `await`. If two cores reserved LSNs in one order and chose pages in the other, the leader would hold a layout replay cannot reproduce. That matters because, once storage M8 lands, the leader fetches an evicted page back from the page store, in replayed layout: a scan crossing the eviction could skip or repeat rows, and a fetch by Tid could return a different row.
+
+On open, the cursor is rebuilt with `SegmentFill::from_page_header` from the segment's open page. The mutex is a lock on the insert path, accepted because the record format leaves no alternative. It is deleted at the switch.
+
+*Provenance.* H9 was decided on 2026-11-26. It replaces the runtime plan's earlier acceptance (FR-46) that live layout may differ from replay layout, which predates the page store serving pages back to the leader. The plan is updated.
+
+### Placement after the switch (type 10 and later)
+
+Once the record names its page and slot, replay takes the placement from the record and the engine may choose freely: §4.1's insert path and the free-space map of §7.2 apply from here.
+
+### Pages are self-describing
+
+A heap page needs no per-relation header and no metapage (the B-tree's B1 has no counterpart here). The relation's only state above the page is its segment id, its extent and its page hint, which `ScopePages` keeps.
+
+### Tids are stable
+
+A slot's index is never renumbered and the slot array never shrinks (page D1). A Tid is what index entries carry. A slot is reused only after it has become unused (§7.3).
 
 ---
 
-## 4. DML paths
+## 3. Row Identity, Locators and the Chain Law (H2)
 
-All four paths share the prelude: epoch/scope debug assert (layer design §5), the mini-txn seam (§6.1 of the layer design), and the conflict protocol (§4.4) — a writer touching a row whose newest version carries an uncommitted word of *another* txn resolves it through `VisibilitySource` + wait policy into `WriteOutcome` values, never errors.
+A heap row's versions form a **chain**, linked old → new by each version's `next` word. A HOT chain is one that never leaves its page.
+
+**A locator names one version.** `RowLocator::Tid` addresses a version, and the engine resolves it by walking forward from that version (heap §5.2). What a locator names depends on where it came from:
+
+- A scan returns the Tid of the version it showed.
+- An index entry names the version that was current when the entry was written. A HOT update writes no entries, so they keep naming the version they were written for. An update that is not HOT writes entries for the new version.
+- An update's `Done` returns the new version's Tid when the locator moved, and the same locator when it did not.
+
+**Two laws bind the chain.**
+
+1. **A HOT chain never crosses a page.** §4.2 chooses a HOT update only when the new version fits on the old version's page. `HEAP_ONLY` is set if and only if the link stays on the page.
+2. **A fetch on a dead slot answers "no row".** The slot state `Dead` (page D1) means the cell is gone. The walk returns `None`; it never reads whatever a later append put at those bytes.
+
+A locator is valid for the statement that produced it, in the same transaction (layer §6.5).
+
+---
+
+## 4. DML Paths
+
+Every path begins with the epoch check (layer §6.7) and works through the mini-transaction seam (layer §9.1): the engine builds records, and the seam applies them to frames the engine has pinned exclusively. When a group touches two pages, both frames are pinned first: made resident, then pinned fail-fast in a fixed order, as btree §3.4 describes.
 
 ### 4.1 Insert
 
+This is the path once the record names its page and slot (type 10). Before that, placement is the fill cursor's (§2).
+
 ```text
 insert(txn, row):
-  page = fsm.find(needed) else hint page          # §7.2
-  exclusive-pin page
-  if low-on-space: plan+apply prune (§7.1)        # in the same txn group (D2/D3)
-  slot = append_cell(uncommitted(txn.xid), payload)   # or append_into(slot) reusing Unused, lowest-first
-  record HEAP_INSERT_V2 (segment, page, slot, cell bytes verbatim)   # §9 — one code path with cascade-page's encode_cell
-  unpin; durable at commit
+  cell = encode_cell(uncommitted(txn.xid), row_image)     # the page format's own encoder
+  if the whole cell exceeds 8158 bytes: refuse it (§9)     # never logged
+  page = fsm.find(cell_len + 2) or the hint page            # §7.2
+  loop
+    pin page exclusively
+    if the page is low on space: prune it under this pin     # §7.1
+    if the cell fits: break
+    unpin; page = the next candidate, or a new page
+  slot = the lowest unused slot, or the next slot
+  apply HEAP_INSERT_V2(segment, page, slot, cell)           # the seam stamps the page
+  unpin
+  write the row's index entries                             # §4.6
   return Done { locator: Tid(page, slot) }
 ```
 
-Index maintenance (WP5 D5) happens inside the same statement before `Done` is returned: every secondary index — including the heap's PK index, which is just a unique secondary index (HLD §13) — receives its entry through `cascade-index`. The unique-check and speculative arbitration are that crate's; the heap's contract obligation is that the entry lands *after* the tuple exists in the same statement, so an index fetch never misses its tuple (HLD §13 invariant: an entry is never visible before its row — guaranteed here because both are uncommitted-own until commit, and visibility resolves them together).
-
 ### 4.2 Update — the HOT decision
+
+The engine first finds the row's newest version by walking forward from the locator (§5.2), and runs the conflict check of §4.4 on it.
 
 ```text
 update(txn, loc, new_row, changed):
-  old = resolve_chain(loc)                         # walk from the root to the newest version (§5.2)
-  conflict = check_newest(old)                     # §4.4; returns per WaitPolicy
+  newest    = the newest version of the row
+  conflict  = check(newest)                                 # §4.4
   if conflict: return it
-  hot = changed ∩ indexed_columns == ∅  &&  fits_on_page(old.page, new_row)
+  indexed   = changed ∩ indexed_columns ≠ ∅
+  key       = changed ∩ key_columns ≠ ∅
+  hot       = not indexed and the new version fits on newest's page
   if hot:
-      new_slot = append/append_into on old.page    # same page as the old version, uncommitted(own) creator
-      group = [ DELETE_MARK(old, xmax=uncommitted(own)),
-                RELINK(old, next=chain(old.page, new_slot, HEAP_ONLY)),
-                HEAP_INSERT_V2(new_slot, cell) ]
-  else:
-      new_page = fsm.find/extend; new_slot = append there
-      group = [ DELETE_MARK(old, xmax=uncommitted(own)),
-                RELINK(old, next=chain(new_page, new_slot, 0)),     # crosses the page: not HOT
-                HEAP_INSERT_V2(new_slot, cell) ]
-      + index: delete-word every entry of the old locator; insert entries → new locator
-  return Done { locator: hot ? loc : Tid(new_page, new_slot) }
-                 # hot: entries and locators unchanged — that is the point of HOT;
-                 # non-HOT: moved (the new version is where entries now point)
+      group = [ DELETE_MARK(newest, xmax = uncommitted(own)),
+                RELINK(newest, next = (same page, new slot) with HEAP_ONLY),
+                HEAP_INSERT_V2(new slot, cell) ]
+      return Done { locator: loc }                          # entries and locators unchanged
+  page      = fsm.find or a new page
+  group     = [ DELETE_MARK(newest, xmax = uncommitted(own); XMAX_UPDATES_KEY if key),
+                RELINK(newest, next = (page, new slot)),
+                HEAP_INSERT_V2(page, new slot, cell) ]
+  + index: delete words on newest's entries; entries for the new version   # §4.6
+  return Done { locator: Tid(page, new slot) }
 ```
 
-The three records are **one mini-transaction group** — the old version's death, the chain hop, and the new version's birth are never separable at a replay boundary (the group-end discipline, layer design §6.1). The chain law makes `RELINK` and `DELETE_MARK` same-page ops on `old`; only the insert may target another page.
+The records are **one mini-transaction group**. The old version's death, the chain link and the new version's birth are never separated by a replay boundary. The two records on the old version are on one page; the insert may be on another.
+
+**Why a non-HOT update writes entries even when no indexed column changed.** The new version lives at a new Tid. Index entries must reach it, so they are written for the new version, and the old version's entries receive delete words. Older snapshots still see the old entries, because their delete words are not yet visible to them. A HOT update avoids all of that, which is its point.
+
+`changed` comes from the executor, and the engine trusts it: a set that omitted an indexed column would make an update HOT that is not. Debug builds can check it by comparing the encoded key columns of the two versions.
+
+When the row moves, its locks move with it: none is left behind on the old version (§4.4).
 
 ### 4.3 Delete
 
-Resolve the chain, run §4.4, then one `DELETE_MARK(old, xmax = uncommitted(own))` group plus index delete-words. The tuple's bytes stay (D2: prune never touches uncommitted verdicts; the deleter may roll back and an RC re-check may need the stub — page design D2's eligibility rule).
+Find the newest version, run §4.4, then one group: `DELETE_MARK(newest, xmax = uncommitted(own))` with `XMAX_UPDATES_KEY`, and delete words on every entry of the row (§4.6). The tuple's bytes stay where they are. Prune removes them once the cleanup watermark has passed the delete (§7.1).
 
-### 4.4 The conflict protocol (WP5 D3, instantiated)
+### 4.4 Conflicts, waits and row locks (H3)
 
-The newest version's words decide:
+**The conflict check.** The engine reads the newest version's words and the lock manager's entry for it:
 
-| Newest version state | `Wait` | `DontWait` | `SkipLocked` |
+| What the newest version shows | `Wait` | `DontWait` | `SkipLocked` |
 | :--- | :--- | :--- | :--- |
-| `xmax` uncommitted-other, row live | bounded wait on holder via `VisibilitySource`/lock queues, then proceed / `CommittedAfterSnapshot { commit_ts, latest }` | `Conflict::InProgress { holder }` | row treated `NotVisible` |
-| `xmin` uncommitted-other (creator in flight) | same wait table | `InProgress` | `NotVisible` |
-| `xmax` committed after our snapshot | `CommittedAfterSnapshot` with the newest committed version's locator via `fetch_latest_committed`'s walk | same value, no wait | `NotVisible` |
-| gone (chain ends dead / root Dead) | `WriteOutcome::NotVisible` | same | same |
+| Another transaction's deleter, or its exclusive locker, still in progress | Wait on it (layer §6.5), then start over: the row may have moved | `Conflict::InProgress { holder }` | `NotVisible` |
+| Another transaction's shared locker, in a mode that conflicts with ours | The same | The same | The same |
+| Another transaction's creator, still in progress | The same | The same | The same |
+| A creator or a deleter that committed after our snapshot | `CommittedAfterSnapshot { commit_ts, latest }`, with `latest` the newest version's locator | The same | `NotVisible` |
+| Deleted by our own transaction, or the slot is dead, or the chain ends dead | `NotVisible` | `NotVisible` | `NotVisible` |
+| None of the above | Proceed | Proceed | Proceed |
 
-Bound expiry under `Wait` returns `InProgress` (bounded waits; the bound is transaction-layer configuration, WP2's). Reads answer not-visible with `None`; writes with `NotVisible` — the asymmetry WP5 D3 pinned. `lock_row` runs this protocol with no tuple change and returns `Locked { outcome, row }` (row present iff acquired — SELECT FOR UPDATE costs one descent).
+A holder that has committed or aborted is not a holder. The wait has the bound the transaction layer configures; when it expires the result is `Conflict::InProgress`.
 
-### 4.5 Speculative insert (WP5 D12, engine half)
+**`lock_row` records the lock.** A lock that leaves no trace excludes nobody, so every mode writes something (layer §6.10):
 
-The heap side of `insert_speculative` is an **ordinary insert** — the tuple is uncommitted-own and already invisible to others. All arbitration lives in the PK index entry (create word = own uncommitted txn), so a conflicting inserter's unique check resolves it to `KeyBusy(InProgress { holder = us })` and waits on us through the status table. `complete_speculative` changes no bytes (the word is already right; the commit does the rest); `abort_speculative` changes no bytes either — the statement drops its claim on the index entry, the tuple's creator word resolves to `Aborted` at rollback, and prune/vacuum reclaim both as ordinary dead food (§4.3's abort rule extends naturally: an aborted speculative insert is just an aborted insert). This is why the M6-era stub can reserve the speculative API as compile-checked signatures with `UniqueViolation`-only behavior (layer design §10 L1) and fill the semantics in at the MVCC milestone without touching the executor surface.
+| Mode | What is recorded |
+| :--- | :--- |
+| `FOR UPDATE` | The version's deleter word is set to `uncommitted(own)`, with the flags `XMAX_LOCK_ONLY` and `XMAX_UPDATES_KEY` |
+| `FOR NO KEY UPDATE` | The same, with `XMAX_LOCK_ONLY` only |
+| `FOR SHARE`, `FOR KEY SHARE` | A lock-manager entry for the relation and the version's locator. Nothing is written to the page |
+
+`XMAX_LOCK_ONLY` tells a plain read to ignore the deleter word: the engine passes no deleter to the visibility rule, so readers never wait and never see a locked row as deleted. Every write and every exclusive locker consults both places — the header word and the lock manager's shared holders — for the version it targets. The two flags are bits in the `next` word's flag field, which the page layer assigns: format F2 assigns three, and the rest are unassigned.
+
+`lock_row` runs the conflict check first and returns `Locked { outcome, row }`, with the row present if the lock was taken. One lookup serves `SELECT … FOR UPDATE`.
+
+**Locks move with the row.** An update never leaves a lock on the old version. Afterwards the engine records on the new version every lock the old one carried: its own, and other transactions' shared locks, which a non-key update does not conflict with. That is how a later key-changing update on the new version still finds them.
+
+### 4.5 Upsert by speculative insertion
+
+The contract is layer §6.9. The heap's part of it:
+
+- **`insert_speculative`** is an insert (§4.1). Its arbitration is the primary-key index's entry, whose create word is the writer's uncommitted word. A second transaction inserting the same key meets that entry and waits, or does not.
+- **`complete_speculative`** changes nothing.
+- **`abort_speculative`** stamps the tuple's deleter word and the index entry's delete word with `uncommitted(own)`, as one mini-transaction. The transaction goes on running, so the row has to disappear now: it is `Deleted { own: true }` for the writer and invisible to every other transaction whatever becomes of the writer, because one transaction both created and deleted it. An entry whose create and delete words name the same in-progress transaction is not a conflict for the unique check, and a waiter for that key is woken when the delete word lands.
+
+### 4.6 Index maintenance
+
+Every insert, update and delete changes the row's index entries in the same statement, through `cascade-index`. Layer §11.4 has the table of which write changes which entry. Until `cascade-index` lands (Step 8), a heap table cannot have a primary key or a unique constraint (layer §12).
 
 ---
 
@@ -111,139 +180,221 @@ The heap side of `insert_speculative` is an **ordinary insert** — the tuple is
 
 ### 5.1 Sequential scan
 
-Walk pages in `page_no` order; per page take a copy-out read (no pin held across the batch boundary — the scan yields through `Rt::should_yield` between pages, and the resume hint is the next `page_no`); per slot: `slot_state` branch — `Unused` = assert-bug, `Dead`/`Redirect` = skip (scan reads cells, and `iter()` is live-only per D1), `Live` = decode the cell, `row_visible(xmin, xmax_nonempty)` decides emit/skip, emitting the visible version's **own Tid** as the locator (§3's law — the executor's later update/delete resolves it by the same forward walk). Each visible version is at most one per logical row per snapshot by construction (older versions are `xmax`-stamped or chain-hidden), so the scan emits rows, not versions. `SeqScanOpts.resume` carries the page hint for a resumption after yield or a restart-driven rescan.
+The scan walks pages in `page_no` order up to the segment's extent. For each page it takes a copy, which it holds nothing from once it moves on; it yields between pages. For each slot:
 
-### 5.2 Fetch by Tid and the chain walk
+- `Unused` is a bug: assert.
+- `Dead` and `Redirect` are skipped. The scan reads every live cell, so a redirect's target is visited anyway.
+- `Live`: decode the cell and apply `row_visible(xmin, Some(xmax))` — with no deleter when `XMAX_LOCK_ONLY` is set (§4.4). A `Live` result is emitted, with **this version's own Tid** as the locator.
 
-`fetch(snap, Tid, proj)`: loop — `slot_state`: `Unused` → bug-assert; `Dead` → `None`; `Redirect(t)` → `slot = t`; `Live` → decode, evaluate `row_visible(xmin, Some(xmax))`: `Live` → materialize `RowRef` and stop; `Deleted` (the deleter is committed at or before `read_ts`) → stop with `None` — every later version is younger, so the row did not exist at this snapshot; `NotBornYet` (the creator is younger than `read_ts`) → hop forward (`next.slot()` same page, else open `next.page_no()`) — the snapshot's version, if any, is further down the chain. Chain end → `None`. (How `row_visible` classifies an *in-flight* deleter — live-at-snapshot vs `Deleted { in_progress }` — is the WP5 D4 composition's decision, not this engine's; the walk mechanically follows whatever it returns.) The loop is bounded by the chain length; a cycle is a corruption (a same-page cycle asserts; the format's parse refuses cross-reference nonsense).
+Every version of a row is visited, and the visibility rule shows exactly one of them to a snapshot, so the scan emits rows, never versions. `SeqScanOpts.resume` carries the page number to resume from.
 
-`fetch_latest_committed` (the RC re-check recipe, WP5 D6): walk the chain from the locator collecting versions; resolve every uncommitted word through `VisibilitySource` **under the `Wait` policy** (the re-check waits for in-flight writers by contract); return the newest version visible to `{own uncommitted writes ∪ committed ≤ now}` plus **its own Tid** as the current locator — the executor re-evaluates its predicate on it and decides (EPQ-style). The walk is the engine's most subtle path and gets the dedicated property tests of §10.
+### 5.2 Fetch by Tid — the chain walk (H10)
 
-### 5.3 RowRef and projection
+```text
+fetch(snap, loc):
+  (page, slot) = loc
+  loop
+    switch slot_state(page, slot)
+      Unused      → bug: assert
+      Dead        → return None
+      Redirect(t) → slot = t
+      Live        → switch row_visible(xmin, deleter)             # layer §6.6; no deleter if XMAX_LOCK_ONLY
+                      Live       → return this version
+                      Deleted    → if next.has_next(): (page, slot) = next
+                                   else             return None
+                      NotBornYet → return None
+```
 
-`RowRef` owns its decoded projection buffer (copy-out discipline — no reference into any page survives the call) plus the engine handle and locator for lazy TOAST materialization (WP5 D15, §8). `ColumnSet` for updates is the changed-column bitmap the executor supplies; the engine derives indexed-column membership from the descriptor (A5).
+**`Deleted` is not "gone".** When an update replaces a version, the old version is `Deleted` and its successor is the row. The hop is what makes an update reached through an old locator work.
 
----
+**`NotBornYet` is "gone".** Chains run old → new. If this version is younger than the snapshot, every later one is too, and older ones cannot be reached. A locator this transaction holds never names a version younger than its snapshot (layer §6.5), so this case means the row did not exist then.
 
-## 6. Visibility integration
+A chain v1 (created at t1), v2 (at t2), v3 (at t3):
 
-The engine holds no visibility logic of its own: `Snapshot` + `row_visible` (layer design §4.5) with the injected `VisibilitySource` (A8) are the whole rule. Engine-side obligations only:
+| Snapshot | From v1's Tid | From v2's Tid |
+| :--- | :--- | :--- |
+| before t1 | `NotBornYet` → none | `NotBornYet` → none |
+| t1 to t2 | v1 | `NotBornYet` → none |
+| t2 to t3 | v1 is `Deleted` → hop → v2 | v2 |
+| after t3 | v1 is `Deleted` → v2 is `Deleted` → v3 | v2 is `Deleted` → v3 |
 
-- **Stamp discipline**: creators are stamped `VersionWord::uncommitted(txn.xid)` at write time; deleters `uncommitted(own)` at delete/update time. No committed word is ever written by this engine in the MVCC milestone — committed resolution is the status table's (WP2 D2); whether commit-time or lazy stamping ever rewrites words is the shared open question of §11 (the engines' constraint is recorded there).
-- **Own-writes visibility** comes from `Snapshot.own` — the engine never special-cases "my tuple".
-- **The status table is the engine's only deadness oracle**: prune eligibility (D2) consults it plus the cleanup watermark, both injected; on a follower, the same interfaces run over the rebuilt status state (architecture §4.5 follower role) — the engine needs no role awareness beyond the mini-txn seam's follower mode (page changes arrive from the `FollowerFeed`; the engines' mutation paths simply don't run).
+The walk is bounded by the chain's length. A link to the page it is on that revisits a slot is corruption and asserts.
 
----
+### 5.2.1 The re-check after a conflict: `fetch_latest_committed` (H13)
 
-## 7. Prune, vacuum and the free space map
+Read committed uses this after `CommittedAfterSnapshot`. "Now" needs a definition, so the procedure is:
 
-### 7.1 Prune — trigger and plan computation
+1. **Take a fresh snapshot** (`TxnCtx::fresh_snapshot`, layer §6.7): a new read timestamp, waited for until it is closed. Everything committed before it is visible, nothing after it, and no later commit can slip in under it.
+2. **Wait for the row's holders.** Any transaction still writing the row, or holding a lock that conflicts, is waited for, with the bound; each is resolved through `VisibilitySource` and `WaitSource`.
+3. **Walk forward from the locator** with the fresh snapshot, by the walk above, and return the first `Live` version with its own Tid.
 
-Trigger (D3's "when the page is nearly full", made concrete): on an insert/update path pin of page P, when `free_bytes(P) < needed` — before declaring the page full — and from `Maintenance::step`'s background budget for pages on the dead-food list. The engine computes the `PrunePlan { free, redirects, relink }` (D2): walk each chain from its root; a version is prune-eligible iff its creator and deleter (if stamped) resolve committed/aborted **older than the cleanup watermark** — uncommitted stamps are never eligible (D2's rule, restated as the engine's eligibility law). Chain mechanics follow the worked example of the page design (§4): same-page successor → Redirect the root and free the middle versions; cross-page successor → retain the stub; standalone dead tuples → Dead; surviving cells whose successor was removed get `relink`. The plan applies through `PageMut::apply_prune` (validate-then-atomic, D2) inside the access's mini-txn group — the plan is also the redo record (§9), so replay reproduces the verdicts without engine state.
+The executor then re-evaluates its predicate on that row and decides.
 
-The **cleanup watermark** in v1 is the scope's oldest active read timestamp (layer design §9.4); the engine takes it as an injected `fn watermark() -> Hlc`, never deriving it.
+### 5.3 Rows and projection
 
-### 7.2 The free space map (H5)
-
-FSM pages are ordinary WAL-logged pages (HLD §12) — proposed kind 6, header-only layout per FSM page carrying an array of `(page_no u32, free_bytes u16)` entries at 32-byte granularity (lossy by design: a stale "has room" costs one failed append and a prune attempt; a stale "full" costs a skipped page — both benign, which is what lets the FSM stay simple). FSM pages chain linearly; the map is small (one entry per heap page; a 1 M-page segment = ~6 MiB of FSM). Updates are `FSM_UPDATE` records (§9) — verdict-shaped like everything else, applied verbatim. The engine's `fsm.find(needed)` returns the best candidate ≥ needed, falling back to the hint walk; `fsm.update` runs after every prune/append that changes a page's free bytes materially (past the 32-byte granularity).
-
-### 7.3 Vacuum — the incremental, index-ordered cleaner
-
-`Maintenance::Heap(HeapPruneVacuum)::step(budget)` — one bounded unit per call, driven by `cascade-maintenance` (layer design §9.4; interim driver: the runtime housekeeping tick):
-
-1. Pick a candidate page: one with `Dead`/`Redirect` slots (the list prune appends to).
-2. **Index cleanup first**: for every slot the page would free, find and remove (delete-word→purge) index entries pointing at `(page_no, slot)` — via `cascade-index`'s per-page entry scan (its own incremental step, budgeted). This ordering is the HLD §12 invariant ("an index entry pointing at a TupleId is removed before or with that slot's reuse") made structural: the engine does not call `apply_slot_free` until the index work for that slot has completed *and been logged* in an earlier durable group — so a crash between the two never leaves a freed slot under a live entry.
-3. `apply_slot_free` per freed slot (Dead → Unused; Redirect → Unused only for roots whose row is fully gone — the D1 table).
-4. `FSM_UPDATE` for the page's new free bytes.
-
-No table-wide pass, no lock phase, no freeze — 63-bit txn ids make wraparound machinery not exist (HLD §12; product pillar §4.1). The step is resumable at page granularity; `Progress` reports pages cleaned and entries removed.
-
----
-
-## 8. TOAST (WP5 D15's engine half)
-
-Out-of-line storage for oversized values, in the relation's **hidden TOAST segment of the same scope** (HLD §15: same scope, same WAL, same key — a write stays single-scope). Reserved now, landed with `cascade-index` (the chunk lookup needs a keyed structure — the TOAST relation is a hidden heap table with a unique index on `(chunk_id, chunk_no)`, landing at migration step L8 rather than growing a special-purpose page kind):
-
-- **The pointer** (reserved format, frozen when TOAST lands): payload bytes where the value would be are `[magic u32][chunk_id u64][total_len u32]` — the `HAS_TOAST` flag in the row's `next` word (F2) says the payload contains pointers. The magic word and the flag are the only format commitments made before landing; they cost nothing while unused and are the D6-style reservation this design makes now.
-- **Threshold**: v1 payload ceiling per column value (descriptor's `ToastPolicy`); no compression in v1 (deferred with the chunk-format decision).
-- **Materialization**: `RowRef::value` returns `Err(ToastNeeded)` for a pointed column; `toast_value` resolves the chunks through the TOAST index and inlines them into the `RowRef`'s owned buffer. Chunks of one value are written in the insert's statement, in one mini-txn group per chunk batch; deletion of the parent row delete-marks the chunk rows in the same statement's work (their cleanup is ordinary vacuum food).
+A `RowRef` owns a decoded copy of the visible columns. No reference into a page outlives the call. It also keeps the engine handle and the locator, so that a stored-out-of-line column can be fetched on demand (§8). The `ColumnSet` an update receives comes from the executor; which columns are indexed comes from the descriptor (layer §6.12).
 
 ---
 
-## 9. Redo records (heap family)
+## 6. Visibility Integration
 
-Type bytes extend WP1 F3's table — extend, never renumber. **Proposed allocation (frozen at landing): heap 10–15, FSM 40** (the ranges the btree design §8 fixes for its family and the undo family are untouched). Payload encodings live in `cascade-wal-format`; the apply functions are already designed — the page's `redo` module (D4) — and `cascade-redo`'s heap family is the thin dispatch over them (layer design A2).
+The engine has no visibility logic of its own. `Snapshot::row_visible` with the injected `VisibilitySource` (layer §6.6) is the whole rule. The engine's obligations are three:
 
-| Byte (proposed) | Record | Payload | Replay primitive |
+- **Stamping.** A creator and a deleter are stamped `uncommitted(txn.xid)`. The engine never writes a committed word; resolving one is the status table's. **This is why layer §13.1 blocks the MVCC step:** for as long as a word is never rewritten, the status table must keep an entry for every transaction a page names.
+- **The reader's own writes** are visible through `Snapshot.own`. The engine never special-cases its own rows.
+- **Deadness comes from the status table and nowhere else.** Prune asks it, and asks the injected cleanup watermark. On a follower the same interfaces answer from the status table rebuilt from the log. The engine's mutation paths do not run there; page changes arrive through the log feed.
+
+---
+
+## 7. Prune, Vacuum and the Free Space Map
+
+### 7.1 Prune — trigger and plan (H11)
+
+**Trigger.** An insert or update that finds its page low on space prunes that page before it looks elsewhere, under the pin it already holds. `Maintenance::step` prunes pages from the list of pages that hold dead versions.
+
+**The plan is computed while the page is pinned exclusively**, from the pinned copy. Its verdicts must describe the image they are applied to. The plan is the page design's `PrunePlan { free, redirects, relink }` (page D2).
+
+**Eligibility.** A version may be removed only when its creator and its deleter are both resolved — committed or aborted — with commit timestamps older than the cleanup watermark. A stamp that is still in progress is never eligible, because its transaction may still roll back and a read-committed re-check may need the row.
+
+**Mechanics** follow the page design's worked example: a same-page successor makes the root a redirect; a cross-page successor keeps a stub; a standalone dead tuple becomes dead; a survivor whose successor was removed is relinked.
+
+**Applying.** The plan goes through `apply_prune`, which validates it against the image and transforms or refuses as a whole (page D2). The plan is the `HEAP_PRUNE` record (§9), so replay reproduces the verdicts without a status table.
+
+The **cleanup watermark** is injected as a function, never derived here. In version 1 it is the oldest read timestamp still in use (layer §11.7).
+
+### 7.2 The free space map (H12)
+
+The map is a **tree of maxima** over the segment's pages, on ordinary logged pages (page kind 6).
+
+- A **span page** covers a fixed run of 2048 heap pages. It holds one `u16` per page — that page's free space, rounded down to a multiple of 32 bytes — and, in its header, the largest of them.
+- A **root page** holds one maximum per span.
+- **`fsm.find(needed)`** scans the root for the first span whose maximum is at least `needed`, then that span's page for the first heap page with room. A root covers 4 Mi pages, 32 GiB; a larger segment adds a level, and the shape repeats.
+
+**Why a tree.** The map has one entry per heap page. A linked list would make every insert past the tail scan it. The tree costs one small page per 2048 heap pages and a short search.
+
+**Why the values may be lossy.** A stale "has room" costs one failed append and a prune attempt. A stale "full" costs one skipped page. Both are benign, which is what allows values to change only when a page's free space crosses a 32-byte boundary. A change is one `FSM_SPAN_UPDATE` record (§9); when a span's maximum changes, an `FSM_ROOT_UPDATE` changes the root's entry in the same group.
+
+Most inserts never ask the map: they go to the hint page.
+
+### 7.3 Vacuum (H6)
+
+**Claim.** A heap slot may be freed as soon as its row's death is older than the cleanup watermark. Vacuum does not wait for the row's index entries to be removed.
+
+**Why that is safe.**
+
+1. Every index entry of a row receives its delete word in the same mini-transaction group as the row's delete-mark or update (§4.6).
+2. An entry's visibility is decided by its own two words (layer §6.6). No reader consults the heap to decide whether an entry is visible.
+3. Once the delete word's commit is older than the cleanup watermark, no snapshot that can still run sees the entry. So no reader follows the entry to the Tid. An entry that is still physically present points at a reused slot, but it is skipped before that.
+
+**The one way the argument fails**, and why it cannot happen: an index built while writes were possible on the table could hold entries for rows that died before the build finished, and those entries would never receive a delete word. A build blocks writes on its table for its duration (layer §6.12), so no row dies during a build. A build that ran concurrently would need a catch-up step; it is out of version 1.
+
+**So vacuum is small.** One bounded unit per `Maintenance::step`, resumable page by page:
+
+1. Pick a page with dead or redirected slots, from prune's list.
+2. For each slot whose row's death is older than the watermark: `apply_slot_free`. A dead slot becomes unused. A redirect becomes unused only once the row itself is gone.
+3. One `FSM_SPAN_UPDATE` for the page's new free space.
+
+There is no index work, no table-wide pass and no freeze.
+
+**Index vacuum is its own pass**, in `cascade-index`: it removes entries whose delete word, or aborted create, is older than the watermark, one index page at a time, to reclaim space (layer §11.4). The heap does not wait for it.
+
+---
+
+## 8. Out-of-line Storage (H7)
+
+A value too large for a row is stored apart from it, in a **hidden segment of the same scope**. The write stays single-scope, and shares the row's log and key (kept §2).
+
+- **Chunks.** The value is cut into chunks, each a row of a hidden heap relation with a unique index on `(chunk_id, chunk_no)`. That is why this lands with `cascade-index` (Step 8) rather than with a page kind of its own.
+- **The pointer.** Where the value would sit in the row, the payload holds `[magic u32][chunk_id u64][total_len u32]`, and the row's `HAS_TOAST` flag is set. The magic word and the flag are the only format commitments made now; the chunk format, and whether values are compressed, are decided when this lands (§12).
+- **Writing.** A row's chunks are written in the row's statement. Deleting the row delete-marks its chunk rows in the same statement's work; they are then ordinary dead versions.
+- **Reading.** `RowRef::value` reports that a column is stored apart, and `toast_value` fetches its chunks through the index and into the row's own buffer.
+
+## 9. Redo Records (H8)
+
+Record type bytes extend `cascade-wal-format`'s table and are never renumbered. **Proposed allocation, frozen at landing: 10–15 for the heap family, 40–41 for the free-space map.** Payload encodings belong to `cascade-wal-format`. The apply functions are the page design's primitives (page D4), which `cascade-redo` dispatches to (layer A2).
+
+| Byte | Record | Payload | Replay |
 | :--- | :--- | :--- | :--- |
-| 5 | `HEAP_INSERT` (landed) | `[segment u32][cell verbatim]` | `apply_heap_insert` — retained forever for replay of existing logs; **emission stops** at the MVCC milestone |
-| 10 | `HEAP_INSERT_V2` | `[segment u32][page_no u32][slot u16][cell verbatim]` | `apply_heap_insert` + placement — **physiological**: names the slot, replay reproduces live layout exactly (the page design §7 forward obligation, resolved the moment index entries carry Tids; this design lands it at the MVCC milestone so the format switches once) |
-| 11 | `HEAP_DELETE_MARK` | `[segment][page_no][slot][xmax word]` | `apply_delete_mark` |
-| 12 | `HEAP_RELINK` | `[segment][page_no][slot][next word]` | `apply_relink` |
-| 13 | `HEAP_PRUNE` | `[segment][page_no][PrunePlan verdicts]` | `apply_prune` — verdicts, never watermarks (D2) |
-| 14 | `HEAP_SLOT_FREE` | `[segment][page_no][slot]` | `apply_slot_free` |
-| 40 | `FSM_UPDATE` | `[segment][fsm_page][entry]` | verbatim entry rewrite |
+| 5 | `HEAP_INSERT` | `[segment u32][cell verbatim]` | Landed. Kept forever for replay of existing logs; **not emitted** once Step 4 lands |
+| 10 | `HEAP_INSERT_V2` | `[segment][page_no][slot][cell verbatim]` | Places the cell at the named slot. Replay reproduces the leader's layout exactly |
+| 11 | `HEAP_STAMP_DELETER` | `[segment][page_no][slot][deleter word][flag bits]` | Writes the deleter word and the flags. Used by delete, update and an exclusive row lock |
+| 12 | `HEAP_RELINK` | `[segment][page_no][slot][next word]` | Writes the chain word |
+| 13 | `HEAP_PRUNE` | `[segment][page_no][the plan's verdicts]` | Transforms the page by the plan. Verdicts, never a watermark (page D2) |
+| 14 | `HEAP_SLOT_FREE` | `[segment][page_no][slot]` | Marks the slot unused |
+| 40 | `FSM_SPAN_UPDATE` | `[segment][span page][heap page][value]` | Writes one span entry |
+| 41 | `FSM_ROOT_UPDATE` | `[segment][root page][span][maximum]` | Writes one root entry |
 
-Idempotence is the replay loop's LSN check (S17); every record is self-contained per page and deterministic (the D2/D4 arguments). A HOT update is one group of records 11+12+10; a non-HOT update adds the index family's records to the same group — the group is the atomicity unit, nothing below it exists at a replay boundary.
+Three rules apply to all of them: the four redo laws (storage §12.4); a page's LSN is the end of its last record (layer §9.3); and replay applies a record only if its start is at or above the page's LSN.
 
-**The producer gate, and the fit-rule defect it exposed (found and fixed 2026-11-26).** `encode_cell`'s ceiling is the u16 length field — 65 509 payload bytes — far above what a page can hold, so the engine gates at the page before logging anything: the largest cell a fresh page holds is **8158 bytes whole, 8132 of payload**. A row past that is a TOAST candidate (§8) and, until TOAST lands, is refused with PostgreSQL's `54000` at the executor boundary. The fit rule did not enforce that ceiling correctly until 2026-11-26. `PageMut::append_cell` accepted a cell when `free_offset − len ≥ 32 + 2·slot_count`, and then wrote the new slot's own 2-byte entry at exactly `32 + 2·slot_count`. For the two lengths where `free_offset − len` equals that address or is one above it — a 8159- or 8160-byte cell on a fresh page; two lengths per page state in general — the slot entry overwrote the cell's length prefix and the header contradicted itself: `append_cell` returned `Ok`, and `PageView::parse` then refused the image as malformed. The rule now reserves the entry it is about to write — `free_offset − len ≥ 32 + 2·(slot_count + 1)` — pinned by a fresh-page boundary test and a sweep over every page state the zero-payload fill reaches (a T6.1 fixup). `cascade-redo` mirrors this arithmetic (`fits`, `SegmentFill`, `MAX_CELL_LEN`), so the same `+ 2` travels with it; the state of that in-flight crate is in the layer design §12.
+A group is the unit of atomicity. A HOT update is one group of records 11, 12 and 10. An update that is not HOT adds the index family's records to the same group. Nothing below a group is ever a replay boundary.
+
+**The gate before the log.** The cell encoder's own ceiling is the 16-bit length field, 65 509 bytes of payload, which is far above what a page holds. The engine refuses a cell larger than the most a fresh page holds — 8158 bytes, 8132 of payload — before anything is logged (§4.1). Until §8 lands such a row is refused with PostgreSQL's `54000`. The page format's fit rule, which determines that number, counts the slot entry an append writes for itself; it did not always do so, and the fix that made it is recorded in layer §16.
 
 ---
 
 ## 10. Testing
 
-The page design §6 pins the format battery (marker goldens, parse refusal matrix, transition table, prune roundtrip, plan-refusal atomicity, redo read-back). The engine adds:
+The page design's §6 pins the format: marker goldens, the parse refusal matrix, the slot transition table, the prune round trip, plan-refusal atomicity, and redo read-back. The engine adds:
 
-- **Visibility property tests**: randomized txn interleavings (begin/write/commit/abort at seeded points) through the fake mini-txn scope and a scripted `VisibilitySource`; every snapshot's scan result equals the reference model's; the RC re-check recipe's outputs match its definition.
-- **Chain invariants**: HOT chains never cross pages (assert `next.page_no == own page` whenever `HEAP_ONLY`); a non-HOT update's chain is exactly one cross-page hop from root to newest; no cycles.
-- **Prune/vacuum end-to-end**: the page design's worked example driven through the engine — including the vacuum ordering invariant (slot freed only after index cleanup, proven with a counting fake index that fails the test if a slot frees first).
-- **Replay equivalence**: live pages vs replayed-log pages byte-identical for random DML + prune + vacuum workloads (the layer design §11 differential harness).
-- **Tid stability**: slots never renumber across prune/compact/vacuum/reuse (the D1/D3 goldens cover the bytes; the engine test covers the sequences).
-- **Conflict matrix**: every §4.4 row exercised under every `WaitPolicy`, including bounded-wait expiry and the poisoned-txn paths (D9).
-- **Wire parity**: the runtime's query/commit/txn suites pass unchanged across the L1→L2 boundary until MVCC behavior is deliberately pinned (WP5 §8's rule).
-- **`AnyTable` conformance**: the full §4.11 suite against the heap arm.
-
----
-
-## 11. Landing plan and the interim slice
-
-| Step | What lands | Notes |
-| :--- | :--- | :--- |
-| **L1 / T6.4 interim** (M6 plan) | `HeapView`-shaped insert/scan through the BPM as M6 defines it: xmin stamped from `next_xid()`, xmax/next reserved zero, no MVCC, `RowVisibility::Live` only, `HEAP_INSERT` type 5 emission, `AnyTable::Heap` arm with `insert`/`fetch`/`seq_scan::next`; speculative + rescan/mark/restore as reserved signatures. Placement by the sequential-fill cursor, advanced in LSN order so that live layout equals replayed layout (H9, decided 2026-11-26 — it replaces the plan's earlier acceptance that the two could differ); see §2. Behavior-identical wire suites (FR-47). | The interim slice is this document's *only* concession to the pre-MVCC world; every structure it creates (descriptor, env, scan) is the L2 shape minus visibility |
-| **L2 / MVCC milestone** | Slot states (page D1) land first (the amendment window rule); visibility + `VisibilitySource`; the §4 DML paths with real outcomes; prune (D2); `HEAP_INSERT_V2` emission switch — which retires the fill cursor and its mutex, and is the earliest point at which FSM placement (H5) and slot reuse may be enabled; poisoning; statement boundary | The wire suites pass unchanged until MVCC behavior is deliberately pinned |
-| **L3** | Hygiene: drop the dead `cascade-mvcc`/`cascade-undo` deps, fix the crate description, CONTEXT sync | Layer design §3.2 |
-| **L4** | The mini-txn seam swap (engine code unchanged — it already holds the seam contract) | Layer design §6.1 |
-| **L5 / M8** (upstream) | Writeback dies; the engine's mutation paths don't change — they hold the seam; the BPM miss path goes to `PageSource`; `page_lsn` becomes real on-page truth (it is already format-complete) | Storage-layer-design §9 |
-| **L8** | `cascade-index` lands: vacuum's index-cleanup step activates (it is code-complete-but-dormant from L2, asserting "no index registered" = no-op), TOAST lands behind it | §7.3, §8 |
-
-Each step is one commit with the workspace gate green and the commit-message discipline of the standing plan (`Task:` trailer, review attestations).
+- **The chain walk.** For every chain shape and every snapshot time, `fetch` from every Tid in the chain returns what §5.2's table says. A property test over random update chains and random snapshots.
+- **Visibility end to end.** Random interleavings of begin, write, commit and abort through the in-memory seam and a scripted `VisibilitySource`; every snapshot's scan result equals the reference model's.
+- **Chain invariants.** A `HEAP_ONLY` link never leaves its page. No cycles.
+- **The conflict table**, every row under every `WaitPolicy`, including the expiry of the wait bound and the poisoned paths.
+- **Row locks.** Two transactions cannot hold conflicting locks on one row; several can hold `FOR SHARE`; a plain read never waits; a lock survives an update that moves the row.
+- **Speculative insertion.** Two transactions race on one key; the loser's wait ends when the winner aborts the speculative insert, not when the winner's transaction ends.
+- **Prune.** The page design's worked example, driven through the engine, under a snapshot that must still see every surviving version.
+- **Vacuum.** A slot is reused only after the watermark passes. An index entry left in place after its slot is reused is never followed to a live row.
+- **Replay equivalence.** Live pages and replayed pages are byte-identical over random DML, prune, vacuum and free-space workloads.
+- **The fill cursor.** Before the switch to type 10, concurrent inserts from several cores leave the leader's pages equal to replay's.
+- **Contract conformance.** The suite of layer §6.13 against this engine.
+- **Wire parity.** The runtime's query, commit and transaction suites pass unchanged across each step until visibility behavior is deliberately pinned.
 
 ---
 
-## 12. Open questions
+## 11. Landing Plan
 
-| Question | Owner / needed before |
+The steps are those of layer §12. What each one lands in this engine:
+
+| Layer step | In this crate |
 | :--- | :--- |
-| Version-word stamping and status-table retention horizon (entries for xid X must outlive every page word still carrying `uncommitted(X)` — i.e., purge-coupled, not read-watermark-coupled; commit-time vs lazy stamping left as WP2 D2 left it) | The L4 transaction pass; constraint recorded, engine-neutral by construction (A8) |
-| FSM kind 6 assignment and layout freeze | Landing review of §7.2 — a format one-way door |
-| TOAST chunk format, compression, `HAS_TOAST` pointer freeze | L8 landing review (§8's reservation made now, format decided then) |
-| Unlogged/temp heap tables (the `UNLOGGED_MARKER` path) | With `cascade-temptable` (layer design §9.3); the marker type stays reserved |
-| Prune's background cadence and the dead-food list's memory bound | Tuned when `cascade-maintenance` lands (§9.4 of the layer design); correctness never depends on it |
-| ~~Row migration on update~~ | **Resolved by the pivot**: append-only versions have no migration problem — a non-fitting update writes a new version wherever the FSM says (§4.2); the old CONTEXT question was the in-place world's |
-| ~~HOT-equivalent for v1~~ | **Resolved**: it *is* the design (§4.2) |
+| Step 3 | The first slice (plan T6.4): insert and scan through the buffer pool, the creator stamped, no visibility yet, record type 5, placement by the fill cursor in LSN order (H9). The speculative and scan-positioning calls exist as signatures. |
+| Step 4 | The MVCC milestone: slot states (page D1), visibility, the DML paths with real outcomes, row locks, prune, and the switch to record type 10. The switch retires the fill cursor and its mutex, and is the earliest point at which free-space placement and slot reuse may begin. |
+| Step 5 | Hygiene: the two dead dependencies go, the crate description is corrected, the context file is synced. |
+| Step 8 | `cascade-index` lands: index maintenance and index vacuum start, and out-of-line storage with them. |
+
+Each step is one commit with the workspace gate green.
+
+---
+
+## 12. Open Questions
+
+| Question | Owner, and needed before |
+| :--- | :--- |
+| How version words become self-describing | The transaction layer. **Blocks Step 4** (layer §13.1) |
+| The two row-lock flag bits, assigned by the page layer | The page layer; before Step 4 |
+| The free-space map's page layout, frozen | Before Step 4 |
+| The chunk format and compression for out-of-line storage | Before Step 8 |
+| How prune is scheduled in the background, and a bound on the dead-page list's memory | Tuned with `cascade-maintenance`; correctness never depends on it |
+| Unlogged heap tables | Later; the record type is reserved |
 
 ---
 
 ## 13. Decisions
 
+Statuses mean: **Proposed**, awaiting the project owner; **Accepted**, by whom and when; **Superseded**, by what.
+
 | # | Decision | Status |
 | :--- | :--- | :--- |
-| H1 | One main segment per relation (+ hidden TOAST segment later); segment-contiguous scan order; no page chain | Proposed — DRAFT |
-| H2 | Locators name chain roots; the two chain laws (never cross a page when HOT; Dead resolves NotVisible) are engine-enforced on top of the format's | Proposed — DRAFT |
-| H3 | The conflict protocol per §4.4; speculative inserts are ordinary inserts with index-level arbitration; `complete`/`abort` change no heap bytes | Proposed — DRAFT |
-| H4 | Prune eligibility = committed/aborted **and** older than the injected watermark; uncommitted never eligible (page D2 restated as engine law) | Proposed — DRAFT |
-| H5 | FSM = lossy WAL-logged pages, proposed kind 6, 32-byte granularity, verdict-shaped updates | Proposed — DRAFT |
-| H6 | Vacuum ordering: index cleanup durably precedes `apply_slot_free` — structural, crash-safe | Proposed — DRAFT |
-| H7 | TOAST: hidden same-scope heap relation + unique index; pointer format reserved `[magic][chunk_id][total_len]`; lands at L8 | Proposed — DRAFT |
-| H8 | `HEAP_INSERT_V2` (type 10) carries the slot; emission switches at the MVCC milestone; type 5 replay-retained forever | Proposed — DRAFT |
-| H9 | While type 5 is the record, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order; FSM placement and slot reuse begin only with type 10 | Decided (Kenneth, 2026-11-26) — replaces the M6 plan's earlier T6.4 acceptance; FR-46 updated to match |
+| H1 | One main segment per relation, and a hidden one for out-of-line storage. Pages are scanned in `page_no` order; there is no page chain | Proposed |
+| H2 | A locator names one version. A HOT chain never crosses a page. A dead slot answers "no row" | Proposed |
+| H3 | The conflict check of §4.4. An exclusive row lock is recorded in the row's header; a shared one in the lock manager. `abort_speculative` stamps the deleter word and the entry's delete word | Proposed |
+| H4 | A version is prunable when its creator and its deleter are resolved and older than the cleanup watermark. An in-progress stamp never is | Proposed |
+| H5 | The free-space map is kept on ordinary logged pages, kind 6, with values rounded to 32 bytes | Proposed |
+| H6 | Vacuum frees a slot once the row's death is older than the cleanup watermark. It does not wait for the row's index entries. Index vacuum is a separate pass | Proposed. It replaces kept §2's ordering rule |
+| H7 | Out-of-line values are chunks of a hidden heap relation with a unique index. The pointer format is reserved now and frozen at Step 8 | Proposed |
+| H8 | `HEAP_INSERT_V2` (type 10) names its page and slot. Emission switches at Step 4; type 5 stays replayable forever | Proposed |
+| H9 | While the record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order. Free-space placement and slot reuse begin with type 10 | **Accepted** (Kenneth, 2026-11-26). It supersedes the runtime plan's FR-46 acceptance that the two layouts may differ |
+| H10 | The chain walk of §5.2: `Deleted` hops to a successor, `NotBornYet` is "no row" | Proposed |
+| H11 | A prune plan is computed while the page is pinned exclusively | Proposed |
+| H12 | The free-space map is a tree of maxima: span pages over 2048 heap pages, a root over spans | Proposed |
+| H13 | The re-check takes a fresh snapshot and waits for the row's holders before it walks (§5.2.1) | Proposed |

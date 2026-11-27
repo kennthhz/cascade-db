@@ -1,236 +1,342 @@
-# cascade-btree design — the B+tree mechanism for the IOT and secondary indexes
+# cascade-btree design — the B+tree mechanism
 
-**Status:** Draft v0.1 for review, 2026-11-26. This document is the detailed design for `cascade-btree` (layer design §8.1): the B+tree mechanism shared by the IOT primary tree (`cascade-iot`) and secondary index trees (`cascade-index`). It owns the tree — descent, latching, structure changes, ordered iteration, byte-level entry operations — and nothing else: page bytes live in `cascade-page` (A3), record payload encodings in `cascade-wal-format`, redo dispatch in `cascade-redo`, and every visibility decision in the engines above it.
+**Status:** Draft v0.2 for review, 2026-11-26. v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): writers now pin before they validate, the root pointer is checked, tree keys and equal keys are defined, every entry carries its length, `mod_count` has a rule, and the no-merge policy is written down (R6, R7, R12–R14, R22, R23, R27–R29). Decision numbers are stable identifiers, so B8–B11, added by v0.2, sit where their subject is rather than in numeric order.
 
-**Upstream:** [`crates/05-access/AI/access-layer-design.md`](../../AI/access-layer-design.md) §5–§6, §8.1 (A2/A3/A4/A9); [`crates/02-storage/AI/storage-layer-design.md`](../../../02-storage/AI/storage-layer-design.md) §12.4 (redo contract), §12.5 (page cache rules), §4.3 promise 5 (mini-transaction boundaries); HLD v2 §11 (IOT leaves) and §13 (index entries) — retired from the tree, engine semantics of record; WP1 F1/F4 (version words, key encoding); the page mutation design L1–L3 (page layer, kind registry, version discipline).
+**What this document is.** The detailed design of `cascade-btree`: the B+tree mechanism shared by the IOT's primary tree (`cascade-iot`) and by every secondary index (`cascade-index`). It owns the tree — descent, latching, structure changes, ordered iteration, and operations on byte keys — and nothing else. Page bytes belong to `cascade-page` (layer A3), record payloads to `cascade-wal-format`, redo dispatch to `cascade-redo`, and every visibility decision to the engines above it.
 
-**Depends on:** the landed T6.1 page format and T6.2 BPM access model (pin word, copy-out guards, exclusive-pin mutation, no pin across an await); `cascade-page`'s frame/heap module split (page design L3 — prerequisite for the first btree kind).
+**Upstream:** the [layer design](../../AI/access-layer-design.md) — §6.4 (locators and keys), §8 (execution model), §9 (the write path; §9.1 defines the mini-transaction), §11.1. The storage design's §12.4 (redo contract) and §12.5 (page cache rules). The [kept document](../../AI/engine-semantics.md) §1 and §3. The page design's L1–L3. Citation prefixes are defined in layer §2.2; terms in layer §3.
 
----
-
-## 1. Scope: what this crate owns and what it must never grow
-
-**Owns:**
-
-- Tree invariants and shape: node kinds, fill, height, root discovery via the segment metapage.
-- Descent and the latch protocol (B3) — optimistic, version-validated, no pin across an await.
-- Structure changes (B5): split, root split, root collapse; the no-merge policy (B6) and its revisit condition.
-- Entry operations on byte keys and byte values: insert, lookup, ordered scan with mark/restore, in-place update, delete-mark, delete-word stamp, purge-compact.
-- The redo *record family design* for tree changes (§8): what each record must carry so replay is deterministic. The bytes of those payloads are `cascade-wal-format`'s; the apply functions are `cascade-redo`'s, written against `cascade-page`'s btree views.
-
-**Must never grow:**
-
-- **Visibility.** Version words in leaf payloads are opaque bytes here. `row_visible`, unique-check arbitration, speculative-insert semantics — the engines' (`cascade-iot`, `cascade-index`). This crate cannot answer "is this entry visible", only "here are the entries at this key".
-- **Undo.** `roll_ptr` is payload bytes. Chain walking and delta application belong to `cascade-iot` (WP6).
-- **Transactions.** No `TxnCtx`, no status table, no snapshots in any signature. Every operation takes an `OpCtx` (tenant/span/deadline) and nothing else transactional.
-- **Key semantics.** Ordering is bytewise on normalized `KeyBytes` (WP1 F4 invariant 7) — this crate never decodes a key into a type.
-
-The crate serves two hosts through one generic tree: the IOT leaf kind and the index leaf kind differ only in their payload codec, which the host supplies as a typed view over `cascade-page` bytes (§2.4). Branch nodes are shared verbatim.
+**Depends on:** the landed page format and the cross-core buffer pool (pin word, copy-out guards, exclusive-pin mutation, no pin across an `await`); the page design's module split (page L3), which must land before the first B-tree page kind.
 
 ---
 
-## 2. Tree shape and node formats
+## 1. Scope
 
-### B1 — One tree, one segment; the metapage is page 0
+**Owns**
 
-A tree lives in exactly one segment: every node pointer is a relation-local `PageNo` (u32) — the same packing family as WP1 F4's `Locator::Heap` and F2's `next` word. Consequences taken deliberately: 2³² pages × 8 KiB = 32 TiB per tree (v1 ceiling, far past any v1 table); one segment per index simplifies `ScopePages` allocation, prefetch (storage `read_pages` is sequential over the segment), and bulk load; cross-segment trees are a post-v1 format change (child pointers would grow to u64 segment+page).
+- Tree shape and invariants: node kinds, fill, height, and finding the root through the metapage.
+- Descent and latching (B3): optimistic, validated after the fact, no pin across an `await`.
+- Structure changes: the split (B5), and the decision not to merge (B6).
+- Operations on byte keys: insert, lookup, ordered scan with mark/restore, update in place, delete-mark, stamping a word, and purge-compact.
+- The design of the redo record family for tree changes (§8). The bytes of those records belong to `cascade-wal-format`; their apply functions belong to `cascade-redo`, written against `cascade-page`'s B-tree views.
 
-`page_no 0` of every tree segment is the **tree metapage**: root `PageNo`, tree kind tag (IOT leaf vs index leaf payload codec), height, and free-format reserved space. It is an ordinary WAL-logged page — a root split logs a metapage update record in the same mini-transaction as the split, so recovery never reconstructs a root by scanning. In-memory tree handles cache the root; the metapage is re-read on open and after any split that logs a new root.
+**Must never grow**
 
-### B2 — Page kinds and headers (proposed; frozen at landing with golden tests)
+- **Visibility.** Version words inside leaf payloads are opaque bytes here. `row_visible`, the unique check, and speculative insertion belong to `cascade-iot` and `cascade-index`. This crate answers "which entries are at this tree key", never "is this entry visible".
+- **Undo.** `roll_ptr` is payload. Walking and applying undo belong to `cascade-iot`.
+- **Transactions.** No transaction context, status table or snapshot appears in a signature. Every operation takes an `OpCtx` and nothing else transactional.
+- **Key meaning.** Order is bytewise on the normalized key bytes (`cascade-pgtypes`). This crate never decodes a key.
 
-Three new kinds under `cascade-page`'s prologue registry (layer design A3; page design L1 assigns per-kind version namespaces). Proposed kind numbers, frozen when the first golden lands: **2 = btree branch, 3 = IOT leaf, 4 = index leaf**. Kinds 5 (tree meta) stays open — the metapage can ship as a fourth kind or as a header-flagged branch variant; the landing review picks, and this document does not pre-grow the registry.
+One generic tree serves both users. An IOT leaf and an index leaf differ only in the codec of their entries, which the host supplies as a typed view over `cascade-page` bytes (§2.2). Branch nodes are shared verbatim.
 
-All three keep the layer discipline: bytes are the spec (no `#[repr(C)]`), little-endian, compile-time format locks, **total parse at the boundary**, validate-before-mutate, per-kind `page_lsn` at a fixed offset (page design L2's stamp-position rule), cells/entries growing down from the tail with a slot/index array growing up from the header — the heap format's proven geometry, reused so `apply`-style byte transforms and compact-on-purge (§7) have one shape across kinds.
+---
+
+## 2. Tree Shape and Node Formats
+
+### 2.1 B1 — One tree, one segment; the metapage is page 0
+
+A tree lives in exactly one segment, and every node pointer is a page number inside it (`u32`). That caps a tree at 2³² pages of 8 KiB, 32 TiB, which no version-1 table approaches. It also makes allocation, prefetch (the storage layer reads a segment's pages sequentially) and bulk load simpler. A tree across several segments would need wider child pointers and is a later format change.
+
+Page 0 of every tree segment is the **metapage**: the root's page number, the tree's height, and a tag that says which leaf codec the tree uses. It is an ordinary logged page. A root split records the new root and the metapage in the same mini-transaction as the split, so recovery never has to find a root by scanning. A tree handle in memory keeps the root's page number and the height; both are refreshed when a group that changes them is applied (§4).
+
+### 2.2 B2 — Page kinds and headers
+
+Four kinds under `cascade-page`'s registry, each frozen with golden tests when it lands: **2 = branch, 3 = IOT leaf, 4 = index leaf, 5 = metapage**. The metapage gets its own kind rather than a flag on a branch, so that parsing never depends on a flag.
+
+All of them keep the page layer's discipline: the bytes are the specification (no `#[repr(C)]`), little-endian, total validation at parse, validate before mutate, a page LSN at a fixed offset (page L2), and entries growing down from the tail under a slot array that grows up from the header — the heap page's geometry, so that the transforms below have one shape.
 
 ```text
-branch (kind 2)                      IOT leaf (kind 3)                index leaf (kind 4)
-0: prologue (v/k)                    0: prologue                      0: prologue
-4: entry_count u16                   4: entry_count u16               4: entry_count u16
-6: free_offset u16                   6: free_offset u16               6: free_offset u16
-8: page_lsn u64 (end LSN, S17)       8: page_lsn u64                  8: page_lsn u64
-16: mod_count u64 (B3 latch)         16: mod_count u64                16: mod_count u64
-24: reserved 4                       24: next_leaf u32 (B7)           24: next_leaf u32 (B7)
-28: leftmost_child u32               28: reserved 4                   28: reserved 4
-    (valid iff entry_count > 0)
-32: slot array ↑ (2 B each)          32: slot array ↑                 32: slot array ↑
-    entries ↓:                           entries ↓ (IOT leaf row):        entries ↓ (index entry):
-    [sep_len u16][sep KeyBytes]          [key_len u16][key KeyBytes]      [key_len u16][key KeyBytes]
-    [child PageNo u32]                   [creator VersionWord u64]        [locator packed]      (F4 shape)
-                                     [roll_ptr u64][flags u16]            [create word u64][delete word u64]
-                                     [payload…]
+branch (kind 2)                    IOT leaf (kind 3)              index leaf (kind 4)
+ 0: format version, kind            0: format version, kind        0: format version, kind
+ 4: entry_count u16                 4: entry_count u16             4: entry_count u16
+ 6: free_offset u16                 6: free_offset u16             6: free_offset u16
+ 8: page_lsn u64                    8: page_lsn u64                8: page_lsn u64
+16: mod_count u64   (§3.1)         16: mod_count u64              16: mod_count u64
+24: reserved 4                      24: next_leaf u32              24: next_leaf u32
+28: leftmost_child u32             28: reserved                    28: reserved
+    (valid once entry_count > 0)
+32: slot array, growing up          32: slot array                 32: slot array
+
+entries, growing down:
+ [len u16][sep_len u16]            [len u16][key_len u16]         [len u16][key_len u16]
+ [separator key bytes]             [tree key bytes]               [tree key bytes]
+ [child page u32]                  [creator word u64]             [locator bytes]
+                                   [roll_ptr u64][flags u16]      [create word u64][delete word u64]
+                                   [payload…]
 ```
 
-Format decisions pinned here so the landing goldens have one source:
+- **Branch entries route by right-child convention.** Entry *i* holds a separator `k_i` and the child that owns keys in `[k_i, k_{i+1})`. The header's `leftmost_child` covers everything below the first separator. Separators are full keys in version 1: no suffix truncation, no prefix compression (§10).
+- **IOT leaf row.** The creator is a version word. `roll_ptr` is opaque here; its encoding belongs to the IOT design. The flag word has bit 0 `DELETE_MARK` and bit 1 `HAS_TOAST`; the rest are zero. An IOT row's lock lives in the lock manager, not in this header (layer §6.10). There is no deleter word. **A delete-mark is not self-contained:** whether a snapshot sees the row as deleted depends on when the deleting transaction committed, and only the undo record at `roll_ptr` carries that (layer §11.3). This crate sets and clears the bit and reads nothing into it.
+- **Index entry.** The locator is the primary key for an IOT table and a Tid for a heap table (`cascade-pgtypes`' `Locator`). Its length follows from the entry's: it is everything between the key and the two words.
+- **Sizes.** An entry is at most 8158 bytes, the most a fresh page holds (layer §7, step 2). A larger IOT row is stored out of line; a larger index key is refused when the index is defined.
+- **Fill.** Leaves split when an entry does not fit; branches when a separator does not. There is no fill-factor setting. The split-point rule in §5.1 is fixed.
 
-- **Branch entries route by right-child convention**: entry *i* holds separator `k_i` and the child that owns keys in `[k_i, k_{i+1})`; the header's slot-0 special case is avoided by storing the leftmost child in the header's reserved field at offset 28 (`leftmost_child u32` when `entry_count > 0`, parse-valid only then). Separators carry **full keys in v1** — no suffix truncation, no prefix compression (both are reserved evolutions: truncation is a minor-bump candidate because separators are routing-only; leaf prefix compression is rejected for v1, revisited with the open question in §10).
-- **IOT leaf row header** (HLD §11's shape, F1 words): creator `VersionWord`, `roll_ptr` u64 (encoding owned by `cascade-iot`/WP6 — opaque here), flags u16: bit 0 `DELETE_MARK`, bit 1 `HAS_TOAST`, bits 2..15 reserved zero. There is no separate deleter word: an IOT delete is the delete-mark flag plus the undo record's prior version word (HLD §11; the heap's `xmax` shape is deliberately not copied — different mutation model, the page design §2 cell boundary).
-- **Index leaf entry** is WP1 F4's logical shape verbatim: `[key][locator][create word][delete word]`, locator tagged (`Pk` | `Heap`). The delete word is `EMPTY` while live. HLD §13's delta-encoding-against-page-base optimization stays deferred (WP1 F4's stance), reserved via the minor-bump rule.
-- **Entry payload ceilings**: entry length prefix is u16 like the heap cell; entries above ~2 KiB are a TOAST problem (IOT: `HAS_TOAST`, `cascade-iot`'s design; index keys: refuse at the descriptor — the catalog layer enforces index key width limits, as PostgreSQL does).
-- Fill targets: leaves split at physical fullness (§5.1); branches split when an inserted separator would not fit. No fill-factor knob in v1 — the split-point rule (§5.1) is the only tuning, and it is fixed, not configurable (product pillar: no tuning settings).
+### 2.3 B8 — Tree keys, and entries with equal keys
 
-### B2.1 — Slot arrays and markers on tree pages
+A tree orders its entries by a **tree key**.
 
-Tree pages reuse the heap's slot-state machine (page design D1) only where its semantics transfer: `Unused` slots after purge-compact, lowest-first reuse. `Redirect`/`Dead` do **not** exist on tree pages — nothing outside vacuum points at a heap slot, but *index entries* point into IOT leaves only by key (never by position), and branch children point at whole pages, so no tree-slot aliasing hazard exists. Purge-compact (§7) rewrites offsets and never renumbers live entries' **keys**; scan resumption (B7) is by key, not slot, so renumbering is invisible to readers.
+| Tree | Tree key | Why |
+| :--- | :--- | :--- |
+| IOT | the primary-key bytes | the primary key is unique |
+| Unique index | the key bytes | unique by definition |
+| Non-unique index | the key bytes followed by the locator bytes | several entries share a key; adding the locator makes the tree key unique, and a range over the key's prefix still selects all of a key's entries |
+
+The host builds the tree key; the tree stores it as opaque bytes.
+
+**Equal tree keys still occur**, in every kind of tree, for two reasons. An update that cannot be made in place leaves a delete-marked entry beside its replacement at the same key (§5.3). And a dead entry stays in place until purge-compact removes it, so an entry inserted again at the same tree key meets its dead twin — in a non-unique index, after a heap slot is reused. Three rules cover them:
+
+- Among equal tree keys, order is by insertion: the older entry sorts first, and a new entry goes last.
+- `lookup(key)` returns the **run** of entries with that tree key, oldest first. The host chooses among them by visibility.
+- A split does not cut inside a run, unless one run alone fills a page. A lookup that meets such a cut follows `next_leaf` while entries carry the same tree key.
+
+### 2.4 B9 — Every entry carries its own length
+
+The first field of every entry is `len u16`, as it is for a heap cell. The page layer validates a page totally at parse, which it cannot do without each entry's extent, and an update in place that shrinks an entry leaves slack inside it (§5.3), which it cannot represent otherwise.
 
 ---
 
-## 3. Descent and the latch protocol (B3)
+## 3. Descent and Latching (B3)
 
-The BPM's v1 pin word is page-level: exclusive pin or copy-out shared read, `Contended` on conflict, no pin across an await. A btree needs multi-level coupling on top of that, and the no-await-pin rule forces the optimistic shape — a descent that hits a page fault must not hold its parent pinned while it awaits the fetch. The protocol is Optimistic Lock Coupling (Graefe-style) with the node's `mod_count` as the validation word:
+The buffer pool's pin is page-wide. A reader takes a coherent copy of a page; a writer takes the exclusive pin; either may meet `Contended` and try again; and no pin may be held across an `await`. A descent that meets a page which is not resident must await a fetch, so it cannot hold its parent pinned while it descends. The protocol is therefore optimistic: copy first, validate afterwards.
+
+### 3.1 The validation word (B10)
+
+Every node's header carries `mod_count u64`, and one rule governs it: **every redo record that changes a node increments that node's `mod_count` by exactly one, and nothing else writes it.** The record's apply does the increment, so the seam does it on the leader and `cascade-redo` does it on replay. `mod_count` is then a function of the node's redo history alone. The leader, a follower and the page store compute the same value, and a node's count never repeats.
+
+A validator reads the field through a page-cache accessor that copies the eight bytes, not the page.
+
+An in-memory counter was considered and rejected. A counter in the frame resets when a page is evicted and fetched again, and a reader could then take a refetched page for the one it read.
+
+### 3.2 Reads
 
 ```text
-descent(key):
-  loop:                                   # retry loop; bounded, seeded by SMO frequency
-    node = pin_copy(root)                 # copy-out read; includes mod_count
-    loop down the tree:
-      (child, version) = route(node, key) # pick child by separators
-      child_node = pin_copy(child)        # may await on a miss — no pin held from `node`
-      node = child_node
-      if leaf: return (leaf_image, leaf_version)
+lookup(tree, key):
+  loop
+    root_no = tree.root.load()            # the root pointer is the top-level version
+    node    = copy(root_no)               # a coherent copy; note (root_no, node.mod_count)
+    path    = [(root_no, node.mod_count)]
+    while node is a branch:
+        node = copy(route(node, key))     # may await if the page is not resident; nothing is held
+        path.push((node.page_no, node.mod_count))
+    if tree.root.load() != root_no:       # the root changed during the walk
+        continue
+    for (page_no, version) in path, except the leaf:
+        if peek_mod_count(page_no) != version:
+            continue                      # an ancestor changed since it was copied: start over
+    return node                           # the leaf copy, now known to be the right leaf for key
 ```
 
-- **Readers hold nothing across levels.** Each `pin_copy` is a coherent 8 KiB snapshot (BPM copy-out guard); the only cross-level state is the version chain. Before the leaf is *used* (visibility decision, mutation decision), the walker re-reads each ancestor's `mod_count` (one shared copy per level, cheap) — any changed count invalidates the walk and retries. This is OLC's validate-on-use, minus the shared latches: our pin word *is* the short shared latch, taken and released per level.
-- **Writers take the exclusive pin only on the node they byte-edit**, after a validated descent. The exclusive pin serializes concurrent writers to that node (the frame mutex under it makes the mutation atomic); between exclusive pin and release there is no await — record-and-mutate is a synchronous block (A1's `MiniTxn::record`/`mutate` never await; only `durable()` does, and pins are dropped before it, layer design §6.1).
-- **Concurrent writer vs reader**: the reader either copied before the write (sees the old version, validated stale only if an *ancestor* also changed — splits change ancestors; in-place leaf edits do not, so an in-flight leaf edit is invisible to a validated reader until it re-validates) or after (new `mod_count`, copy sees new bytes). A torn image is impossible: copy-out is under the frame mutex.
-- **Concurrent writer vs writer on one node**: the second exclusive pin attempt fails `Contended` and the caller retries its descent (fail-fast is the BPM's contract; the engine's retry is bounded and bias-free — no spin, one yield through `Rt::yield_now` between attempts).
-- **Multi-frame writers** (SMOs, §5) pin parent-then-left-then-right, always in that order — the only multi-pin order in the crate, so no cycle exists (Rule 11 model check, §9).
+The copies come first and the checks after the leaf copy is in hand. So any change to an ancestor between the reader's copy of it and its copy of the leaf is seen, and the reader starts over. A node's routing for a key cannot change without the node changing, so an unchanged path means the leaf is the right one.
 
-**What lands in the BPM:** nothing yet. The v1 pin word stays; OLC here is a *usage protocol* over copy-out + exclusive pins, not a new latch type. The BPM CONTEXT's "the OLC latch lands with the btree" is satisfied by this protocol; a fused per-node RW-latch inside the frame (saving one memcpy per level) is a measured optimization behind the same interface, not a v1 dependency.
+**The root is checked by pointer, not by version.** A root split rewrites the old root page in place, as the left child, and installs a new root. A reader that loads the root pointer just before the split and copies the page just after gets the left child, with no earlier version to compare against; a key in the right half would be reported absent. Comparing the pointer catches it, and a root pointer that returns is the same root, because page numbers are never reused. The handle's height is checked too: a root that copies as a leaf when the handle says the tree is taller is stale.
 
-*Why version re-validation and not pin-coupling:* pin-coupling (hold parent shared while pinning child) is impossible without holding a pin across the child's potential `await` — the F3 discipline forbids it structurally. Every surveyed OLC implementation that allows I/O during descent uses exactly this validate-later shape; ours differs only in that the "version" lives in the node image instead of a latch word.
-
----
-
-## 4. Root discovery and tree open (B4)
-
-`open(segment)` reads the metapage (root, kind, height) and returns a `TreeHandle { segment, root: AtomicU32, meta }`. The root is re-read after any operation that logs a metapage record (root split, root collapse); readers pick up the new root through the atomic on their next descent retry — a stale root merely costs one wasted walk, never a wrong answer (the old root's page remains a valid node; only its *role* changed, and `mod_count`/re-read-from-root catches the routing miss).
-
----
-
-## 5. Mutations
-
-### 5.1 Insert and split
+### 3.3 Writes
 
 ```text
-insert(tree, key, payload):
-  loop:
-    (leaf, v) = validated_descent(key)
-    exclusive-pin leaf
-    if fits(key, payload): slot-append entry; record LEAF_INSERT; unpin; return
-    else: split(leaf) → retry insert            # B5's split, then the insert re-descends
+write(tree, key, make_record):
+  loop
+    leaf = lookup(tree, key)                          # §3.2, validated
+    pin leaf exclusively                              # fail-fast: Contended → yield and retry
+    if leaf is not the rightmost leaf and key > leaf.last_tree_key:
+        unpin; continue                               # the leaf was split between lookup and pin
+    if any node on the lookup's path, except the leaf, changed since the lookup copied it:
+        unpin; continue
+    record = make_record(leaf)                        # reads the pinned copy
+    seam.apply(leaf, record)                          # layer §9.1: the redo function changes the page
+    unpin
+    return
 ```
 
-**B5 — a split is one mini-transaction.** The group carries every record the split needs — new-node init, old-node rewrite, parent separator insert, and, when the parent is the root, the new-root init + metapage update — so the durable LSN and every replay boundary never land inside a split (storage-layer-design §4.3 promise 5 names this exact case). Sequence: validated descent → exclusive-pin parent, left, right-new (that order; the new page comes from `ScopePages::extend`'s hint, one `fetch_add`, before pinning) → byte transforms under the pins → release pins → `durable()`.
+**The pins come first and the validation after.** A leaf's key range can change only through a split of that leaf, and a split needs the leaf's exclusive pin — the one now held. So once the leaf is pinned, two checks are enough: the ancestors copied on the way down have not changed, and the key is not beyond the leaf's last key. Validating before pinning would leave a window in which another writer splits the leaf, and the insert would land in the wrong half.
 
-**Split point** (fixed policy, B2's no-knob rule): split at the median entry for random workloads; when the inserting key sorts **past the last entry** (the append pattern), split so the new right node receives only the new key — the sequential-insert optimization that keeps append-heavy loads at ~full pages instead of ~half. Detection is per-split (compare against last entry), not a remembered mode.
+Nothing awaits between the pin and the unpin. The durability wait comes after the group is sealed (layer §9.1).
 
-**Root split**: when the splitting node is the root, the group adds the new-root init and the metapage record; the in-memory handle's root atomic updates at group apply.
+### 3.4 Structure changes: acquiring several pins (B11)
 
-### 5.2 Lookup and ordered scan
+A split changes three nodes — the left node, the new right node and their parent — or four when the left node is the root: the old root, the new right node, a new root and the metapage. All of them are rewritten under their exclusive pins, and nothing may await while a pin is held — but pinning a page that is not resident awaits a fetch. The order is therefore:
 
-`lookup(key)` is a validated descent + binary search over the leaf's slots (entries are slot-indexed, keys in slot order). Scans (B7) walk leaves in key order: position by descent to the first key ≥ the range's lower bound, emit entries, then follow `next_leaf`. A concurrent split ahead of the cursor is benign — the split copies entries *forward* and the cursor re-validates by key (below) — a split *behind* the cursor cannot remove entries the cursor hasn't emitted (splits never delete).
+1. **Make every page resident.** Take a shared copy of each and release it at once.
+2. **Take the exclusive pins** — parent, left, right — in that order, each fail-fast. For a root split they are the old root, the new right node, the new root and the metapage. If any refuses, release all, yield, and start over.
+3. **Validate under the pins.** The nodes above the parent have not changed since the descent copied them, and the parent's entry whose child is the left node still routes the split key to it. Otherwise release all and start over.
+4. **Build the records and apply them** through the seam.
+5. **Release the pins.**
+6. **Seal the group.** A commit waits for durability later.
 
-**B7 — mark/restore is key-anchored.** `mark()` saves the last emitted key (and its page, as a hint); `restore()` re-descends to the first key ≥ the marked key. This survives splits, compactions, and renumbering by construction, which is why §B2.1 can allow purge-compact to renumber slots freely. Cost: one descent per restore instead of an O(1) positional restore — accepted; merge-join restore frequency is bounded by the join, and `supports_mark_restore()` is advertised statically (`AmCapabilities`).
+The new right page's number is allocated before step 2. A split that then starts over leaves that number unused: a hole in the segment, harmless.
 
-### 5.3 In-place update (IOT leaves only)
+Parent → left → right is the only multi-pin order in the crate. Two structure changes therefore cannot wait on each other, and a writer that holds only a leaf pin never holds anything a structure change needs first.
 
-`update_in_place(key, new_payload)` — the HLD §11 update path, exposed byte-level: validated descent, exclusive pin, and:
+### 3.5 Why this is sound
 
-- `len(new) ≤ len(old)` → overwrite the payload in place; the length prefix and slot offset stay; the freed slack stays where it is until purge-compact. Record `LEAF_UPDATE` (carries the new bytes; replay overwrites the same region — deterministic because the record names the key and replay locates the entry by key).
-- `len(new) > len(old)` and the slack fits → same, with the entry's slot offset rewritten (the entry grows downward; still one page, one record — `LEAF_UPDATE` carries the new full entry bytes and replay rewrites the whole entry region for that key).
-- Otherwise → the engine's fallback: delete-mark + insert of the new version at the same key position (two records in the same group). The btree exposes this composition; `cascade-iot` decides when to use it (its WP6 design).
+A reader copies nodes one at a time and checks each ancestor's version after its leaf copy is in hand.
 
-An update that changes the **key** is never in-place — that is delete-mark + insert at the new key, the locator-move case (`WriteOutcome::Done` with the new `Pk`), engine-composed from the same two primitives.
+- A plain write changes a leaf only under that leaf's exclusive pin, and no reader can copy a leaf during its exclusive pin. A reader sees the leaf either as it was before the write or as it was after.
+- A structure change changes all of its nodes under their pins at once. No reader can copy a child after the change together with a parent from before it. A reader that copies a node after the change copied its parent either before the change — the parent's version then differs, and the reader starts over — or after, in which case both are current.
+- The one node that changes without a version to compare is the old root during a root split. Its pointer is compared instead (§3.2).
 
-### 5.4 Delete-mark, delete-word, purge-compact
-
-- **Delete-mark** (IOT leaf): set the flag bit — one u16 write under the exclusive pin, record `DELETE_MARK` (names the key). Clearing it happens only in purge-compact (physical removal).
-- **Delete-word stamp** (index leaf): write the `delete word` u64 — record `ENTRY_DELETE_WORD` (key + the word). Same shape as the heap's `set_xmax`, on a different kind.
-- **Purge-compact** (§7): the engines compute, per page, which entries are physically removable (their verdicts — dead delete-marked rows, entries with words older than the cleanup watermark); the btree rewrites the page keeping surviving entries verbatim, renumbers slots, resets `free_offset`, zeroes the gap — the heap's compact-on-prune transform (page design D3) generalized to tree kinds, with the same law: **verdicts computed by the engine, never replayed** (page design D2's redo argument applies verbatim: deadness needs the status table, which replay lacks). Record `PURGE_COMPACT` carries the keep-list implicitly by carrying the surviving entries verbatim; replay rebuilds the page from the record + the old image deterministically.
-
----
-
-## 6. What the engines build on this
-
-- **`cascade-iot`** (WP6): leaf rows carry the creator word + `roll_ptr`; insert = `LEAF_INSERT` + undo-append in one group (undo-before-leaf, layer design §6.1); update = §5.3 with an undo delta first; delete = §5.4's mark + undo; read = validated descent, then the undo walk *outside* the tree (the engine applies deltas to a copied row buffer — no page pin during the walk; a concurrent purge of an undo segment the walk still needs is prevented by the cleanup watermark, not by latching).
-- **`cascade-index`**: entries per §2; unique check = validated descent to the key, decode entries, `row_visible(create, Some(delete))` per entry — `Conflict::InProgress` (uncommitted-other) or `UniqueViolation` (committed-live); speculative install = `LEAF_INSERT` of an entry whose create word is the writer's own uncommitted word (the arbiter is the word, so a conflicting inserter's check finds it — the PG speculative shape with our version words, WP5 D12's engine half).
-- **`cascade-maintenance`/purge**: drives §5.4 through `Maintenance::step` budgets; the btree exposes purge as per-page work items discovered by an amortized scan (dirty-leaf bitmap maintained by delete-mark/delete-word operations — a page enters the purge candidates list when a mark/stamp lands on it).
+So every interleaving that could mislead a reader changes an ancestor's `mod_count` between that reader's copy of the ancestor and its validation, or changes the root pointer. In each case the reader starts over. The model check of §9 enumerates these interleavings.
 
 ---
 
-## 7. Purge-compact and slot hygiene
+## 4. Root Discovery and Opening a Tree (B4)
 
-Inherits the page design's compact-on-purge decisions, generalized: surviving entries are copied **verbatim** into a fresh tail run; slot values are rewritten; `entry_count` shrinks only by trailing-`Unused` truncation (slot indices of surviving entries are preserved — not for locator stability, which keys provide, but so replay's keep-list indices are unambiguous); `free_offset` resets exactly; the gap zeroes. `mod_count` increments — in-flight validated descents that already passed this page re-validate on use and retry. The transform validates the whole plan against the current image and refuses atomically (the layer's validate-before-mutate rule, page design L2).
+`open(segment)` reads the metapage and returns a handle with the root's page number and the height. A root split's group updates both when it is applied. Readers validate against the root pointer on every lookup (§3.2). A stale handle costs one repeated lookup, never a wrong answer.
 
 ---
 
-## 8. Redo record family
+## 5. Operations
 
-Record type bytes extend WP1 F3's extend-never-renumber table. **Proposed allocation: heap family 10–19 (heap design §9), btree family 20–29, undo family 30–39 (`cascade-iot`/WP6), index shares the btree family, FSM 40–41 (heap design §7); frozen at landing.** Every record obeys the four §12.4 rules; each names its target page(s); payloads are `cascade-wal-format`'s.
+### 5.1 Insert and split (B5)
 
-| Byte (proposed) | Record | Carries | Self-containment |
+```text
+insert(tree, tree_key, entry_bytes):
+  write(tree, tree_key, leaf ->
+      if it fits:  a leaf-insert record
+      else:        split the leaf (§3.4), then retry the insert from the top)
+```
+
+**A split is one mini-transaction and one record** (layer §9.1; §8). `BT_SPLIT` carries the left node's image, the new right node's image, the parent's new separator, and — when the left node was the root — a new root and the metapage. The durable LSN therefore never falls inside a split (storage §2, S16). §3.4 gives the order of pins.
+
+**Where a split cuts.** At the median entry, except when the key being inserted sorts after the leaf's last entry. Then the new right node receives only the new entry. Sequential inserts keep their pages full instead of leaving every other page half empty. The test is made at each split, by comparing with the last entry; there is no remembered mode. A split never cuts inside a run of equal tree keys unless the run fills a page (§2.3).
+
+### 5.2 Lookup and ordered scan (B7)
+
+`lookup(tree_key)` is the descent of §3.2 and a search of the leaf for the run of entries with that tree key, oldest first (§2.3).
+
+A scan positions itself by a lookup of the range's lower bound, emits the visible entries of each leaf copy in order, and follows `next_leaf`. The cursor emits from copies, one leaf at a time, and never holds a pin.
+
+**A split during the scan loses nothing and shows nothing too new.** Take a leaf L that splits while the scan is under way, moving its upper entries into a new right sibling L′.
+
+- *The cursor had already copied L.* It emits every entry of its pre-split copy, the moved ones included. It then follows that copy's `next_leaf`, to L's old right neighbour, and never visits L′. L′ holds the moved entries, already emitted, and anything inserted after the split — which was written after the snapshot's read timestamp and is invisible to it.
+- *The cursor had not yet copied L.* It copies L after the split, emits the entries left in it, follows L's `next_leaf` to L′, emits those, and goes on.
+
+An insert can be visible to a snapshot only if it committed before the snapshot's read timestamp, and the read waited for the closed timestamp. So nothing a split adds during the scan is visible to the scan.
+
+**Mark and restore are anchored to a tree key.** `mark()` remembers the last tree key it emitted; `restore()` looks that tree key up again and resumes inside its run. This survives splits, compaction and any renumbering of slots. It costs one descent per restore, which merge join tolerates. `supports_mark_restore` is advertised statically.
+
+### 5.3 Update in place (IOT leaves)
+
+The IOT keeps the newest version in the leaf (kept §1), so an update overwrites the row when it can:
+
+- **The new entry is not longer than the old.** Overwrite it and set `len` to the new length. The slack stays inside the entry until purge-compact. The record carries the new entry bytes; replay overwrites the same region, which it finds by tree key.
+- **Longer, and the leaf has room.** The same, with the slot rewritten to the entry's new start. One record.
+- **Otherwise.** The host falls back to a delete-mark and an insert at the same tree key. The tree then holds a delete-marked entry and a live one with equal tree keys (§2.3) until purge removes the dead one. The IOT design decides when.
+
+An update that changes the tree key is never in place. It is a delete-mark at the old tree key and an insert at the new one, which is why the IOT's locator moves on a primary-key update.
+
+### 5.4 Delete-mark, stamp, purge-compact
+
+- **Delete-mark** (IOT leaf): set the flag bit. One record, naming the tree key. The bit is cleared only when purge-compact removes the entry.
+- **Stamp a word** (index leaf): write the entry's delete word. One record, naming the tree key and the word.
+- **Purge-compact** (§7): the host says which entries of a leaf are removable, and the tree rewrites the leaf without them.
+
+### 5.5 No merge and no root collapse (B6)
+
+Version 1 never moves an entry from one node to another and never removes a node.
+
+- A branch never loses a separator, so it never falls below two children. **A root collapse cannot happen.** Its record type is reserved and never emitted.
+- A leaf shrinks only when purge-compact removes dead entries from it.
+
+**The cost.** After a workload that deletes heavily, the tree keeps its height and its near-empty leaves. Every lookup pays the full height, and a range scan crosses empty pages.
+
+**Why accept it.** Merge is the hardest part of a B-tree to make correct under concurrency and replay, and the IOT engine is the default engine: its rows leave nothing behind when they are updated, so its tree does not shrink the way a heap's does. The policy is reopened when a deletion-heavy benchmark measures the cost.
+
+---
+
+## 6. What the Engines Build on This
+
+- **`cascade-iot`** (layer §11.3). A leaf row carries the creator word and `roll_ptr`. Insert: an undo record and a leaf-insert record in one group, undo first. Update: §5.3, with an undo delta first. Delete: the mark and an undo record. Read: a lookup, then the undo walk outside the tree, on a copy of the row — no pin is held during the walk. Purge of an undo record the walk still needs is prevented by the cleanup watermark, not by latching.
+- **`cascade-index`** (layer §11.4). The host supplies the tree key (§2.3). The unique check is a lookup, which returns the run at the key, and then the host's rule on each entry: an entry another transaction has in progress gives `Conflict::InProgress`; one committed and visible gives `UniqueViolation`; one committed after the snapshot gives `CommittedAfterSnapshot`. A speculative insert is an ordinary insert whose create word is the writer's; aborting it stamps the delete word (layer §6.9).
+- **`cascade-maintenance`**. Purge runs through `Maintenance::step` budgets. The host keeps a list of leaves that hold dead entries — a leaf joins it when a mark or a stamp lands on it — and offers them to purge one at a time.
+
+---
+
+## 7. Purge-Compact and Slot Hygiene
+
+Tree pages have no slot markers: every slot points at an entry.
+
+The host says which entries of a leaf are removable. The tree rebuilds the leaf's tail from the entries that remain, in their existing order; rewrites the slot array to match; sets `entry_count` to their number; resets `free_offset`; zeroes the gap; and, through the record's apply, increments `mod_count`. It first checks the list against the pinned leaf and refuses the whole operation if a named entry is absent.
+
+Slot numbers may change. Nothing outside a page refers to a slot, and a scan resumes by tree key (§5.2).
+
+The host's verdicts travel in the record and are never derived again at replay. Deadness needs the status table, which replay does not have (page D2).
+
+---
+
+## 8. Redo Record Family
+
+Record type bytes extend `cascade-wal-format`'s table and are never renumbered. Proposed allocation, frozen when the family lands: **20–29 for the tree family**. Every record obeys the four redo laws (storage §12.4). Three further rules apply to all of them:
+
+- **Page LSN.** A record leaves each node it changes with the end of that record as its page LSN (layer §9.3).
+- **`mod_count`.** A record increments the count of each node it changes by one (§3.1). A record that carries a node's whole image — the split — has the new count already inside that image, and the apply copies it.
+- **Idempotence.** The apply checks the record's start against the node's page LSN first and does nothing if the node is ahead.
+
+| Byte (proposed) | Record | Carries | Replay |
 | :--- | :--- | :--- | :--- |
-| 20 | `BT_LEAF_INSERT` | page kind (3 or 4), full entry bytes, insert position as **key** | Replay locates the position by key in the old image and inserts. Index-naming would also be deterministic (the LSN-ordered replay sees this group at its exact prefix, so no concurrent group can have touched the page), but key-naming is kept as defense-in-depth and for diagnosability — a replay that cannot find its key fails loudly instead of inserting at a shifted position |
-| 21 | `BT_LEAF_UPDATE` | kind, key, full new entry bytes (and old length) | Overwrite-in-place by key |
-| 22 | `BT_DELETE_MARK` / `BT_ENTRY_DELETE_WORD` | kind, key, the flag/word | One-field rewrite by key |
-| 23 | `BT_SPLIT` | left page, new page no, split key, both nodes' post-images (verbatim), parent page + inserted separator, optional new-root image + metapage image | The one record carries the whole SMO; replay applies node images verbatim — deterministic by construction, no routing logic on the replay side |
-| 24 | `BT_ROOT_COLLAPSE` | old root, new root, metapage image | Verbatim images |
-| 25 | `BT_PURGE_COMPACT` | kind, page, surviving entries verbatim, new `free_offset` | Verbatim rebuild |
-| 26 | `BT_META` | segment, metapage image | Root/kind/height rewrite |
+| 20 | `BT_LEAF_INSERT` | leaf kind, the tree key, the whole entry | Finds the end of the run at that tree key and appends there |
+| 21 | `BT_LEAF_UPDATE` | leaf kind, tree key, which entry of the run, the whole new entry | Overwrites that entry |
+| 22 | `BT_DELETE_MARK` | tree key, which entry of the run | Sets the flag bit |
+| 23 | `BT_ENTRY_DELETE_WORD` | tree key, which entry of the run, the word | Writes the word |
+| 24 | `BT_SPLIT` | the left node's image, the new right node's image, the parent's separator and its position, and for a root split the new root's image and the metapage's | Copies the images |
+| 25 | `BT_PURGE_COMPACT` | leaf kind, the entries that remain, in order | Rebuilds the leaf from them |
+| 26 | `BT_META` | the metapage's image | Copies it |
+| 27 | `BT_ROOT_COLLAPSE` | — | **Reserved. Never emitted in version 1** (§5.5) |
 
-The SMO-as-one-record choice (`BT_SPLIT` carrying post-images instead of step-by-step deltas) is deliberate: replay applies images and stays free of tree logic entirely — the `cascade-redo` btree family is then byte-copies plus header stamps, the simplest possible apply, at the cost of larger records (a split logs two full node images, ~16 KiB worst case). Ingest bandwidth is the page store's budget, not the commit path's; the alternative (delta SMO records) would put tree logic in replay, which §12.4's determinism rule makes risky and Rule 5 makes multi-owner. Revisit only if page-store ingest profiling ever shows split-heavy logs dominating.
+**Why a split carries images, not steps.** Replay then copies bytes and contains no tree logic at all, which keeps it on the right side of the determinism law and leaves the tree's logic in one crate. The price is size: a split logs two nodes, up to about 16 KiB, inside the 1 MiB group limit (storage §5.4). §10 says when that would be revisited.
 
-*Idempotence*: every record's apply checks `record.lsn ≥ page_lsn` (S17 end-LSN rule) and no-ops otherwise — the same caller-side check the heap family uses (page design D4's stance: the format primitives are LSN-agnostic; the replay loop owns the check).
+Records 20–23 name "which entry of the run", so that a delete-marked twin and its live replacement at one tree key are told apart.
 
 ---
 
 ## 9. Testing
 
-- **Golden bytes** per kind and per record payload at their authorities (`cascade-page` views, `cascade-wal-format` payloads) — the landing commits freeze kinds 2/3/4 (and the metapage form) with byte-literal tests, per the layer discipline.
-- **Replay equivalence**: random insert/update/delete/purge workloads through the fake `MiniTxnScope`; pages rebuilt by applying the recorded groups to empty images must be byte-identical to the live pages.
-- **Tree property tests**: after any operation sequence, an ordered walk yields sorted unique keys; every `next_leaf` chain is complete and acyclic; every branch separator routes correctly against its children (checked exhaustively on small trees).
-- **Concurrency**: `loom` on the multi-pin order (parent→left→right) and the validated-descent retry loop (Rule 11); seeded interleaving tests for reader-vs-split (a validated reader never observes a half split — structurally impossible, asserted by re-reading the post-split invariants mid-suite).
-- **Engine differential**: the same logical workload through IOT leaves and (fake-coded) index leaves agrees on observable outcomes; the generic `AnyTable` suite covers the contract promises.
-- **Mark/restore under concurrent SMOs**: restores land on the same logical position across splits and compactions (the key-anchor property, B7, tested directly).
+- **Golden bytes** for each kind and each record payload, at their authorities: `cascade-page` for the nodes, `cascade-wal-format` for the records. The landing commits freeze kinds 2–5.
+- **Replay equivalence.** Random insert, update, delete and purge workloads through the in-memory seam. Pages rebuilt from the recorded groups equal the pages the leader produced, byte for byte.
+- **Tree properties**, after any operation sequence: an ordered walk yields tree keys in non-decreasing order, with equal tree keys in insertion order; every `next_leaf` chain is complete and acyclic; every separator routes correctly to its child; and every node's `mod_count` equals the number of records applied to it.
+- **Concurrency, model-checked** (`loom`, architecture Rule 11): the multi-pin order; validate-after-pin for a plain write; a lookup racing a root split; a lookup racing a leaf split.
+- **Scans under splits.** A scan's result at a snapshot equals the reference result while splits run.
+- **Mark and restore** across splits and purge-compact.
+- **Equal tree keys.** Runs are kept in insertion order, returned whole, and not cut by a split.
 
 ---
 
-## 10. Open questions
+## 10. Open Questions
 
-| Question | Owner / needed before |
+| Question | Owner, and needed before |
 | :--- | :--- |
-| Metapage: fourth kind vs header-flagged branch | Landing review of this document — a format one-way door, decided before the first golden |
-| Merge/rebalance (underfull pages after deletion-heavy workloads) | Deferred by B6; revisit when a deletion-heavy benchmark shows height inflation or scan slack past a bound |
-| Leaf prefix compression; separator suffix truncation | Post-v1 format evolutions (minor-bump candidates); revisit with text-heavy index benchmarks |
-| Fused OLC latch inside BPM frames (one memcpy per level saved) | Measured optimization behind B3's interface; BPM CONTEXT's open question resolves to "this protocol now, fusion if profiled" |
-| Hot-node contention (single root/branch under one skew hot spot) | The contention budget (layer §5) covers the commit path; a hot *leaf* is the engines' partitioning concern, not the tree's |
-| `BT_SPLIT` record size (two node images) vs delta SMO records | Revisit on page-store ingest profiling only (§8's rationale) |
+| The metapage's exact layout | Frozen with kind 5's golden test |
+| Separator suffix truncation; leaf prefix compression | Later, as minor format versions, when text-heavy index benchmarks justify them |
+| A latch fused into the buffer-pool frame, saving one copy per level | A measured optimization behind this protocol's interface |
+| A hot leaf (the rightmost one under sequential inserts) serializes its writers | Acknowledged in layer §8. A mitigation is not designed; it is taken up when a benchmark shows it matters |
+| The size of `BT_SPLIT` | Revisited if page-store ingest profiling shows split-heavy logs dominating |
 
 ---
 
-## 11. Landing plan
+## 11. Landing Plan
 
-1. **Prerequisite**: `cascade-page`'s frame/heap module split (page design L3) — the btree consumes the layer contract, never a forked prologue.
-2. **Kinds + views**: kinds 2/3/4 (metapage form decided), typed views + parse + goldens in `cascade-page`; `cascade-btree` gains descent, insert/split, lookup, scan (B1–B3, B5, B7) over the fake `MiniTxnScope`, with the full test battery of §9.
-3. **The rest of the surface**: in-place update, marks/stamps, purge-compact, root collapse, metapage records (§5.3–§5.4, §8) — landed with replay-equivalence from the first commit, not retrofitted.
-4. **Consumers**: `cascade-iot` (WP6) and `cascade-index` adopt the tree; their landing freezes the undo family (30–39) and the index-entry specifics respectively.
+1. **Prerequisite.** The page design's module split (page L3). The tree consumes the page layer's contract and never a copy of its prologue logic.
+2. **Kinds and views.** Kinds 2–5 in `cascade-page`, with typed views, parse and golden tests. Then in `cascade-btree`, over the in-memory seam: descent and validation (§3), lookup, insert and split (§5.1), scan (§5.2), with the tests of §9.
+3. **The rest of the surface.** Update in place, marks and stamps, purge-compact, the metapage record.
+4. **The hosts adopt it.** `cascade-index` freezes the index entry's bytes; `cascade-iot` freezes the IOT leaf row's.
 
-Each step is one commit with the workspace gate green; task numbers are assigned when the landing plan is authored (the M-plan discipline).
+Each step is one commit with the workspace gate green. Task numbers are assigned when the step is scheduled.
 
 ---
 
 ## 12. Decisions
 
+Statuses mean: **Proposed**, awaiting the project owner; **Accepted**, by whom and when; **Superseded**, by what.
+
 | # | Decision | Status |
 | :--- | :--- | :--- |
-| B1 | One tree = one segment; u32 relation-local child pointers; metapage at page 0 as the recoverable root | Proposed — DRAFT |
-| B2 | Kinds 2/3/4 (branch, IOT leaf, index leaf); headers per §2; full separators in v1; no fill-factor knob; append-aware split point | Proposed — DRAFT |
-| B2.1 | Heap slot-state machine reused only for Unused; no Redirect/Dead on tree pages | Proposed — DRAFT |
-| B3 | Optimistic Lock Coupling over copy-out + exclusive pins; version re-validation on use; no pins across levels or awaits; fixed multi-pin order | Proposed — DRAFT |
-| B4 | Root discovery via the metapage; in-memory root atomic, re-read after root-changing groups | Proposed — DRAFT |
-| B5 | Split = one mini-transaction, one `BT_SPLIT` record carrying post-images | Proposed — DRAFT |
-| B6 | No merge in v1; root collapse only | Proposed — DRAFT |
-| B7 | Scans walk `next_leaf`; mark/restore is key-anchored | Proposed — DRAFT |
-
-Carried from the crate's CONTEXT (resolved here): key-prefix compression — rejected for v1 (§2, §10); suffix truncation — deferred as a minor-bump candidate; hash variant — sibling crate behind `cascade-index`'s seam when needed (layer design §13), never a tagged enum inside this crate (a hash table is not a B+tree; the only shared code would be the page-frame discipline).
+| B1 | One tree, one segment. Page-number child pointers. The metapage is page 0 | Proposed |
+| B2 | Kinds 2–5. Headers as in §2.2. Full separators. No fill-factor setting | Proposed |
+| B3 | Optimistic descent. Readers copy, then validate; writers pin, then validate; no pin across an `await` or a tree level | Proposed |
+| B4 | The root pointer and the height are validated on every lookup | Proposed |
+| B5 | A split is one mini-transaction and one record, carrying images. It does not cut inside a run | Proposed |
+| B6 | No merge and no root collapse in version 1 | Proposed |
+| B7 | Scans follow `next_leaf`. Mark and restore are anchored to a tree key | Proposed |
+| B8 | A non-unique index's tree key is key + locator. Equal tree keys are ordered by insertion, returned as a run | Proposed |
+| B9 | Every entry carries its own length | Proposed |
+| B10 | `mod_count` lives in the node's image and is incremented by every record that changes the node | Proposed |
+| B11 | A structure change makes its pages resident first, then takes all pins fail-fast, then validates under them | Proposed |
