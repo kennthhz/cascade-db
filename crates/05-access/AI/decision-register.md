@@ -10,15 +10,15 @@
 
 ## 1. Open decisions
 
-Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row.
+Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
 
 ### D-1. How version words become self-describing
 
 | | |
 | :--- | :--- |
 | **Question** | Engines only ever write `uncommitted(xid)`, so the status table must keep an entry for every transaction any live row still names, forever. How is that bounded? |
-| **Options** | (a) Stamp through the log: each transaction records the positions it stamped; at commit and abort it emits stamp records that `cascade-redo` applies everywhere, after which its status entry can be retired. (b) Keep the words and bound the table some other way: no sound method is known, because commit order is not txn-id order. |
-| **Recommendation** | (a), as layer §13.1 recommends. It also gives the heap a real rollback. Cost: one small record per touched row, written once. |
+| **Options** | (a) Stamp through the log: each transaction records the positions it stamped; at commit and abort it emits stamp records that `cascade-redo` applies everywhere, after which its status entry can be retired. (b) Keep the words and bound the table in memory some other way: no sound method is known, because commit order is not txn-id order. (c) Transaction status pages, which the architecture already lists (§4.2): a logged, paged array indexed by transaction id, holding state, commit timestamp and top-level id, cached like any other page (added by round-3 review V12). |
+| **Recommendation** | Changed 2026-11-27: (c) for version 1, with (a)'s logged stamping used lazily by prune and vacuum to freeze old words so that old status pages can be truncated (layer §13.1 compares the three). Commit stays one record, and subtransaction ids for savepoints (D-11) are just more entries. |
 | **Owner** | Transaction layer, ratified by Kenneth |
 | **Blocks** | Step 4 (the MVCC milestone) for every engine |
 | **Status** | Open |
@@ -50,10 +50,10 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Accept the three changes of layer §13.2 and update `docs/architecture-design.md`? |
-| **Items** | (1) A13: callers see an enum `AnyTable` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. |
-| **Recommendation** | Accept all three. |
+| **Items** | (1) A13: callers see an enum `AnyTable` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids (D-11). The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
+| **Recommendation** | Accept all five. |
 | **Owner** | Kenneth |
-| **Blocks** | (1) Step 1. (2) Step 4. (3) Step 2. |
+| **Blocks** | (1) Step 1. (2) Step 4. (3) Step 2. (4) Step 4. (5) Step 1. |
 | **Status** | Open |
 
 ### D-6. Ratify the proposed layer, B-tree and heap decisions
@@ -61,7 +61,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Every decision in the three designs is still Proposed except H9. Which are accepted as written? |
-| **Items** | Layer A1–A13 (layer §15). B-tree B1–B11 (btree §12). Heap H1–H8, H10–H13 (heap §13). Page L1–L3 and D1–D6 (page design §9). |
+| **Items** | Layer A1–A16 (layer §15). B-tree B1–B13 (btree §12). Heap H1–H8, H2a, H10–H13 (heap §13). Page L1–L3 and D1–D6 (page design §9). |
 | **Recommendation** | Ratify in the order they are needed: A-decisions before Step 1; A10 and the page L3 split before Step 2; H1–H13 and page D1–D6 before Step 4; B1–B11 before Step 6. The ones that only restate the architecture (A1, A4, A5, A9) can be accepted now. |
 | **Owner** | Kenneth |
 | **Blocks** | Each step, as listed |
@@ -93,11 +93,13 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | # | Question | Recommendation | Blocks |
 | :--- | :--- | :--- | :--- |
 | D-9a | The free-space map's page layout (kind 6) | Freeze it with H5/H12 before Step 4 | Step 4 |
-| D-9b | The two heap row-lock flag bits, `XMAX_LOCK_ONLY` and `XMAX_UPDATES_KEY`, in the `next` word's flag field | Assign them in `cascade-page` while the heap format is still major 0 | Step 4 |
+| D-9b | The heap row-lock flag bits `XMAX_LOCK_ONLY`, `XMAX_UPDATES_KEY` and the `HAS_SHARED_LOCKS` hint, in the `next` word's flag field; and the IOT leaf row's `HAS_LOCKS` bit (round-3 V16) | Assign them in `cascade-page` while the formats are still major 0 | Step 4 (heap), Step 7 (IOT) |
 | D-9c | The `cascade-page` frame/heap module split (page L3) | Land it early; it is code organization only | Step 6 |
 | D-9d | The upward dependency from `cascade-access-api` to `cascade-pgtypes` until `cascade-datum` exists (A7) | Accept as a named exception in the layering check | Step 1 |
 | D-9e | In the Step 3 slice a row is reserved and applied in the commit path, so a transaction cannot read its own uncommitted inserts | Accept for Step 3 and say so in the step's notes, or apply at insert and filter by an in-memory "own rows" set | Step 3 |
 | D-9f | A shared free-space predicate for `cascade-page` and `cascade-redo` instead of a mirror | Do it with the next change to either | — |
+| D-9g | Text indexes support only the `C` collation until `cascade-datum` provides collation-aware keys; other collations are refused at `CREATE INDEX` (layer A7, round-3 V24) | Accept, and list it in product definition §5.5 | Step 8 |
+| D-9h | Sequence range size (default 32, growing with use); allocation waits for durability (layer §11.5, round-3 V23) | Accept | Step 8 |
 
 ### D-10. The access-api implementation design (Step 1)
 
@@ -109,6 +111,38 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Owner** | Kenneth |
 | **Blocks** | Step 1 |
 | **Status** | Partly decided. C1, C5, C6 and C10 accepted by Kenneth on 2026-11-27, and C8's opaque lock key with them, since C1 forbids L4 naming an L5 type. C2, C3, C4, C7, the rest of C8, and C9, C11, C12, C13 are still open |
+
+### D-11. Statement visibility and savepoints (round-3 review V1, V2)
+
+| | |
+| :--- | :--- |
+| **Question** | A statement must not see its own changes (the Halloween problem), and `ROLLBACK TO SAVEPOINT` must work on the heap, which has no undo. How? |
+| **Options** | (a) Subtransaction ids: each writing statement and each savepoint stamps a fresh id recorded with its top-level transaction; a snapshot carries the statement's horizon; savepoint rollback marks sub-ids aborted. (b) A command id in each row header, as PostgreSQL does, plus a separate savepoint mechanism. (c) A per-transaction in-memory map from written versions to statements. |
+| **Recommendation** | (a), now written into layer §6.6 as A14. It needs no row-format change and solves both problems with one mechanism. Cost: one status entry per writing statement, and the status table must map sub-ids to their top. |
+| **Owner** | Transaction layer, ratified by Kenneth |
+| **Blocks** | Step 1 (it changes `Snapshot` and `TxnStatus` in `cascade-txn-api`) |
+| **Status** | Open |
+
+### D-12. The cleanup watermark in the managed service (round-3 review V8)
+
+| | |
+| :--- | :--- |
+| **Question** | Prune and vacuum verdicts replay on followers and read replicas. Their snapshots must hold cleanup back, or be cut off. |
+| **Recommendation** | In the managed service the watermark comes from `cascade-watermark`, covering followers and replicas, with a bounded lag after which a replica's reader gets "snapshot too old". Single-box mode keeps the process-local watermark (layer §11.7). |
+| **Owner** | `cascade-watermark` design, ratified by Kenneth |
+| **Blocks** | Step 4 in the managed service |
+| **Status** | Open |
+
+### D-13. The IOT tree reclaims empty leaves (round-3 review V11)
+
+| | |
+| :--- | :--- |
+| **Question** | The no-merge policy (B6) leaves empty leaves behind, which defeats the job-queue showcase. |
+| **Options** | (a) Unlink empty leaves, leaving a tombstone whose page is reused after the cleanup watermark (btree B12). (b) Drop the queue showcase from version 1. (c) Full merge. |
+| **Recommendation** | (a), now in btree §5.5. |
+| **Owner** | Kenneth |
+| **Blocks** | Step 6 |
+| **Status** | Open |
 
 ## 2. Decided
 

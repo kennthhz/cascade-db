@@ -38,8 +38,10 @@ Nothing in Step 1 touches a page, the log or the buffer pool. It depends on none
 ### 4.1 Visibility (layer §6.6, unchanged)
 
 ```rust
-pub struct Snapshot { pub read_ts: Hlc, pub own: Option<TxnId> }
-pub enum TxnStatus { InProgress, Committed { ts: Hlc }, Aborted }
+pub struct Snapshot { pub read_ts: Hlc, pub own: Option<OwnView> }
+/// The reader's transaction as one statement sees it (layer §6.6, round-3 fixes V1, V2).
+pub struct OwnView { pub top: TxnId, pub horizon: TxnId }
+pub enum TxnStatus { InProgress { top: TxnId }, Committed { ts: Hlc }, Aborted }
 pub trait VisibilitySource: Send + Sync { fn status(&self, xid: TxnId) -> TxnStatus; }
 pub enum Visibility { Visible, CommittedAfterSnapshot { commit_ts: Hlc }, InProgress { holder: TxnId }, Aborted }
 pub enum RowVisibility { Live, NotBornYet, Deleted { own: bool } }
@@ -59,14 +61,19 @@ The functions are pure and total. A zero creator word is a corrupt page, not a v
 /// What a lock is held on, in bytes the lock manager never interprets.
 pub struct LockKey { pub rel: u64, pub key: Vec<u8> }
 
-pub enum WaitFor { Txn(TxnId), SharedLocks(LockKey) }
+pub enum WaitFor { Txn(TxnId), SharedLocks(LockKey), Key(LockKey) }
 pub enum Waited { Resolved, TimedOut, Deadlock, LockTimeout }
 
 pub trait WaitSource: Send + Sync {
     fn wait<'a>(&'a self, ctx: &'a OpCtx<'_>, waiter: TxnId, what: WaitFor,
                 deadline: Option<Instant>) -> LocalBoxFuture<'a, Waited>;
+    /// Wakes every `WaitFor::Key(key)` waiter. Called by an engine right after it stamps
+    /// the delete word of an aborted speculative insertion (layer §6.9, round-3 fix V13).
+    fn signal(&self, key: &LockKey);
 }
 ```
+
+`WaitFor::Key` is the speculative-insertion wait, PostgreSQL's speculative-insertion lock: a transaction that meets another's speculative key sleeps on the key, not on the transaction, so it wakes as soon as the key is released by `abort_speculative`. The wait also ends when the holder's transaction ends.
 
 Two changes from layer §6.5. `SharedLocks` takes an opaque `LockKey`, which the access crate builds from a relation id and the locator's encoded bytes, so L4 names no L5 type. And `Waited` carries the two aborts the lock manager decides, deadlock victim and `lock_timeout`, because otherwise there is no channel through which the engine learns them; the engine turns them into `TamError::Deadlock` and `TamError::LockTimeout`.
 
@@ -87,16 +94,17 @@ pub struct TxnServices {
 }
 
 pub struct TxnCtx { /* scope, epoch, isolation, xid: Option<TxnId>, services,
-                       stmt: Option<StmtCtx>, poisoned: Option<Poison>, pending_spec: Vec<SpecId> */ }
+                       stmt: Option<StmtCtx>, poisoned: Cell<Option<Poison>>,
+                       pending_spec: Vec<(RelId, SpecId)> */ }
 
 impl TxnCtx {
     pub fn new(scope: ScopeId, epoch: Epoch, iso: Isolation, xid: Option<TxnId>,
                services: TxnServices) -> Self;           // the transaction layer calls this
     pub async fn begin_statement(&mut self) -> Result<&mut StmtCtx, Fenced>;
-    pub fn end_statement(&mut self) -> Vec<SpecId>;      // C6
+    pub fn end_statement(&mut self) -> Vec<(RelId, SpecId)>; // C6, V26
     pub async fn fresh_snapshot(&mut self) -> Result<Snapshot, Fenced>;
     pub fn check_live(&self) -> Result<(), Liveness>;    // epoch and poison, before any page
-    pub fn poison(&mut self, why: Poison);
+    pub fn poison(&self, why: Poison);                   // interior: V25
     pub fn xid(&self) -> Option<TxnId>;
     pub fn services(&self) -> &TxnServices;
 }
@@ -104,15 +112,17 @@ impl TxnCtx {
 pub struct StmtCtx { pub snapshot: Snapshot, pub serial: u64, pub schema_version: SchemaVersion }
 ```
 
-- **`begin_statement` and `fresh_snapshot` are `async`.** Layer §6.7 has them synchronous, but a fresh snapshot must wait until its read timestamp is closed (heap §5.2.1), which is an await. Under read committed every statement takes a new snapshot, so `begin_statement` awaits too; under repeatable read it returns at once.
+- **`begin_statement` and `fresh_snapshot` are `async`.** A snapshot takes `read_ts = max(closed timestamp, the session's last commit timestamp)` (layer §6.7, round-3 fix V20), so it waits only just after the session's own commit, until the closed timestamp catches up. That rare wait is why both are `async`. Every statement also takes a new statement horizon (`OwnView.horizon`), under every isolation level; under repeatable read the read timestamp is the transaction's.
+- **Subtransaction ids (round-3 fixes V1, V2).** `TxnCtx::write_xid()` returns the id the current statement stamps, allocating a subtransaction id on the statement's first write. `savepoint()` and `rollback_to(savepoint)` are the transaction layer's; the second marks every subtransaction id since the savepoint aborted.
 - **`check_live` is the epoch check of layer §6.7 in one place.** It compares the context's epoch with `EpochSource::current` and checks the poison flag. Every engine entry point calls it first.
 - **`SchemaVersion` moves here** from layer §6.2, because `StmtCtx` carries it.
-- **Speculative tokens (C6).** The context records each token an engine installs (as a `SpecId`). `end_statement` returns the unresolved ones; `cascade-access` provides `AnyTable::abort_unresolved(txn, ids)`, which the executor calls. Layer §6.9 said "the engine aborts them at `end_statement`", but `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches an executor that drops the list.
+- **Poisoning through a shared reference (round-3 fix V25).** Reads take `&TxnCtx`, and a scan outlives the call that created it, yet an I/O failure met by either must poison the transaction. So the poison flag is a `Cell` and `poison` takes `&self`. `TxnCtx` is `!Send` already, so a `Cell` costs nothing. A scan keeps a shared borrow of the context for its lifetime and poisons through it.
+- **Speculative tokens (C6).** The context records each token an engine installs as a pair of relation id and `SpecId` (round-3 fix V26), because a `SpecId` alone does not say which table to route the abort to, and L4 cannot name the contract's `SpecToken`. `end_statement` returns the unresolved pairs, and `cascade-access` rebuilds a `SpecToken` from each; `cascade-access` provides `AnyTable::abort_unresolved(txn, ids)`, which the executor calls. Layer §6.9 said "the engine aborts them at `end_statement`", but `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches an executor that drops the list.
 - **Reserved for D-1.** If stamping through the log is accepted, the context gains `record_stamp(StampPos)`. It is not added until D-1 is decided.
 
 ### 4.4 The scripted world (feature `fake`)
 
-`ScriptedWorld` implements all four traits for tests: a status map with `begin() -> TxnId`, `commit(xid) -> Hlc` and `abort(xid)`; a manual clock whose closed timestamp the test advances; a lock-manager stand-in that wakes `Txn` waiters when a status changes and `SharedLocks` waiters when the last holder releases; deadlock and timeout injection (`inject_deadlock(waiter)`); and an epoch the test can bump to simulate fencing. Wake-ups use `std::task::Waker`s; nothing spins.
+`ScriptedWorld` implements all four traits for tests: a status map with `begin() -> TxnId`, `commit(xid) -> Hlc` and `abort(xid)`; a manual clock whose closed timestamp the test advances; a lock-manager stand-in that wakes `Txn` waiters when a status changes, `SharedLocks` waiters when the last holder releases, and `Key` waiters on `signal`; subtransactions and savepoint rollback; deadlock and timeout injection (`inject_deadlock(waiter)`); and an epoch the test can bump to simulate fencing. Wake-ups use `std::task::Waker`s; nothing spins.
 
 ## 5. `cascade-access-api`: the contract types
 
@@ -255,8 +265,9 @@ Every engine runs the suite against `ScriptedWorld`, not against the real transa
 | S4 conflicts and waits | Every row of the heap §4.4 table: writes under `Wait`, and `lock_row` under all three policies, including the wait bound expiring | §6.5 |
 | S5 the re-check | `CommittedAfterSnapshot` then `fetch_latest_committed` returns the newest version with its own locator; it waits for in-progress holders | §6.8 |
 | S6 row locks | The compatibility matrix of the four modes; a plain read never waits; locks survive a moving update; `SkipLocked` | §6.10 |
-| S7 unique and nulls | The unique-check table; nulls never conflict | §11.4 |
-| S8 speculative insertion | All four results; abort makes the row vanish for the writer; two transactions racing on one key, the loser woken by the abort, not the commit; unresolved tokens returned by `end_statement` | §6.9 |
+| S7 unique and nulls | The unique-check table against the latest committed state: a key deleted by a transaction that committed after the snapshot is free; a key inserted by one is a violation for a plain insert; nulls never conflict | §11.4 |
+| S8 speculative insertion | All four results; abort makes the row vanish for the writer; two transactions racing on one key, the loser woken through `WaitFor::Key` by the abort, not the commit; unresolved tokens returned by `end_statement` with their relation | §6.9 |
+| S13 statements and savepoints | An `UPDATE` over a scan never meets its own new versions; `INSERT … SELECT` from the same table reads only earlier rows; a nested statement sees the outer statement's earlier writes; `ROLLBACK TO SAVEPOINT` hides exactly the writes since the savepoint, on both flavours | §6.6 |
 | S9 scans | Construction does no work; `rescan` at the same snapshot; `mark`/`restore` where advertised; drop without `close`; index scans in key order; index-only results | §6.8 |
 | S10 errors | `Fenced` after an epoch bump, then `Poisoned`; injected `Io` poisons; `SchemaStale`; `Deadlock` and `LockTimeout` from the wait seam; `RowTooLarge` | §6.11 |
 | S11 DDL phase | `build_index` then index scans and unique checks use it; `truncate` rolled back leaves the rows | §6.12 |
