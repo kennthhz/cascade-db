@@ -15,6 +15,7 @@ use cascade_wal_format::{self, walk};
 
 use crate::error::{FrameError, StoreError};
 use crate::key_provider::KeyRef;
+use crate::types::HolderReport;
 use crate::log_sink::LogSink;
 use crate::log_source::{LogSource, LogSubscription};
 use crate::scope_admin::LogScopes;
@@ -501,8 +502,10 @@ impl LogSource for MemLogStore {
             let st = inner.scopes.get_mut(&scope).ok_or(StoreError::UnknownScope(scope))?;
             // A holder's value only moves forward, and a new holder
             // registers at or above the current floor (§4.4 promise 4) —
-            // the fake clamps to keep the floor monotone.
-            let clamped = lsn.max(Self::floor_of(st));
+            // the fake clamps to keep the floor monotone. It also never
+            // passes the durable LSN: a holder above it would make every
+            // read at the durable point fail Truncated.
+            let clamped = lsn.min(st.durable).max(Self::floor_of(st));
             st.holders.insert(holder, clamped);
             Ok(())
         })
@@ -539,6 +542,22 @@ impl LogSource for MemLogStore {
             .get(&scope)
             .map(Self::floor_of)
             .ok_or(StoreError::UnknownScope(scope))
+    }
+
+    fn retention_holders(&self, scope: ScopeId) -> Result<Vec<HolderReport>, StoreError> {
+        let inner = self.inner.lock().expect("store lock");
+        let st = inner
+            .scopes
+            .get(&scope)
+            .ok_or(StoreError::UnknownScope(scope))?;
+        Ok(st.holders
+            .iter()
+            .map(|(holder, lsn)| HolderReport {
+                holder: *holder,
+                lsn: *lsn,
+                lag: st.durable.0.saturating_sub(lsn.0),
+            })
+            .collect())
     }
 
     fn append_before_time<'a>(
@@ -592,6 +611,10 @@ impl LogSubscription for MemSubscription {
                         if st.failed {
                             return Err(StoreError::Failed { scope: self.scope });
                         }
+                        if st.dropped {
+                            // Dropped while parked: end, never park again.
+                            return Err(StoreError::UnknownScope(self.scope));
+                        }
                         if self.pos < st.durable {
                             let chunk =
                                 MemLogStore::serve(self.scope, st, self.pos, SUB_CHUNK_MAX)?;
@@ -620,10 +643,19 @@ impl LogSubscription for MemSubscription {
                     Some(()) => futures_lite::future::poll_fn(|cx| {
                         let mut inner = self.store.inner.lock().expect("store lock");
                         if let Some(st) = inner.scopes.get_mut(&self.scope) {
+                            // Dropped or failed: wake the loop head, which
+                            // reports it. Re-queueing would park forever on
+                            // a scope that will never progress.
+                            if st.dropped || st.failed {
+                                return std::task::Poll::Ready(());
+                            }
                             if self.pos < st.durable {
                                 return std::task::Poll::Ready(());
                             }
                             st.waiters.push((self.pos, cx.waker().clone()));
+                        } else {
+                            // The scope is gone: report it through the loop.
+                            return std::task::Poll::Ready(());
                         }
                         std::task::Poll::Pending
                     })

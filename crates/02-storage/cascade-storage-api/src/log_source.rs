@@ -51,6 +51,14 @@ pub trait LogSource: Send + Sync {
     /// The lowest LSN that is still readable.
     fn retained_floor(&self, scope: ScopeId) -> Result<Lsn, StoreError>;
 
+    /// Every registered holder and where it stands (§4.4 promise 6): the
+    /// surface an operator or `cascade-cluster` reads to decide that a
+    /// holder is stuck and should be released. Lag is the holder's
+    /// distance behind the durable LSN, in bytes. The promise's remaining
+    /// halves — a holder's age, and automatic invalidation past a size
+    /// limit — land with the managed service's control plane.
+    fn retention_holders(&self, scope: ScopeId) -> Result<Vec<crate::types::HolderReport>, StoreError>;
+
     /// For point-in-time restore: the start of the earliest append whose
     /// highest commit timestamp is above `ts`. Every commit at or below
     /// `ts` ends before the end of that append. The caller scans forward

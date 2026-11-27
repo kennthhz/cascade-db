@@ -30,7 +30,7 @@ use cascade_storage_api::{
     BlockDevice, BlockHandle, FileName, IoError, KeyRef, LogChunk, OpCtx,
     RetentionHolder, StoreError,
 };
-use cascade_storage_api::{CorruptionSite};
+use cascade_storage_api::{CorruptionSite, HolderReport};
 use cascade_types::{Epoch, Hlc, Lsn, ScopeId};
 use cascade_wal_format::walk;
 
@@ -137,6 +137,39 @@ impl Default for ScopeState {
             failed: false,
             dropped: false,
             key_id: 0,
+        }
+    }
+}
+
+/// What a reader needs of a scope: enough to serve a range, and small.
+///
+/// `read_log` and subscriptions used to clone the whole `ScopeState`,
+/// which holds the extent index and the recent-log cache — unbounded in
+/// this slice, so the whole log. Every read then cost time proportional to
+/// the log's size so far, and a reader catching up (the page store) paid
+/// it once per chunk: quadratic. A view copies only the index entries that
+/// can overlap the range being read.
+#[derive(Clone)]
+struct ReadView {
+    floor: Lsn,
+    durable: Lsn,
+    /// The runs that end after the reader's starting point, in LSN order.
+    runs: Vec<ExtentRun>,
+}
+
+impl ScopeState {
+    /// The reader's view of this scope from `from`.
+    fn view(&self, from: Lsn) -> ReadView {
+        // Runs are appended in LSN order, at publish and at recovery, so
+        // their ends are increasing: everything up to the first run that
+        // ends after `from` cannot overlap the range.
+        let first = self
+            .runs
+            .partition_point(|r| r.lsn_end.0 <= from.0);
+        ReadView {
+            floor: floor_of(self),
+            durable: self.durable,
+            runs: self.runs[first..].to_vec(),
         }
     }
 }
@@ -942,12 +975,12 @@ impl<D: BlockDevice + 'static> LogStore<D> {
     async fn serve(
         &self,
         scope: ScopeId,
-        st: &ScopeState,
+        st: &ReadView,
         from: Lsn,
         max_bytes: usize,
         ctx: &OpCtx<'_>,
     ) -> Result<LogChunk, StoreError> {
-        let floor = floor_of(st);
+        let floor = st.floor;
         if from < floor {
             return Err(StoreError::Truncated { floor });
         }
@@ -1066,6 +1099,9 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                 if s.failed {
                     return Err(StoreError::Failed { scope });
                 }
+                if s.dropped {
+                    return Err(StoreError::UnknownScope(scope));
+                }
                 if s.durable >= lsn {
                     return Ok(());
                 }
@@ -1100,10 +1136,27 @@ impl<D: BlockDevice + 'static> LogStore<D> {
                 futures_lite::future::poll_fn(|cx| {
                     let mut inner = self.inner.lock().expect("store lock");
                     if let Some(s) = inner.scopes.get_mut(&scope) {
+                        // Dropped or failed: wake the loop head, which
+                        // reports it. Re-queueing would park forever.
+                        if s.dropped || s.failed {
+                            return Poll::Ready(());
+                        }
                         if s.durable >= lsn {
                             return Poll::Ready(());
                         }
+                        // This waiter's own bytes are still staged — it
+                        // must flush again rather than sleep: the flush
+                        // it lost the leadership race for may have
+                        // snapshotted before its append, and every other
+                        // flusher on this scope may be on its way out.
+                        // Sleeping here is how a writer parks forever
+                        // once the other writers stop.
+                        if !s.staged.is_empty() {
+                            return Poll::Ready(());
+                        }
                         s.waiters.push((lsn, cx.waker().clone()));
+                    } else {
+                        return Poll::Ready(());
                     }
                     Poll::Pending
                 })
@@ -1220,14 +1273,20 @@ impl<D: BlockDevice + 'static> LogSink for LogStore<D> {
                         return Err(StoreError::Conflict { at: start });
                     }
                 }
-                // Staged region: [max(start, durable), overlap_end).
+                // Staged region: [max(start, durable), overlap_end). Each
+                // group's position comes from the group itself: a flush in
+                // flight has already taken the earliest staged groups out
+                // of the queue without having advanced the durable LSN, so
+                // the remaining ones do not start at `durable`, and
+                // counting from there would compare a re-send against the
+                // wrong bytes — refusing an identical one, or passing a
+                // differing one.
                 let staged_lo = (start.0.max(s.durable.0)) as usize;
                 if staged_lo < overlap_end {
                     let mut staged_bytes = Vec::with_capacity(overlap_end - staged_lo);
-                    let mut cursor = s.durable.0;
                     for g in &s.staged {
-                        let g_start = cursor;
-                        let g_end = cursor + g.bytes.len() as u64;
+                        let g_end = g.end_lsn.0;
+                        let g_start = g_end - g.bytes.len() as u64;
                         if (staged_lo as u64) < g_end && g_start < (overlap_end as u64) {
                             let lo = (staged_lo as u64).max(g_start);
                             let hi = (overlap_end as u64).min(g_end);
@@ -1235,7 +1294,6 @@ impl<D: BlockDevice + 'static> LogSink for LogStore<D> {
                             let take = (hi - lo) as usize;
                             staged_bytes.extend_from_slice(&g.bytes[off..off + take]);
                         }
-                        cursor = g_end;
                     }
                     if staged_bytes.as_slice() != &given[staged_lo - start.0 as usize..] {
                         return Err(StoreError::Conflict { at: start });
@@ -1324,15 +1382,16 @@ impl<D: BlockDevice + 'static> LogSource for LogStore<D> {
         max_bytes: usize,
     ) -> cascade_types::LocalBoxFuture<'a, Result<LogChunk, StoreError>> {
         Box::pin(async move {
-            let st = {
+            // A view, not a clone of the state: the state holds the log.
+            let view = {
                 let inner = self.inner.lock().expect("store lock");
                 inner
                     .scopes
                     .get(&scope)
-                    .cloned()
                     .ok_or(StoreError::UnknownScope(scope))?
+                    .view(from)
             };
-            self.serve(scope, &st, from, max_bytes, ctx).await
+            self.serve(scope, &view, from, max_bytes, ctx).await
         })
     }
 
@@ -1362,7 +1421,12 @@ impl<D: BlockDevice + 'static> LogSource for LogStore<D> {
             let s = inner.scopes.get_mut(&scope).ok_or(StoreError::UnknownScope(scope))?;
             // The floor never regresses: a holder's value only moves
             // forward, a new holder registers at or above it (§4.4 P4).
-            let clamped = lsn.max(floor_of(s));
+            // It also never passes the durable LSN: a holder claiming not
+            // to need log it does not have yet is a lie that would make
+            // every read at the durable point fail Truncated — and strand
+            // a subscription parked there, since nothing new would lower
+            // the floor back under it.
+            let clamped = lsn.min(s.durable).max(floor_of(s));
             s.holders.insert(holder, clamped);
             Ok(())
         })
@@ -1389,6 +1453,22 @@ impl<D: BlockDevice + 'static> LogSource for LogStore<D> {
             .get(&scope)
             .map(floor_of)
             .ok_or(StoreError::UnknownScope(scope))
+    }
+
+    fn retention_holders(&self, scope: ScopeId) -> Result<Vec<HolderReport>, StoreError> {
+        let inner = self.inner.lock().expect("store lock");
+        let s = inner
+            .scopes
+            .get(&scope)
+            .ok_or(StoreError::UnknownScope(scope))?;
+        Ok(s.holders
+            .iter()
+            .map(|(holder, lsn)| HolderReport {
+                holder: *holder,
+                lsn: *lsn,
+                lag: s.durable.0.saturating_sub(lsn.0),
+            })
+            .collect())
     }
 
     fn append_before_time<'a>(
@@ -1436,23 +1516,30 @@ impl<D: BlockDevice + 'static> LogSubscription for StoreSubscription<D> {
         Box::pin(async move {
             loop {
                 let chunk = {
-                    let st = {
+                    // A view, not a clone of the state: the state holds the log.
+                    let (failed, dropped, view) = {
                         let inner = self.store.inner.lock().expect("store lock");
-                        inner
+                        let s = inner
                             .scopes
                             .get(&self.scope)
-                            .cloned()
-                            .ok_or(StoreError::UnknownScope(self.scope))?
+                            .ok_or(StoreError::UnknownScope(self.scope))?;
+                        (s.failed, s.dropped, s.view(self.pos))
                     };
-                    if st.failed {
+                    if failed {
                         return Err(StoreError::Failed { scope: self.scope });
                     }
-                    if self.pos < st.durable {
+                    if dropped {
+                        // Dropped while this subscription was parked on
+                        // it: end, never park again (§4.4 — a subscription
+                        // ends with an error when its scope is dropped).
+                        return Err(StoreError::UnknownScope(self.scope));
+                    }
+                    if self.pos < view.durable {
                         let span = cascade_telemetry::Span::noop();
                         let ctx = test_ctx(&span, 0);
                         Some(
                             self.store
-                                .serve(self.scope, &st, self.pos, 1024 * 1024, &ctx)
+                                .serve(self.scope, &view, self.pos, 1024 * 1024, &ctx)
                                 .await?,
                         )
                     } else {
@@ -1479,10 +1566,20 @@ impl<D: BlockDevice + 'static> LogSubscription for StoreSubscription<D> {
                 futures_lite::future::poll_fn(|cx| {
                     let mut inner = self.store.inner.lock().expect("store lock");
                     if let Some(s) = inner.scopes.get_mut(&self.scope) {
+                        // A dropped or failed scope ends the wait — the
+                        // loop head turns this into the error. Re-queueing
+                        // here would swallow the wake and park forever on
+                        // a scope that will never progress.
+                        if s.dropped || s.failed {
+                            return Poll::Ready(());
+                        }
                         if self.pos < s.durable {
                             return Poll::Ready(());
                         }
                         s.waiters.push((self.pos, cx.waker().clone()));
+                    } else {
+                        // The scope is gone: report it through the loop.
+                        return Poll::Ready(());
                     }
                     Poll::Pending
                 })

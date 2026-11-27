@@ -45,7 +45,7 @@ pub use log_source::{LogSource, LogSubscription};
 pub use page_source::PageSource;
 pub use scope_admin::{LogScopes, PageScopes};
 pub use types::{
-    AppendMeta, FileId, FileName, Lineage, LogChunk, PageImage, PageKey, ReaderId,
+    AppendMeta, FileId, FileName, HolderReport, Lineage, LogChunk, PageImage, PageKey, ReaderId,
     RetentionHolder,
 };
 

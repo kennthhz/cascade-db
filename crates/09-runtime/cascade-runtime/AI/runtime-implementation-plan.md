@@ -413,6 +413,7 @@ One sentence each, plain language, spec anchor attached. "In" = invariant I1–I
 - Code review: full-milestone diff re-reviewed against §5 end to end (not just the last task).
 - Test review: every `#[ignore]` reason string verified still-accurate; flaky candidates from CI history re-run N times.
 - **DEFERRED (2026-11-01):** no bare-metal multi-NUMA host is available; the gate runs unchanged when one is. T5.1–T5.6 are committed and green, and nothing else in the plan depends on this task — M5 is otherwise closed. The three `#[ignore]` tests (`pools_are_node_local_on_bare_metal`, `provisioned_host_boots_without_warnings`, `boots_bare_metal`) are the entry points; their reason strings name what each needs.
+- **ADDED (2026-11-27, storage M7):** the gate must also cover the storage layer's crash suites, not only the runtime's. `cascade-logstore` and `cascade-pagestore` cut crashes on `MemBlockDevice`, whose model keeps unsynced file *creations* and cuts at whole 4 KiB blocks; real media tear inside sectors, and a create can be lost unless `sync_namespace` made it durable. So the suites' crash-cut results are only as strong as the fake, and the bare-metal run needs a power-cut-style harness (dm-flake, dm-log-writes, or physical kill) re-running the log store's and page store's crash suites against a real device. Page store files already order their creates against `sync_namespace` on the reasoning alone; the gate is where that reasoning gets its evidence.
 
 ### M6 — Real engine vertical slice (the cascade-heap slice; added 2026-11-08, post-M5)
 

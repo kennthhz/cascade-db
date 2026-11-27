@@ -304,6 +304,12 @@ fn a_transplanted_record_refuses_by_name() {
         fn retained_floor(&self, _scope: ScopeId) -> Result<Lsn, cascade_storage_api::StoreError> {
             Ok(Lsn(0))
         }
+        fn retention_holders(
+            &self,
+            _scope: ScopeId,
+        ) -> Result<Vec<cascade_storage_api::HolderReport>, cascade_storage_api::StoreError> {
+            Ok(Vec::new())
+        }
         fn append_before_time<'a>(
             &'a self,
             _ctx: &'a cascade_storage_api::OpCtx<'_>,

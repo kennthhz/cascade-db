@@ -120,6 +120,20 @@ pub enum RetentionHolder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReaderId(pub u64);
 
+/// One registered holder's retention position, as the log store reports it
+/// (§4.4 promise 6): where the holder stands, and how far behind the
+/// durable LSN that is, in bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HolderReport {
+    pub holder: RetentionHolder,
+    /// The holder's retention value — the LSN below which it no longer
+    /// needs log.
+    pub lsn: Lsn,
+    /// `durable_lsn − lsn`: how many durable bytes the holder is still
+    /// holding onto.
+    pub lag: u64,
+}
+
 /// A flat name inside a `BlockDevice`'s namespace (§4.8): no caller
 /// computes a path — file paths never leave the storage layer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

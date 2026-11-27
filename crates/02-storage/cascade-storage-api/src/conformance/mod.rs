@@ -22,6 +22,7 @@ use crate::scope_admin::{LogScopes, PageScopes};
 use crate::types::{AppendMeta, FileName, RetentionHolder};
 
 
+
 /// The scope every suite runs in.
 pub const SCOPE: ScopeId = ScopeId(7);
 const E1: Epoch = Epoch(1);
@@ -369,6 +370,63 @@ pub async fn log_source_suite<H: LogStoreHarness>(h: &mut H) {
         .expect("raise floor");
     let gone = (store.append_before_time(&ctx, SCOPE, Hlc(15))).await;
     assert!(matches!(gone, Err(StoreError::Truncated { .. })));
+
+    // Promise 6's reporting half: every registered holder, where it
+    // stands, and its lag behind the durable LSN. (Leases, holder age and
+    // size-limit invalidation land with the managed service's control
+    // plane.)
+    let reports = store.retention_holders(SCOPE).expect("reports");
+    assert_eq!(reports.len(), 1, "only the Archive remains");
+    assert_eq!(reports[0].holder, RetentionHolder::Archive);
+    assert_eq!(reports[0].lsn, e1_end, "at the floor it raised to");
+    assert_eq!(reports[0].lag, 0, "nothing durable past it");
+
+    // A new holder registers at the floor, whatever it asked for (§4.4
+    // promise 4), and its lag grows as the log advances past it.
+    (store.set_retained_from(
+        &ctx,
+        SCOPE,
+        RetentionHolder::PageStore { instance: 1 },
+        Lsn(0),
+    ))
+    .await
+    .expect("registers");
+    let reports = store.retention_holders(SCOPE).expect("reports");
+    let page_store = reports
+        .iter()
+        .find(|r| matches!(r.holder, RetentionHolder::PageStore { .. }))
+        .expect("the page store holder");
+    assert_eq!(page_store.lsn, e1_end, "clamped up to the floor");
+    let end3 = append_group(&*store, &span, e1_end.0, E1, 11, 110, b"eleven")
+        .await
+        .expect("append past the floor");
+    let reports = store.retention_holders(SCOPE).expect("reports");
+    let page_store = reports
+        .iter()
+        .find(|r| matches!(r.holder, RetentionHolder::PageStore { .. }))
+        .expect("the page store holder");
+    assert_eq!(page_store.lsn, e1_end);
+    assert_eq!(page_store.lag, end3.0 - e1_end.0, "the log advanced past it");
+    assert_eq!(store.retained_floor(SCOPE).expect("floor"), e1_end);
+
+    // A holder claiming to stand above the durable LSN is clamped down to
+    // it: the floor never passes the durable point, or every read there
+    // would truncate and a subscription parked there would strand.
+    (store.set_retained_from(
+        &ctx,
+        SCOPE,
+        RetentionHolder::Cdc { slot: 1 },
+        Lsn(end3.0 + 10_000),
+    ))
+    .await
+    .expect("registers");
+    let reports = store.retention_holders(SCOPE).expect("reports");
+    let cdc = reports
+        .iter()
+        .find(|r| matches!(r.holder, RetentionHolder::Cdc { .. }))
+        .expect("the cdc holder");
+    assert_eq!(cdc.lsn, end3, "clamped down to the durable LSN");
+    assert_eq!(store.retained_floor(SCOPE).expect("floor"), e1_end);
 }
 
 fn end_of(xid: u64, body: &[u8]) -> Lsn {

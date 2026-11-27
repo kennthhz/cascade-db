@@ -25,9 +25,15 @@ pub trait PageSource: Send + Sync {
     /// Every page on disk reflects the log up to here.
     fn materialized_lsn(&self, scope: ScopeId) -> Result<Lsn, StoreError>;
 
-    /// The oldest `at_lsn` this page store can still serve for the scope.
-    /// Without page versions (v1) this equals the materialized LSN, and a
-    /// leader never sees `TooOld` (§4.5).
+    /// The oldest `at_lsn` this page store can still serve for the scope:
+    /// any request at or above it succeeds (§4.5 promise 5). Without page
+    /// versions (v1) only the newest image of each page is held, so this
+    /// is the LSN through which those images are complete, in memory or on
+    /// disk — at or above [`materialized_lsn`](Self::materialized_lsn),
+    /// since a page changed since the last flush is held only in memory.
+    /// A request below it is served only if the image's page LSN is at or
+    /// below `at_lsn`, and fails with `TooOld` otherwise; a leader, whose
+    /// requests move forward with its own writes, never sees `TooOld`.
     fn oldest_readable_lsn(&self, scope: ScopeId) -> Result<Lsn, StoreError>;
 
     /// A reader promises it will not ask for pages below `lsn`. The page

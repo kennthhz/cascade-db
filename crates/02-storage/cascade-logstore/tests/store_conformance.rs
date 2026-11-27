@@ -13,7 +13,7 @@ use cascade_storage_api::fake::{test_ctx, MemBlockDevice};
 use cascade_storage_api::log_sink::LogSink;
 use cascade_storage_api::log_source::LogSource;
 use cascade_storage_api::scope_admin::LogScopes;
-use cascade_storage_api::{AppendMeta, KeyRef, StoreError};
+use cascade_storage_api::{AppendMeta, KeyRef, RetentionHolder, StoreError};
 use cascade_types::{Epoch, Hlc, Lsn, ScopeId, SegmentId};
 use cascade_wal_format::{encode_with_flags, encode, WalRecord, FLAG_GROUP_END};
 use futures_lite::future::block_on;
@@ -295,4 +295,145 @@ fn reopen_across_executors_sees_the_flushed_frame() {
         Lsn(bytes.len() as u64),
         "the scan finds the flushed frame across the reopen"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Subscription failure paths (§4.4: a subscription "ends with an error if
+// the scope is dropped or `from` falls below the retained floor", and a
+// failed flush fails the epoch for every waiter — §4.3 promise 7's blast
+// radius covers readers, not only committers)
+// ---------------------------------------------------------------------------
+
+/// A fresh store with one scope, a writer, and one durable group.
+fn subscription_rig() -> (Arc<MemBlockDevice>, Arc<LogStore<MemBlockDevice>>, Lsn) {
+    let dev = Arc::new(MemBlockDevice::new());
+    let store = block_on(LogStore::open(dev.clone())).expect("opens");
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 1);
+    block_on(async {
+        store
+            .create_scope(&ctx, SCOPE, Epoch(1), KeyRef { key_id: 1 })
+            .await
+            .expect("creates");
+        store
+            .open_writer(&ctx, SCOPE, Epoch(1))
+            .await
+            .expect("opens writer");
+    });
+    let bytes = group_bytes(1, 10, b"one", 0);
+    block_on(async {
+        store
+            .append(&ctx, SCOPE, Epoch(1), Lsn(0), &bytes, meta_none())
+            .await
+            .expect("appends");
+        store
+            .wait_durable(&ctx, SCOPE, Lsn(bytes.len() as u64))
+            .await
+            .expect("flushes");
+    });
+    let end = Lsn(bytes.len() as u64);
+    (dev, store, end)
+}
+
+/// `from` below the retained floor: the very first `next` truncates.
+#[test]
+fn a_subscription_below_the_floor_truncates_on_its_first_next() {
+    let (_dev, store, end) = subscription_rig();
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 1);
+    block_on(store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, end))
+        .expect("registers");
+    let mut sub = store.subscribe(&ctx, SCOPE, Lsn(0));
+    let next = block_on(sub.next());
+    assert!(
+        matches!(&next, Err(StoreError::Truncated { floor }) if *floor == end),
+        "got {next:?}"
+    );
+}
+
+/// Dropped while parked — with a holder keeping the scope's state alive —
+/// ends the subscription instead of parking forever. This path had no
+/// check at all: `drop_scope` woke the waiter, and the loop simply went
+/// back to sleep.
+#[test]
+fn a_subscription_parked_on_a_dropped_scope_ends() {
+    let (_dev, store, end) = subscription_rig();
+    let mut sub = {
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 1);
+        store.subscribe(&ctx, SCOPE, Lsn(0))
+    };
+    let first = block_on(sub.next()).expect("the durable group");
+    assert_eq!(first.end, end, "one chunk covers the log");
+
+    // A holder keeps the scope's entry in the map after the drop, so the
+    // subscription meets the `dropped` flag rather than a missing scope.
+    // It is registered after the drain, at the subscription's own
+    // position: a floor above a subscriber's `from` truncates it, which
+    // is the previous test's law, not this one's.
+    {
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 1);
+        block_on(store.set_retained_from(&ctx, SCOPE, RetentionHolder::Archive, end))
+            .expect("registers");
+    }
+
+    let dropper = std::thread::spawn({
+        let store = store.clone();
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let span = cascade_telemetry::Span::noop();
+            let ctx = test_ctx(&span, 1);
+            block_on(store.drop_scope(&ctx, SCOPE)).expect("drops");
+        }
+    });
+    // Parked here until the drop wakes it.
+    let next = block_on(sub.next());
+    dropper.join().expect("the dropper thread ends");
+    assert!(
+        matches!(&next, Err(StoreError::UnknownScope(s)) if *s == SCOPE),
+        "got {next:?}"
+    );
+    // And it keeps ending: nothing was left that could park again.
+    let again = block_on(sub.next());
+    assert!(
+        matches!(&again, Err(StoreError::UnknownScope(_))),
+        "got {again:?}"
+    );
+}
+
+/// A failed flush fails the epoch for a parked subscription too.
+#[test]
+fn a_subscription_parked_through_a_flush_failure_ends_with_failed() {
+    let (dev, store, end) = subscription_rig();
+    let mut sub = {
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 1);
+        store.subscribe(&ctx, SCOPE, Lsn(0))
+    };
+    let first = block_on(sub.next()).expect("the durable group");
+    assert_eq!(first.end, end);
+
+    dev.inject_sync_failure();
+    let appender = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 1);
+        let bytes = group_bytes(2, 20, b"two", end.0);
+        block_on(async {
+            store
+                .append(&ctx, SCOPE, Epoch(1), end, &bytes, meta_none())
+                .await
+                .expect("appends");
+            // The flush behind this wait fails — the failure is the
+            // answer, and the subscription observes it independently.
+            let _ = store
+                .wait_durable(&ctx, SCOPE, Lsn(end.0 + bytes.len() as u64))
+                .await;
+        })
+    });
+    // Parked here until the failed flush wakes the subscription.
+    let next = block_on(sub.next());
+    appender.join().expect("the appender thread ends");
+    assert!(matches!(&next, Err(StoreError::Failed { .. })), "got {next:?}");
 }
