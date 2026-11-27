@@ -515,7 +515,7 @@ pub trait ScopeTxn {                                 // Send + Sync on the leade
 
 ### 4.6. L5 Access
 
-**`cascade-access-api`: the unified table access contract (see the [access layer design](../crates/05-access/AI/access-layer-design.md) §6).** An enum, `Table`, with one arm per engine (heap, index-organized, temporary), plus a test-only trait for the conformance suite (access layer A13, pending decision D-5; it replaces the earlier trait `TableAccessMethod`), with an opaque `RowLocator`, `WriteOutcome` that reports conflicts and unique violations as values, and separate scan entry points. Two additions:
+**`cascade-access-api`: the unified table access contract (see the [access layer design](../crates/05-access/AI/access-layer-design.md) §6).** An enum, `Table`, with one arm per engine (heap, index-organized, temporary), plus a test-only trait for the conformance suite (access layer A13, accepted by Kenneth on 2026-11-27 through decision D-5; it replaces the earlier trait `TableAccessMethod`), with an opaque `RowLocator`, `WriteOutcome` that reports conflicts and unique violations as values, and separate scan entry points. Two additions:
 
 - *`TableDescriptor`.* An engine instance is constructed with a descriptor that lists columns, key columns and indexes. Engines never call the catalog. The scope host builds descriptors from the catalog, and the catalog's own system tables use hard-coded bootstrap descriptors.
 - *Conformance and fake.* One suite runs against every engine, including temporary tables. A simple in-memory multi-version table implements the contract with no pages, for testing the catalog, executor and data plane.
