@@ -1,0 +1,18 @@
+[package]
+name        = "cascade-redo"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The redo contract (storage-layer-design.md §12.4): per-page, deterministic, versioned, idempotent-by-LSN apply functions. M7 lands the heap-insert family."
+
+[dependencies]
+cascade-types      = { workspace = true }
+cascade-wal-format = { workspace = true }
+cascade-page       = { workspace = true }
+thiserror          = { workspace = true }
+
+[dev-dependencies]
+static_assertions  = { workspace = true }

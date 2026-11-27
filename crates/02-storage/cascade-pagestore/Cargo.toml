@@ -1,0 +1,35 @@
+[package]
+name        = "cascade-pagestore"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+description = "The page store (storage-layer-design.md §6): log ingest through cascade-redo, doublewrite materialization, as-of-LSN page reads and recovery. M7 slice 1."
+
+# `cascade-storage-api` is declared by path rather than inherited: the
+# store proper builds without the fakes and the conformance suites (they
+# are test-only), and an inherited dependency cannot turn its default
+# features off.
+[dependencies]
+cascade-storage-api = { path = "../cascade-storage-api", default-features = false }
+cascade-types       = { workspace = true }
+cascade-wal-format  = { workspace = true }
+cascade-page        = { workspace = true }
+cascade-redo        = { workspace = true }
+cascade-telemetry   = { workspace = true }
+crc32fast           = { workspace = true }
+
+[dev-dependencies]
+cascade-storage-api = { path = "../cascade-storage-api", features = ["fake", "conformance"] }
+cascade-logstore    = { workspace = true }
+cascade-blockdev    = { workspace = true }
+cascade-types       = { workspace = true }
+cascade-wal-format  = { workspace = true }
+cascade-page        = { workspace = true }
+cascade-redo        = { workspace = true }
+cascade-telemetry   = { workspace = true }
+futures-lite        = { workspace = true }
+glommio             = { workspace = true }
+static_assertions   = { workspace = true }

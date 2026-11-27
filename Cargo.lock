@@ -300,6 +300,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-pagestore"
+version = "0.1.0"
+dependencies = [
+ "cascade-blockdev",
+ "cascade-logstore",
+ "cascade-page",
+ "cascade-redo",
+ "cascade-storage-api",
+ "cascade-telemetry",
+ "cascade-types",
+ "cascade-wal-format",
+ "crc32fast",
+ "futures-lite",
+ "glommio",
+ "static_assertions",
+]
+
+[[package]]
 name = "cascade-pg-parser"
 version = "0.1.0"
 dependencies = [
@@ -346,6 +364,17 @@ dependencies = [
  "cascade-sql-planner",
  "cascade-telemetry",
  "cascade-types",
+]
+
+[[package]]
+name = "cascade-redo"
+version = "0.1.0"
+dependencies = [
+ "cascade-page",
+ "cascade-types",
+ "cascade-wal-format",
+ "static_assertions",
+ "thiserror",
 ]
 
 [[package]]
