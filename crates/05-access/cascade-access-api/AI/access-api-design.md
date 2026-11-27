@@ -13,13 +13,13 @@
 1. The contract of layer §6 as compiled Rust, with no engine behind it yet.
 2. An in-memory fake engine that keeps every promise of the contract. It is the executor's test double and the reference model for the engines.
 3. One conformance suite, run against the fake now and against each engine as it lands.
-4. The dispatch types the executor holds (`AnyTable`, `TableScan`, `Maintenance`), with the fake as their only arm until the first engine lands.
+4. The dispatch types the executor holds (`Table`, `TableScan`, `Maintenance`), with the fake as their only arm until the first engine lands.
 
 Nothing in Step 1 touches a page, the log or the buffer pool. It depends on none of the open gaps D-1, D-2, D-4 or D-7.
 
 ## 2. Two problems in layer §6 that the crate layout must solve
 
-**The enum cannot live in the contract crate (C1).** `AnyTable` names `IotTable`, `HeapTable` and `TempTable`, which live in the engine crates, and every engine crate depends on `cascade-access-api`. Putting the enum in the contract crate is a dependency cycle. The enum has to live in a crate above all engines. Layer §6.1 already says every `match` on it lives "in the executor, in this repository"; this design gives it a crate of its own so the executor, the catalog's bootstrap and the tests share one copy.
+**The enum cannot live in the contract crate (C1).** `Table` names `IotTable`, `HeapTable` and `TempTable`, which live in the engine crates, and every engine crate depends on `cascade-access-api`. Putting the enum in the contract crate is a dependency cycle. The enum has to live in a crate above all engines. Layer §6.1 already says every `match` on it lives "in the executor, in this repository"; this design gives it a crate of its own so the executor, the catalog's bootstrap and the tests share one copy.
 
 **L4 types are declared in L5 (C5, C8).** `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule, `WaitSource`, `TxnCtx` and `StmtCtx` are transaction-layer concepts (architecture §4.5) that layer §6.6–§6.7 declares in the access crate. Index kinds and the IOT's undo walk use the same rule, and the lock manager implements `WaitSource`. Separately, `WaitFor::SharedLocks` names `TableHandle` and `RowLocator`, which are L5 types, so the L4 lock manager could not implement it without depending upward.
 
@@ -29,7 +29,7 @@ Nothing in Step 1 touches a page, the log or the buffer pool. It depends on none
 | :--- | :--- | :--- | :--- |
 | `cascade-txn-api` (new) | L4 | `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule, `WaitSource`, `WaitFor`, `LockKey`, `TxnClock`, `EpochSource`, `TxnCtx`, `StmtCtx`, `SchemaVersion`. Feature `fake`: a scripted world implementing all four injected traits | `cascade-types` |
 | `cascade-access-api` (new) | L5 | The contract types of layer §6.2–§6.5 and §6.11–§6.12, the `TableAccess` trait (api §6), key helpers. Features `fake` (the fake engine) and `conformance` (the suite) | `cascade-types`, `cascade-txn-api`, `cascade-pgtypes` (A7), `cascade-telemetry` |
-| `cascade-access` (new) | L5, above the engines | `AnyTable`, `TableScan`, `Maintenance`: inherent `async fn`s that `match` and delegate to `TableAccess` | `cascade-access-api`, and each engine crate as it lands |
+| `cascade-access-dispatch` (new) | L5, above the engines | `Table`, `TableScan`, `Maintenance`: inherent `async fn`s that `match` and delegate to `TableAccess` | `cascade-access-api`, and each engine crate as it lands |
 
 `cascade-txn-api` is the architecture's crate of that name, started early with only what the access contract consumes. It grows the `ScopeTxn` and coordinator contracts in the transaction layer's own design. Creating it now settles D-3 without a later move of public types.
 
@@ -117,7 +117,7 @@ pub struct StmtCtx { pub snapshot: Snapshot, pub serial: u64, pub schema_version
 - **`check_live` is the epoch check of layer §6.7 in one place.** It compares the context's epoch with `EpochSource::current` and checks the poison flag. Every engine entry point calls it first.
 - **`SchemaVersion` moves here** from layer §6.2, because `StmtCtx` carries it.
 - **Poisoning through a shared reference (round-3 fix V25).** Reads take `&TxnCtx`, and a scan outlives the call that created it, yet an I/O failure met by either must poison the transaction. So the poison flag is a `Cell` and `poison` takes `&self`. `TxnCtx` is `!Send` already, so a `Cell` costs nothing. A scan keeps a shared borrow of the context for its lifetime and poisons through it.
-- **Speculative tokens (C6).** The context records each token an engine installs as a pair of relation id and `SpecId` (round-3 fix V26), because a `SpecId` alone does not say which table to route the abort to, and L4 cannot name the contract's `SpecToken`. `end_statement` returns the unresolved pairs, and `cascade-access` rebuilds a `SpecToken` from each; `cascade-access` provides `AnyTable::abort_unresolved(txn, ids)`, which the executor calls. Layer §6.9 said "the engine aborts them at `end_statement`", but `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches an executor that drops the list.
+- **Speculative tokens (C6).** The context records each token an engine installs as a pair of relation id and `SpecId` (round-3 fix V26), because a `SpecId` alone does not say which table to route the abort to, and L4 cannot name the contract's `SpecToken`. `end_statement` returns the unresolved pairs, and `cascade-access-dispatch` rebuilds a `SpecToken` from each; `cascade-access-dispatch` provides `Table::abort_unresolved(txn, ids)`, which the executor calls. Layer §6.9 said "the engine aborts them at `end_statement`", but `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches an executor that drops the list.
 - **Stamp positions (D-1).** Under D-1's current recommendation (post-commit stamping, layer §13.1, round-4 fix W5), the context gains `record_stamp(StampPos)`, which every engine calls for each in-flight word it writes, in rows and index entries. It is added when D-1 is decided.
 - **The failed state (round-4 fix W2).** `TxnCtx` has a `failed` flag beside the poison flag. An engine sets it when it returns `TamError::StatementFailed`; while it is set, `check_live` returns `StatementFailed` and the transaction layer refuses `COMMIT`. Unlike poisoning, it is cleared by a rollback to an enclosing savepoint, which aborts the failed statement's subtransaction id.
 - **Status resolution (round-4 fix W6).** The scripted world, like the real status table, stores a subtransaction as `{top, rolled_back}` and resolves it through its top, and it advances its closed timestamp only past published commits.
@@ -148,7 +148,7 @@ Modules and their content. Every type is as layer §6.2–§6.5 and §6.11–§6
 
 ## 6. The `TableAccess` trait (C3)
 
-The plug the suite is written against (layer §6.1, A13). The executor never names it; only `cascade-access` and test code do.
+The plug the suite is written against (layer §6.1, A13). The executor never names it; only `cascade-access-dispatch` and test code do.
 
 ```rust
 pub trait TableAccess: Send + Sync {
@@ -190,10 +190,10 @@ pub trait TableAccess: Send + Sync {
 - **`OpCtx` is explicit** as the first argument (Rule 8), where layer §6.3 omitted it for readability.
 - **`RowScan`** is the scan protocol of layer §6.4 (`next`, `rescan`, `supports_mark_restore`, `mark`, `restore`, `close`) as a trait with `async fn`s. **`MaintenanceStep`** is `async fn step(&mut self, budget: Budget) -> Progress`.
 
-## 7. `cascade-access`: the dispatch types (C2)
+## 7. `cascade-access-dispatch`: the dispatch types (C2)
 
 ```rust
-pub enum AnyTable {
+pub enum Table {
     #[cfg(feature = "fake")] Fake(FakeTable),
     // Heap(HeapTable)  — Step 3
     // Iot(IotTable)    — Step 7
@@ -203,7 +203,7 @@ pub enum TableScan { #[cfg(feature = "fake")] Fake(FakeScan), /* engine arms as 
 pub enum Maintenance { #[cfg(feature = "fake")] Fake(FakeMaint), /* engine arms as they land */ }
 ```
 
-Each method is an inherent `async fn` that `match`es and forwards, written by a small `macro_rules!` so that the arms cannot drift from the trait. **The fake is a fourth arm behind the `fake` feature.** Without it the executor's tests could not hold a fake through `AnyTable`, and the fake would stop being the executor's test double. The production build turns the feature off, so the shipped enum has exactly the three arms of A13. Until the heap lands in Step 3, `AnyTable` has only the fake arm and the crate is used only by tests.
+Each method is an inherent `async fn` that `match`es and forwards, written by a small `macro_rules!` so that the arms cannot drift from the trait. **The fake is a fourth arm behind the `fake` feature.** Without it the executor's tests could not hold a fake through `Table`, and the fake would stop being the executor's test double. The production build turns the feature off, so the shipped enum has exactly the three arms of A13. Until the heap lands in Step 3, `Table` has only the fake arm and the crate is used only by tests.
 
 ## 8. The fake engine (C10)
 
@@ -287,7 +287,7 @@ Each commit keeps the workspace building and the gate green.
 2. **`cascade-access-api` types and trait**: api §5 and §6, compiling, with doc tests for the key helpers.
 3. **The fake**: api §8, with its own unit tests for the chain walk in both flavours.
 4. **The suite**: api §9, S2–S12, run against both fake flavours in `tests/conformance.rs`.
-5. **`cascade-access`**: the dispatch enums with the fake arm, and a test that runs the suite through `AnyTable` to prove the forwarding is complete.
+5. **`cascade-access-dispatch`**: the dispatch enums with the fake arm, and a test that runs the suite through `Table` to prove the forwarding is complete.
 6. **Doc sync**: layer §5.1, §6.1, §6.5, §6.7, §6.9, §6.12 and the architecture's §4.5–§4.6 updated for whichever of C1–C13 are accepted.
 
 ## 11. Open questions
@@ -305,12 +305,12 @@ Statuses: **Accepted** (by whom, when) or **Proposed**.
 
 | # | Decision | Status |
 | :--- | :--- | :--- |
-| C1 | Three crates: `cascade-txn-api` (L4 seams), `cascade-access-api` (contract, fake, suite), `cascade-access` (dispatch enums above the engines). Fixes the dependency cycle of layer §6.1 and settles D-3 | Accepted (Kenneth, 2026-11-27) |
-| C2 | `AnyTable`, `TableScan` and `Maintenance` have a `Fake` arm behind the `fake` feature; production builds have the three arms of A13 | Proposed |
-| C3 | `TableAccess`: a public trait with `async fn`s and associated `Scan` and `Maint` types. Only `cascade-access` and tests name it. `OpCtx` is an argument of every call; only `lock_row` takes a `WaitPolicy` | Proposed |
+| C1 | Three crates: `cascade-txn-api` (L4 seams), `cascade-access-api` (contract, fake, suite), `cascade-access-dispatch` (dispatch enums above the engines). Fixes the dependency cycle of layer §6.1 and settles D-3 | Accepted (Kenneth, 2026-11-27) |
+| C2 | `Table`, `TableScan` and `Maintenance` have a `Fake` arm behind the `fake` feature; production builds have the three arms of A13 | Proposed |
+| C3 | `TableAccess`: a public trait with `async fn`s and associated `Scan` and `Maint` types. Only `cascade-access-dispatch` and tests name it. `OpCtx` is an argument of every call; only `lock_row` takes a `WaitPolicy` | Proposed |
 | C4 | `SpecToken` and `ResumeHint` are concrete opaque types in the contract, created by engines through hidden constructors | Proposed |
 | C5 | `TxnCtx` is a concrete struct in `cascade-txn-api`, built from `TxnClock`, `VisibilitySource`, `WaitSource` and `EpochSource`. `begin_statement` and `fresh_snapshot` are `async`. `check_live` is the one epoch-and-poison check | Accepted (Kenneth, 2026-11-27) |
-| C6 | `end_statement` returns unresolved speculative tokens and the executor aborts them through `AnyTable::abort_unresolved`; replaces "the engine aborts them" in layer §6.9 | Accepted (Kenneth, 2026-11-27) |
+| C6 | `end_statement` returns unresolved speculative tokens and the executor aborts them through `Table::abort_unresolved`; replaces "the engine aborts them" in layer §6.9 | Accepted (Kenneth, 2026-11-27) |
 | C7 | `TamError` gains `RowTooLarge { len }` (PostgreSQL 54000) and `Unsupported` (for signatures that exist before their step) | Proposed |
 | C8 | `WaitFor::SharedLocks` takes an opaque `LockKey`, and `Waited` carries `Deadlock` and `LockTimeout`, so L4 names no L5 type | Accepted in part with C1: the opaque `LockKey`. `Waited` carrying the aborts is proposed |
 | C9 | No `TableEnv` in the contract. Each engine's constructor takes its own environment | Proposed |

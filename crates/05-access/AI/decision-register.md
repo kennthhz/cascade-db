@@ -50,7 +50,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Accept the three changes of layer §13.2 and update `docs/architecture-design.md`? |
-| **Items** | (1) A13: callers see an enum `AnyTable` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids (D-11). The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
+| **Items** | (1) A13: callers see an enum `Table` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids (D-11). The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
 | **Recommendation** | Accept all five. |
 | **Owner** | Kenneth |
 | **Blocks** | (1) Step 1. (2) Step 4. (3) Step 2. (4) Step 4. (5) Step 1. |
@@ -106,7 +106,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Accept decisions C1–C13 of the [access-api design](../cascade-access-api/AI/access-api-design.md)? |
-| **Highlights** | C1: three crates, because `AnyTable` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `AnyTable` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
+| **Highlights** | C1: three crates, because `Table` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `Table` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
 | **Recommendation** | Accept as written, or comment on the PR |
 | **Owner** | Kenneth |
 | **Blocks** | Step 1 |
@@ -160,9 +160,10 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | # | Decision | By, when |
 | :--- | :--- | :--- |
 | D-3 | `Snapshot`, the visibility rule, `WaitSource` and `TxnCtx` live in a new, small `cascade-txn-api` (L4), created now with only what the access contract consumes (access-api C1) | Kenneth, 2026-11-27 |
-| C1 | Three crates: `cascade-txn-api`, `cascade-access-api`, and `cascade-access` for the dispatch enums above the engines | Kenneth, 2026-11-27 |
+| C1 | Three crates: `cascade-txn-api`, `cascade-access-api`, and `cascade-access-dispatch` for the dispatch enums above the engines | Kenneth, 2026-11-27 |
 | C5 | `TxnCtx` is concrete in `cascade-txn-api`; `begin_statement` and `fresh_snapshot` are async | Kenneth, 2026-11-27 |
 | C6 | `end_statement` returns unresolved speculative tokens; the executor aborts them | Kenneth, 2026-11-27 |
+| Names | The dispatch crate is `cascade-access-dispatch` (was `cascade-access`); the dispatch enum is `Table` (was `AnyTable`) | Kenneth, 2026-11-27 |
 | C10 | One fake engine with two locator flavours, `Heap` and `Iot` | Kenneth, 2026-11-27 |
 | H9 | While the heap insert record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order | Kenneth, 2026-11-26 |
 
