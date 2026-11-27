@@ -749,7 +749,7 @@ engine ── records ──▶ seam ── apply, via cascade-redo ──▶ th
 ```
 
 - **It is not the log writer.** The log writer (`WalWriter` today, `cascade-log` in the architecture) owns LSNs, group commit and durability. The seam reserves an LSN range from it and hands it the sealed group. The seam never writes log bytes itself.
-- **It is not a page writer.** The seam changes a page's image in the buffer pool and stops there. Compute never writes pages to disk; the page store writes them, by applying the same records. (Today the buffer pool still writes dirty pages back to disk, which storage M8 removes. That write-back is the buffer pool's, not the seam's.)
+- **It is not a page writer.** The seam changes a page's image in the buffer pool and stops there. Compute never writes pages to disk; the page store writes them, by applying the same records. (Storage M8, landed 2026-11-27, removed the buffer pool's write-back: pages are a read cache, never written anywhere. The write-back was the buffer pool's, never the seam's.)
 
 **How one is made.** Every page change in every engine is one mini-transaction, in three steps:
 
