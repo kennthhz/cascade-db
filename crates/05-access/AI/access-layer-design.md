@@ -170,10 +170,10 @@ Each decision carries one status: **Proposed** (the author's proposal, awaiting 
 | A11 | Row locks: on a heap, exclusive locks are recorded in the row header and shared locks in the lock manager; on an IOT, all in the lock manager | §6.10 | Proposed; changes architecture §4.5 (see §13.2) |
 | A12 | An engine that must wait sleeps in an injected wait seam (`WaitSource`) until woken, instead of polling. The wait layer's two aborts — deadlock victim, `lock_timeout` — arrive as errors | §6.5, §6.11 | Proposed |
 | A13 | Callers see an enum (`Table`, three arms: IOT, heap, temporary); the conformance suite is written once over a test-only trait that the engines and the fake implement, and `Table` delegates to it, so the suite covers the whole surface | §6.1, §6.13 | Proposed |
-| A14 | Each writing statement and each savepoint gets a subtransaction id; a snapshot carries the statement horizon, so a statement never sees its own changes, and savepoint rollback marks sub-ids aborted | §6.6 | Proposed (round 3); changes architecture §4.5 |
+| A14 | Each writing statement and each savepoint gets a subtransaction id; a snapshot carries the statement horizon, so a statement never sees its own changes, and savepoint rollback marks sub-ids aborted | §6.6 | **Accepted** (Kenneth, 2026-11-27, register D-11); changes architecture §4.5 |
 | A15 | The unique check reads the latest committed state, not the statement snapshot | §11.4 | Proposed (round 3) |
 | A16 | Each index change is its own mini-transaction, after the row's, in the same statement and transaction | §11.4 | Proposed (round 3) |
-| A17 | A failure after a write's row step is an error that blocks commit until a savepoint rollback or an abort | §6.5 | Proposed (round 4) |
+| A17 | A failure after a write's row step is an error that blocks commit until a savepoint rollback or an abort | §6.5 | **Accepted** (Kenneth, 2026-11-27, register D-14) |
 | A18 | Earlier own locks survive a savepoint rollback; lock hints follow a pin protocol | §6.10 | Proposed (round 4) |
 
 The decisions of the retired WP5 design (its D1–D15) are part of the contract in layer §6 and are no longer cited by number. Layer §16 maps each one to where it now lives. One of them is **superseded**: WP5 D8, message-to-owner reads, by A4.
@@ -941,7 +941,7 @@ Each step keeps the workspace building and its tests passing.
 
 ## 13. Dependencies and Open Questions
 
-### 13.1 Blocking: version words must become self-describing
+### 13.1 Version words become self-describing (decided: stamping after commit)
 
 **The problem.** Engines write `uncommitted(xid)` and never a committed word (heap §6). Every read of such a word asks the status table. That works while the entry exists, and as specified the entry must exist for as long as any page word names it:
 
@@ -957,7 +957,7 @@ So the status table grows with the number of transactions that have ever touched
 - A rewrite after commit is a page change. A1 allows one only with a redo record. An unlogged rewrite makes the leader's page differ from the replayed one, which layer §1.1 and the differential tests forbid.
 - It must cover aborted transactions too, or their words stay behind on live rows.
 
-**Directions. None is decided.**
+**Directions.** Decided on 2026-11-27 by Kenneth: the recommendation below, register D-1. The comparison is kept for the record.
 
 - *(a) Stamp through the log.* Each transaction records the positions of the words it stamped. At commit, and at abort, it emits stamp records for them, which `cascade-redo` applies everywhere. It costs one small record per touched row, written once. It gives the heap a real rollback in place of "write the abort record only" (kept §2). Status entries can then be retired once the stamps are durable.
 - *(b) Keep the words and bound the table in memory another way.* No sound way is known. Transaction ids are monotonic, but commit order is not, so no range of ids can be declared resolved.
@@ -973,7 +973,7 @@ So the status table grows with the number of transactions that have ever touched
 
 **Why the round-3 recommendation does not hold (round-4 fix W5).** Round 3 recommended (c) with lazy freezing by prune and vacuum. But prune and vacuum touch only pages that hold dead versions. A cold page whose rows never change is never frozen, and nothing freezes index pages at all, so the oldest unfrozen id would never advance without a periodic pass over every heap and index page: PostgreSQL's anti-wraparound vacuum, which heap §7.3 and product definition §4.1 set out to avoid. Without that pass the status pages grow by about 16 bytes per writing statement, roughly 14 GB a day at 10,000 per second.
 
-**Recommendation:** (a) stamping, done *after* the commit rather than on its path, with (c) status pages as the bounded backing store. A commit is still one durable record and is acknowledged as before. Afterwards a background stamper, owned by the transaction layer, writes stamp records that replace the transaction's in-flight words with its commit timestamp, in row pages and index entries alike, from the positions each engine reported to `TxnCtx`. An abort, or a rollback to a savepoint, stamps the rolled-back words to zero instead (an empty creator makes the version invisible; an empty deleter makes it live). A transaction's status entry, and those of its subtransactions, are retired once its stamps are durable, so the status pages hold only transactions whose stamps are still pending, and they never need a whole-table pass. Recovery re-derives pending stamps from the positions logged with each mini-transaction. The cost is one small record per touched row and index entry, written once, off the commit path. This reverses round 3's recommendation in register D-1; the decision is still the transaction layer's, ratified by Kenneth.
+**Recommendation:** (a) stamping, done *after* the commit rather than on its path, with (c) status pages as the bounded backing store. A commit is still one durable record and is acknowledged as before. Afterwards a background stamper, owned by the transaction layer, writes stamp records that replace the transaction's in-flight words with its commit timestamp, in row pages and index entries alike, from the positions each engine reported to `TxnCtx`. An abort, or a rollback to a savepoint, stamps the rolled-back words to zero instead (an empty creator makes the version invisible; an empty deleter makes it live). A transaction's status entry, and those of its subtransactions, are retired once its stamps are durable, so the status pages hold only transactions whose stamps are still pending, and they never need a whole-table pass. Recovery re-derives pending stamps from the positions logged with each mini-transaction. The cost is one small record per touched row and index entry, written once, off the commit path. This reversed round 3's recommendation, and Kenneth accepted it on 2026-11-27 (register D-1). Precedent: CockroachDB resolves its write intents to committed versions asynchronously after commit in the same way, and Oracle's delayed block cleanout stamps commit times lazily; PostgreSQL's approach (a compact commit log plus a freeze scan) was rejected because it needs the whole-table pass.
 
 ### 13.2 Changes proposed to the architecture
 
@@ -1038,10 +1038,10 @@ Three further points are confirmations, not changes: A3 follows the architecture
 | A11 | Heap: exclusive row locks in the row header, shared ones in the lock manager. IOT: all in the lock manager | Proposed. Changes architecture §4.5 (layer §13.2) |
 | A12 | An injected wait seam (`WaitSource`): engines sleep until woken; deadlock and `lock_timeout` arrive as errors | Proposed |
 | A13 | An enum for callers; a test-only trait for the suite, with `Table` delegating to it | Proposed |
-| A14 | Subtransaction ids per writing statement and savepoint; a snapshot carries the statement horizon; savepoint rollback aborts sub-ids (layer §6.6) | Proposed (round-3 V1, V2). Changes architecture §4.5 (layer §13.2) |
+| A14 | Subtransaction ids per writing statement and savepoint; a snapshot carries the statement horizon; savepoint rollback aborts sub-ids (layer §6.6) | **Accepted** (Kenneth, 2026-11-27, register D-11). Changes architecture §4.5 (layer §13.2) |
 | A15 | The unique check reads the latest committed state, not the statement snapshot (layer §11.4) | Proposed (round-3 V3) |
 | A16 | Index maintenance is a separate mini-transaction per index, in the row's statement and transaction (layer §11.4) | Proposed (round-3 V6) |
-| A17 | A failure after a write's row step is `StatementFailed`; the transaction cannot commit until a savepoint rollback or an abort (layer §6.5) | Proposed (round-4 W2) |
+| A17 | A failure after a write's row step is `StatementFailed`; the transaction cannot commit until a savepoint rollback or an abort (layer §6.5) | **Accepted** (Kenneth, 2026-11-27, register D-14) |
 | A18 | Overwriting an earlier own subtransaction's lock word first records that lock in the lock manager; lock hints are set, checked and cleared under the page's exclusive pin (layer §6.10) | Proposed (round-4 W3, W8) |
 
 ## 16. Provenance and Changes
