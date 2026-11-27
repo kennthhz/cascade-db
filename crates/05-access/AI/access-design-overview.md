@@ -42,6 +42,19 @@ Two consequences that are easy to miss:
 - **On an IOT table, the primary key is not an index; it *is* the table.** The table tree is ordered by primary key and its leaves hold the rows, like a SQL Server clustered index or an InnoDB table, but always on the primary key. `cascade-index` serves only the table's *other* indexes.
 - **On a heap table, every index is a `cascade-index` tree, including the primary key's**, because the heap has no tree of its own. That is why the crate is called "index", not "secondary index".
 
+### Creator and deleter words: PostgreSQL's xmin and xmax
+
+A **creator word** and a **deleter word** are this design's `xmin` and `xmax`: they record which transaction created a row version and which one deleted or replaced it. They are called "words" rather than transaction ids because each is a 64-bit word that can hold one of two things:
+
+- **While the writer is still running:** the writing transaction's id. Since round 3 that is the id of the statement's subtransaction, which the status table links to its top-level transaction. The top bit of the word marks it as an id.
+- **After the writer commits:** the commit timestamp. Under the current recommendation (register D-1), a background stamper overwrites the id with the commit timestamp soon after commit. Until then, a reader resolves the id through the status table.
+
+Zero means empty: no deleter, or a version rolled back. Who carries which:
+
+- **Heap row versions** carry both, plus the link to the next version.
+- **Index entries** carry both, under the names *create word* and *delete word*.
+- **IOT rows** carry **only a creator word**. A delete sets the row's `DELETE_MARK` flag and writes an undo record, and the undo record says which transaction deleted the row and when, as in InnoDB.
+
 ### What is stored where
 
 | | Key | Value |
