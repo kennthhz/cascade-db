@@ -4,6 +4,8 @@
 
 **Documents reviewed.** The layer design, the heap design, the btree design, the access-api design, the page design and the decision register, all at commit `b882b75` on `claude/access-review-fixes`. Citation prefixes follow layer §2.2.
 
+**Fix status.** All nine findings were fixed on 2026-11-27, each marked below with **Fixed** and a one-line description. The choices that need the owner's ratification are in the [decision register](decision-register.md): D-1 (recommendation reversed), D-9b, D-12, D-13 and the new D-14.
+
 **Summary.** There are nine findings, W1–W9. Five of them come from the round-3 fixes themselves, or from how those fixes interact (W2, W4, W5, W8, W9). Three are older defects that earlier rounds missed (W1, W3, W6). One is a gap that remained in a round-3 fix (W7). The two that most need attention are **W1**, where a B-tree insert can retry forever on ordinary data, and **W2**, where a statement can commit with only part of its index work done, which leads to wrong query results once vacuum runs.
 
 ---
@@ -19,6 +21,8 @@
 *Impact:* Inserts hang on ordinary data. This is the default engine's write path.
 
 *Fix:* Give every leaf a **high key** (an upper fence, as in Lehman–Yao's B-link tree), set by the split that creates it and kept by purge. The writer then checks `key >= leaf.high_key`. Alternatively, the writer can validate the leaf's own `mod_count` against the copy taken during the descent, since a split changes it. In both cases, drop the comparison with `last_tree_key`, and add a test that inserts into the gap left by purge.
+
+**Fixed (2026-11-27):** Every leaf but the rightmost now carries a high key (an upper fence) set by splits and unlinks and kept by purge, and the writer checks its key against that bound instead of the last key present. Btree §2.2, §3.3, decision B14, and a purge-gap test.
 
 ### W2. A write that stops after its row step leaves a partial write that commits
 
@@ -41,6 +45,8 @@ Subtransaction ids do not save this, because the sub-id is per statement and the
 
 Option (b) is the smallest change and matches PostgreSQL, where a unique violation inside `UPDATE` raises an error. State the rule in layer §6.5, and add a suite case in which an update's second index conflicts.
 
+**Fixed (2026-11-27):** An index step after the row step now always waits, whatever the `WaitPolicy`, and a unique violation or expired wait there is `TamError::StatementFailed`. That error marks the transaction failed, and it cannot commit until it rolls back to a savepoint (aborting the statement's sub-id and its partial write) or aborts, as in PostgreSQL. Layer §6.5, §6.11, §11.4, A17; heap §4.6; api §4.3, suite S7; register D-14.
+
 ### W3. Rolling back to a savepoint silently releases an earlier exclusive row lock
 
 *Where:* layer §6.6 (savepoints through subtransaction ids), layer §6.10 (exclusive locks live in the row's deleter word), heap §4.4.
@@ -50,6 +56,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 *Impact:* An application's explicit row lock is lost. The inconsistency stays silent, and job queues that use `FOR UPDATE SKIP LOCKED` together with savepoints are exactly where it would bite.
 
 *Fix:* When a write overwrites a lock word that names an earlier subtransaction of the same top-level transaction, first move that lock into the lock manager, so the lock has a second home that survives the rollback. Alternatively, a deleter word whose sub-id was rolled back can fall back to a lock-manager entry recorded at the overwrite. Add a suite case: lock, savepoint, update, roll back, and then a second transaction must still be blocked.
+
+**Fixed (2026-11-27):** A write that overwrites a lock word naming an earlier subtransaction of its own transaction first records that lock in the lock manager and sets the row's `HAS_MANAGER_LOCKS` hint, in the same group, so the lock survives the rollback. Layer §6.10, A18; heap §4.4; suite S6.
 
 ### W4. Lazy freezing breaks the round-3 chain-hop check
 
@@ -61,6 +69,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 
 *Fix:* Compare *identities*, not raw words. Either never freeze a deleter word whose `next` link crosses pages until its successor is frozen too, or let the hop check accept `uncommitted(x)` against `committed(ts)` when `status(x)` resolves to `Committed{ts}`. Status pages keep that answer for as long as any unfrozen word exists, and that is exactly the condition under which the check is needed. State the rule in heap §5.2, and add the case to the chain property test with freezing interleaved.
 
+**Fixed (2026-11-27):** The round-3 word comparison is gone. A pure delete now clears `next` in its stamp record, so the walk only ever hops from a version whose visible deleter is an update, which wrote the link itself. A debug assertion compares resolved identities. Heap §5.2, record 11, H10.
+
 ### W5. Bounding the status pages needs the table-wide freeze the product promises to avoid
 
 *Where:* layer §13.1 (recommendation (c), with old status pages truncated "below the oldest unfrozen id"), heap §7.3 ("There is no index work, no table-wide pass and no freeze"), product definition §4.1 ("tables do not bloat", no vacuum emergencies).
@@ -70,6 +80,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 *Impact:* Either unbounded growth, or a table-wide maintenance pass that contradicts heap §7.3 and the product's promise. D-1's recommendation was made without this cost.
 
 *Fix:* Put the full cost in the layer §13.1 comparison. Options: a background freeze pass with a bounded budget, made a stated product behavior; or option (a), stamping at commit, which needs no scan, at the price of one record per touched row; or status pages kept forever, with tiering to cold storage. Count index pages in every option. Reopen D-1 with this added.
+
+**Fixed (2026-11-27):** Layer §13.1 now states the cost of truncating status pages: a pass over every heap and index page. The recommendation is reversed to post-commit background stamping, with status pages as the bounded store for transactions whose stamps are pending; no whole-table pass is needed. Register D-1 updated.
 
 ### W6. Snapshots can change under a reader: commit publication is not ordered with the closed timestamp
 
@@ -84,6 +96,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 
 *Fix:* (1) Make it an invariant of `cascade-txn-api` that the closed timestamp passes `ts` only after every commit at or below `ts` is published in the status table, and test it in S1/S2 with the scripted world. (2) Resolve a sub-id through its top: a sub-id entry stores only `{top, aborted?}`, and `status(sub)` returns the top's state unless the sub-id itself was rolled back. A commit then flips one entry. Change `TxnStatus` accordingly in layer §6.6 and access-api §4.1.
 
+**Fixed (2026-11-27):** A subtransaction's entry holds only `{top, rolled_back}` and resolves through its top, so a commit flips one entry. The closed timestamp passes `ts` only after every commit at or below `ts` is published, which is now an invariant of `cascade-txn-api`. Layer §6.6, api §4.3.
+
 ### W7. The replica-aware watermark still ignores snapshots a follower has not taken yet
 
 *Where:* layer §11.7 and register D-12 (round 3: the watermark collects "each follower's and replica's oldest snapshot"), heap §7.1.
@@ -93,6 +107,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 *Impact:* Wrong results on followers and read replicas, the D4 configuration of the managed service. This is the hole V8 meant to close.
 
 *Fix:* Define the watermark as at most the minimum, over followers and replicas, of `min(oldest active snapshot, applied closed timestamp)`. Alternatively, have a follower refuse, with "snapshot too old", a new snapshot below the watermark carried by any prune record it has not yet applied, which means the records carry W. State the rule in layer §11.7 and D-12.
+
+**Fixed (2026-11-27):** The watermark is now at most the minimum, over leader, followers and replicas, of `min(oldest open snapshot, applied closed timestamp)`, which covers snapshots a follower has not taken yet. Layer §11.7, register D-12.
 
 ### W8. The round-3 lock hint bits have races that lose locks
 
@@ -107,6 +123,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 
 *Fix:* Specify the protocol. Under the row page's exclusive pin, a locker sets the bit (or confirms it is set) and then registers in the lock manager while still holding the pin. A writer reads the bit and consults the lock manager under the same pin, before it stamps. Only a writer that holds the pin and has seen no holder may clear the bit, and a locker always re-checks under the pin. Add a `loom` test, as architecture Rule 11 requires for shared structures.
 
+**Fixed (2026-11-27):** A protocol is specified: lockers register in the lock manager and set the hint while holding the row page's exclusive pin; writers check the hint and consult the manager under the same pin before stamping; only a writer holding the pin that has just found no holder may clear an IOT hint. To be model-checked with `loom`. Layer §6.10, A18.
+
 ### W9. Reusing tombstone pages breaks A6 and the B-tree's validation arguments
 
 *Where:* btree §5.5 (B12: a tombstone's page number "is not reused until the cleanup watermark has passed the unlink"), btree §3.1 ("a node's count never repeats"), btree §3.2 ("a root pointer that returns is the same root, because page numbers are never reused"), layer A6 ("Ids are never reused").
@@ -120,6 +138,8 @@ Option (b) is the smallest change and matches PostgreSQL, where a unique violati
 *Impact:* Readers can be misrouted, which means missed or wrong rows from the default engine and from every index.
 
 *Fix:* Either never reuse page numbers, as A6 says, and let the page store release the storage of tombstones; 2³² pages per segment is 32 TiB of churn before the segment must be rebuilt, so state that limit and the rebuild. Or keep reuse but (i) carry `mod_count` forward, so a reused page's first image has the old count plus one; (ii) never reuse a tombstone as a root; (iii) gate reuse on an epoch that every descent pins, not on the snapshot watermark. Update A6 or B12 so that they agree.
+
+**Fixed (2026-11-27):** Page numbers are never reused, as A6 requires. The page store releases a tombstone's storage, and a tree that exhausts its 2³² page numbers through churn (about 1.3 years at 10,000 queue jobs a second) is rebuilt online, which is added as an open item. Btree §5.5, §10, B12; register D-13.
 
 ---
 

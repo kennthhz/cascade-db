@@ -10,7 +10,7 @@
 
 ## 1. Open decisions
 
-Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
+Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
 
 ### D-1. How version words become self-describing
 
@@ -18,7 +18,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | :--- | :--- |
 | **Question** | Engines only ever write `uncommitted(xid)`, so the status table must keep an entry for every transaction any live row still names, forever. How is that bounded? |
 | **Options** | (a) Stamp through the log: each transaction records the positions it stamped; at commit and abort it emits stamp records that `cascade-redo` applies everywhere, after which its status entry can be retired. (b) Keep the words and bound the table in memory some other way: no sound method is known, because commit order is not txn-id order. (c) Transaction status pages, which the architecture already lists (§4.2): a logged, paged array indexed by transaction id, holding state, commit timestamp and top-level id, cached like any other page (added by round-3 review V12). |
-| **Recommendation** | Changed 2026-11-27: (c) for version 1, with (a)'s logged stamping used lazily by prune and vacuum to freeze old words so that old status pages can be truncated (layer §13.1 compares the three). Commit stays one record, and subtransaction ids for savepoints (D-11) are just more entries. |
+| **Recommendation** | Changed again 2026-11-27 by the round-4 review (W5): (a), with stamps written by a background stamper *after* the commit, off its path, and (c) status pages as the bounded store for transactions whose stamps are still pending. Round 3's lazy freezing could not bound the status pages without a pass over every heap and index page, which the product promises to avoid (layer §13.1). |
 | **Owner** | Transaction layer, ratified by Kenneth |
 | **Blocks** | Step 4 (the MVCC milestone) for every engine |
 | **Status** | Open |
@@ -61,7 +61,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Every decision in the three designs is still Proposed except H9. Which are accepted as written? |
-| **Items** | Layer A1–A16 (layer §15). B-tree B1–B13 (btree §12). Heap H1–H8, H2a, H10–H13 (heap §13). Page L1–L3 and D1–D6 (page design §9). |
+| **Items** | Layer A1–A18 (layer §15). B-tree B1–B14 (btree §12). Heap H1–H8, H2a, H10–H13 (heap §13). Page L1–L3 and D1–D6 (page design §9). |
 | **Recommendation** | Ratify in the order they are needed: A-decisions before Step 1; A10 and the page L3 split before Step 2; H1–H13 and page D1–D6 before Step 4; B1–B11 before Step 6. The ones that only restate the architecture (A1, A4, A5, A9) can be accepted now. |
 | **Owner** | Kenneth |
 | **Blocks** | Each step, as listed |
@@ -93,7 +93,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | # | Question | Recommendation | Blocks |
 | :--- | :--- | :--- | :--- |
 | D-9a | The free-space map's page layout (kind 6) | Freeze it with H5/H12 before Step 4 | Step 4 |
-| D-9b | The heap row-lock flag bits `XMAX_LOCK_ONLY`, `XMAX_UPDATES_KEY` and the `HAS_SHARED_LOCKS` hint, in the `next` word's flag field; and the IOT leaf row's `HAS_LOCKS` bit (round-3 V16) | Assign them in `cascade-page` while the formats are still major 0 | Step 4 (heap), Step 7 (IOT) |
+| D-9b | The heap row-lock flag bits `XMAX_LOCK_ONLY`, `XMAX_UPDATES_KEY` and the `HAS_MANAGER_LOCKS` hint (renamed in round 4, W3), in the `next` word's flag field; and the IOT leaf row's `HAS_LOCKS` bit (round-3 V16) | Assign them in `cascade-page` while the formats are still major 0 | Step 4 (heap), Step 7 (IOT) |
 | D-9c | The `cascade-page` frame/heap module split (page L3) | Land it early; it is code organization only | Step 6 |
 | D-9d | The upward dependency from `cascade-access-api` to `cascade-pgtypes` until `cascade-datum` exists (A7) | Accept as a named exception in the layering check | Step 1 |
 | D-9e | In the Step 3 slice a row is reserved and applied in the commit path, so a transaction cannot read its own uncommitted inserts | Accept for Step 3 and say so in the step's notes, or apply at insert and filter by an in-memory "own rows" set | Step 3 |
@@ -123,12 +123,23 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Blocks** | Step 1 (it changes `Snapshot` and `TxnStatus` in `cascade-txn-api`) |
 | **Status** | Open |
 
+### D-14. A failure after a write's row step (round-4 review W2)
+
+| | |
+| :--- | :--- |
+| **Question** | Index steps run after the row step. If one of them returns a value, the executor can skip the row and commit a half-done write. |
+| **Options** | (a) Such a failure is `TamError::StatementFailed`, which blocks commit until a savepoint rollback or an abort, as PostgreSQL does (layer A17). (b) Run every unique check before the row step. (c) A subtransaction id per row. |
+| **Recommendation** | (a), now in layer §6.5. Changes the contract: unique violations from secondary indexes become errors, not values. |
+| **Owner** | Kenneth |
+| **Blocks** | Step 1 (the error type) |
+| **Status** | Open |
+
 ### D-12. The cleanup watermark in the managed service (round-3 review V8)
 
 | | |
 | :--- | :--- |
 | **Question** | Prune and vacuum verdicts replay on followers and read replicas. Their snapshots must hold cleanup back, or be cut off. |
-| **Recommendation** | In the managed service the watermark comes from `cascade-watermark`, covering followers and replicas, with a bounded lag after which a replica's reader gets "snapshot too old". Single-box mode keeps the process-local watermark (layer §11.7). |
+| **Recommendation** | In the managed service the watermark comes from `cascade-watermark`: at most the minimum, over the leader, followers and replicas, of `min(oldest open snapshot, applied closed timestamp)`, so it also covers snapshots a follower has not taken yet (round-4 W7), with a bounded lag after which a replica's reader gets "snapshot too old". Single-box mode keeps the process-local watermark (layer §11.7). |
 | **Owner** | `cascade-watermark` design, ratified by Kenneth |
 | **Blocks** | Step 4 in the managed service |
 | **Status** | Open |
@@ -138,7 +149,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | The no-merge policy (B6) leaves empty leaves behind, which defeats the job-queue showcase. |
-| **Options** | (a) Unlink empty leaves, leaving a tombstone whose page is reused after the cleanup watermark (btree B12). (b) Drop the queue showcase from version 1. (c) Full merge. |
+| **Options** | (a) Unlink empty leaves, leaving a tombstone; page numbers are never reused, and a tree that exhausts them is rebuilt online (btree B12, revised in round 4, W9). (b) Drop the queue showcase from version 1. (c) Full merge. |
 | **Recommendation** | (a), now in btree §5.5. |
 | **Owner** | Kenneth |
 | **Blocks** | Step 6 |
