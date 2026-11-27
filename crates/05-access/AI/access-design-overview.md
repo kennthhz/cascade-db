@@ -17,7 +17,7 @@ The **access layer** (L5) sits between the SQL executor above and the page cache
 | Part | What it is |
 | :--- | :--- |
 | `cascade-access-api` | The contract the executor calls: insert, update, delete, fetch, scans, row locks, upsert. Conflicts and unique violations come back as *values*; only fates already decided for the transaction (I/O failure, deadlock, lost ownership) are *errors* |
-| `cascade-access` | `AnyTable`, an enum with one arm per engine. The executor dispatches through it; a test-only trait lets one conformance suite run against every engine and an in-memory fake |
+| `cascade-access-dispatch` | `Table`, an enum with one arm per engine. The executor dispatches through it; a test-only trait lets one conformance suite run against every engine and an in-memory fake |
 | `cascade-txn-api` (L4) | What the access layer needs from transactions: `Snapshot`, the visibility rule, the status table interface, the wait interface, and the per-transaction context |
 | **IOT engine** (default) | Index-organized table: rows live in the leaves of a B-tree ordered by primary key. Updates happen in place, and older versions go to undo, as in InnoDB or Oracle |
 | **Heap engine** | For tables without a primary key, or that need PostgreSQL heap behavior: append-only row versions, HOT updates, prune and vacuum |

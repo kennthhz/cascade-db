@@ -63,7 +63,7 @@ cascade-page is not "the heap page format". It is the **page layer of the databa
 
 ```text
 cascade DB engine
-  └── table access API            (WP5: AnyTable — engine-neutral row operations)
+  └── table access API            (WP5: Table — engine-neutral row operations)
         ├── cascade-heap          heap organization   (page_kind 1)     ──┐
         │                                                          ├── cascade-page
         └── cascade-btree        IOT organization    (future kinds)  ──┘   (the page layer)

@@ -2,7 +2,7 @@
 
 ## Role
 
-The heap table engine — **the compatibility engine**: append-only row versions, HOT chains, incremental prune and vacuum. The `AnyTable::Heap` arm. The default engine is the index-organized one (`cascade-iot`); this crate serves tables without a primary key and applications that depend on PostgreSQL's heap behavior (product definition §4.1).
+The heap table engine — **the compatibility engine**: append-only row versions, HOT chains, incremental prune and vacuum. The `Table::Heap` arm. The default engine is the index-organized one (`cascade-iot`); this crate serves tables without a primary key and applications that depend on PostgreSQL's heap behavior (product definition §4.1).
 
 **Authoritative design:** [`AI/heap-design.md`](heap-design.md) (the engine — decisions H1–H13) and [`cascade-page/AI/storage-page-mutation-design.md`](../../cascade-page/AI/storage-page-mutation-design.md) D1–D6 (the heap page format — locked; this crate obeys it). Layer contracts: [`access-layer-design.md`](../../AI/access-layer-design.md) §6 (the contract), §8 (execution model), §9 (the write path).
 
