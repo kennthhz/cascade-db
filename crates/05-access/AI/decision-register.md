@@ -10,7 +10,7 @@
 
 ## 1. Open decisions
 
-Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
+Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-15 to D-17, the DDL gaps, were added on 2026-11-27 at Kenneth's request. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
 
 ### D-1. How version words become self-describing
 
@@ -132,6 +132,39 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Recommendation** | (a), now in layer §6.5. Changes the contract: unique violations from secondary indexes become errors, not values. |
 | **Owner** | Kenneth |
 | **Blocks** | Step 1 (the error type) |
+| **Status** | Open |
+
+### D-15. Who drops a table's or an index's storage
+
+| | |
+| :--- | :--- |
+| **Question** | Layer §6.12 says `DROP TABLE` and `DROP INDEX` drop their segments at commit, like `truncate`, but no contract call or component is named for it. |
+| **Options** | (a) A contract call `drop_storage(txn)` (and `drop_index(txn, index)`) on `Table`, which registers the segments to drop with `TxnCtx`; the transaction layer logs the drops as part of the commit record. (b) The catalog asks `ScopePages` directly to drop the segments named in the descriptor at commit, with no engine involved. |
+| **Recommendation** | (a). The engine is the only component that knows all of a table's segments (main, out-of-line, free-space map, undo, each index), so it should list them; the commit-time drop then follows the same path as `truncate`. |
+| **Owner** | Kenneth, with the catalog design |
+| **Blocks** | Step 8 (indexes), and `DROP TABLE` for any engine |
+| **Status** | Open |
+
+### D-16. `ALTER TABLE` that rewrites rows
+
+| | |
+| :--- | :--- |
+| **Question** | Some `ALTER TABLE` forms must rewrite every row: a column type change, an added column with a volatile default, `SET` of a new storage parameter that changes layout. The contract has no rewrite operation; a descriptor change alone works only for forms that need no rewrite (adding a nullable column, or one with a constant default stored in the descriptor). |
+| **Options** | (a) A physical rewrite through the contract: build a new segment set by scanning the old one under the old descriptor and inserting under the new one, then swap segments at commit, as `truncate` does (PostgreSQL's table rewrite). (b) Lazy conversion: rows carry a schema version and are converted on read and on the next write. (c) Refuse rewriting forms in version 1. |
+| **Recommendation** | (a) for version 1, with a write-blocking table lock like `build_index`, plus PostgreSQL's fast path: an added column with a constant default needs no rewrite (the default is kept in the descriptor). (b) is a later optimization. |
+| **Owner** | Kenneth, with the catalog design |
+| **Blocks** | ORM migrations that change column types; before general availability |
+| **Status** | Open |
+
+### D-17. Changing a table's engine (heap ↔ IOT)
+
+| | |
+| :--- | :--- |
+| **Question** | A table without a primary key uses the heap; one with a primary key may use the IOT. What happens on `ALTER TABLE … ADD PRIMARY KEY` or `DROP CONSTRAINT` on a primary key, or if a user wants a different engine? |
+| **Options** | (a) The table keeps its engine; adding a primary key to a heap table adds a unique index, and dropping an IOT's primary key is refused. (b) The change rewrites the table into the other engine with D-16's rewrite path. (c) An explicit `ALTER TABLE … SET ACCESS METHOD`, as PostgreSQL 15 has, using the rewrite path. |
+| **Recommendation** | (a) for version 1, which needs no new machinery and matches what PostgreSQL users expect from `ADD PRIMARY KEY`; then (c) once D-16's rewrite exists. Refusing to drop an IOT's primary key is a listed difference in product definition §5.5. |
+| **Owner** | Kenneth |
+| **Blocks** | Nothing before Step 7 |
 | **Status** | Open |
 
 ### D-12. The cleanup watermark in the managed service (round-3 review V8)
