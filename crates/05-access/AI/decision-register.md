@@ -38,12 +38,12 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 
 | | |
 | :--- | :--- |
-| **Question** | Accept the three changes of layer §13.2 and update `docs/architecture-design.md`? |
+| **Question** | Accept the changes of layer §13.2 and update `docs/architecture-design.md`? Item 1 was accepted by Kenneth on 2026-11-27 (see Decided); items 2 to 5 remain |
 | **Items** | (1) A13: callers see an enum `Table` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids, accepted by Kenneth on 2026-11-27 through D-11, so only the architecture text remains to update. The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
 | **Recommendation** | Accept all five. |
 | **Owner** | Kenneth |
-| **Blocks** | (1) Step 1. (2) Step 4. (3) Step 2. (4) Step 4. (5) Step 1. |
-| **Status** | Open |
+| **Blocks** | (2) Step 4. (3) Step 2. (4) Step 4. (5) Step 1, text only. |
+| **Status** | Item 1 decided. Items 2 and 3 are the architecture side of A11 and A10, which Kenneth ratified through D-6 on 2026-11-27, so only his confirmation of the architecture text is outstanding. Item 4 is open. Item 5 is decided through D-11, text pending |
 
 ### D-6. Ratify the proposed layer, B-tree and heap decisions
 
@@ -54,7 +54,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Recommendation** | Ratify in the order they are needed: A-decisions before Step 1; A10 and the page L3 split before Step 2; H1–H13 and page D1–D6 before Step 4; B1–B11 before Step 6. The ones that only restate the architecture (A1, A4, A5, A9) can be accepted now. |
 | **Owner** | Kenneth |
 | **Blocks** | Each step, as listed |
-| **Status** | Open |
+| **Status** | Partly decided. Layer A1–A18 ratified by Kenneth on 2026-11-27 (see Decided). B1–B14, the heap H decisions and page L1–L3, D1–D6 remain |
 
 ### D-7. The IOT engine's design
 
@@ -84,22 +84,10 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | D-9a | The free-space map's page layout (kind 6) | Freeze it with H5/H12 before Step 4 | Step 4 |
 | D-9b | The heap row-lock flag bits `XMAX_LOCK_ONLY`, `XMAX_UPDATES_KEY` and the `HAS_MANAGER_LOCKS` hint (renamed in round 4, W3), in the `next` word's flag field; and the IOT leaf row's `HAS_LOCKS` bit (round-3 V16) | Assign them in `cascade-page` while the formats are still major 0 | Step 4 (heap), Step 7 (IOT) |
 | D-9c | The `cascade-page` frame/heap module split (page L3) | Land it early; it is code organization only | Step 6 |
-| D-9d | The upward dependency from `cascade-access-api` to `cascade-pgtypes` until `cascade-datum` exists (A7) | Accept as a named exception in the layering check | Step 1 |
 | D-9e | In the Step 3 slice a row is reserved and applied in the commit path, so a transaction cannot read its own uncommitted inserts | Accept for Step 3 and say so in the step's notes, or apply at insert and filter by an in-memory "own rows" set | Step 3 |
 | D-9f | A shared free-space predicate for `cascade-page` and `cascade-redo` instead of a mirror | Do it with the next change to either | — |
 | D-9g | Text indexes support only the `C` collation until `cascade-datum` provides collation-aware keys; other collations are refused at `CREATE INDEX` (layer A7, round-3 V24) | Accept, and list it in product definition §5.5 | Step 8 |
 | D-9h | Sequence range size (default 32, growing with use); allocation waits for durability (layer §11.5, round-3 V23) | Accept | Step 8 |
-
-### D-10. The access-api implementation design (Step 1)
-
-| | |
-| :--- | :--- |
-| **Question** | Accept decisions C1–C13 of the [access-api design](../cascade-access-api/AI/access-api-design.md)? |
-| **Highlights** | C1: three crates, because `Table` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `Table` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
-| **Recommendation** | Accept as written, or comment on the PR |
-| **Owner** | Kenneth |
-| **Blocks** | Step 1 |
-| **Status** | Partly decided. C1, C5, C6 and C10 accepted by Kenneth on 2026-11-27, and C8's opaque lock key with them, since C1 forbids L4 naming an L5 type. C2, C3, C4, C7, the rest of C8, and C9, C11, C12, C13 are still open |
 
 ### D-15. Who drops a table's or an index's storage
 
@@ -159,6 +147,10 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 
 | # | Decision | By, when |
 | :--- | :--- | :--- |
+| D-6 (A) | Layer decisions **A1–A18 ratified** as written (layer §4, §15) | Kenneth, 2026-11-27 |
+| D-5 (1) | Callers see the **enum `Table`** with three arms, plus a test-only trait for the suite, instead of the architecture's `TableAccessMethod` trait (layer A13, §13.2); the architecture is updated | Kenneth, 2026-11-27 |
+| D-10 | Access-api decisions **C1–C13 accepted** as written: the remaining C2, C3, C4, C7, the rest of C8, C9, C11, C12 and C13 join C1, C5, C6 and C10 ([access-api design](../cascade-access-api/AI/access-api-design.md) §12) | Kenneth, 2026-11-27 |
+| D-9d | The upward dependency from `cascade-access-api` to `cascade-pgtypes` until `cascade-datum` exists is a **named exception** in the layering check (layer A7) | Kenneth, 2026-11-27 |
 | D-1 | Version words become self-describing by **stamping after commit**: a background stamper replaces each in-flight id with the commit timestamp (or zero after an abort or savepoint rollback) through small log records, in rows and index entries, and the transaction's status entries are retired once its stamps are durable. Persistent status pages hold only transactions whose stamps are pending (layer §13.1) | Kenneth, 2026-11-27 |
 | D-11 | Statement visibility and savepoints use **subtransaction ids**: each writing statement and savepoint stamps its own id, a snapshot carries the statement horizon, and a savepoint rollback marks sub-ids aborted (layer §6.6, A14) | Kenneth, 2026-11-27 |
 | D-14 | A failure after a write's row step is **`TamError::StatementFailed`**, which blocks commit until a savepoint rollback or an abort (layer §6.5, A17) | Kenneth, 2026-11-27 |

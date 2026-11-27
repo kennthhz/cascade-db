@@ -1,6 +1,6 @@
 # Cascade DB Access Layer: Contracts, Engines and Migration
 
-**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-4 review's findings W1–W9 ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)) and for the round-3 review's High and Medium findings ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md); each is marked there with its fix), and for access-api decisions C1, C5, C6 and C10 (accepted by Kenneth; see the [access-api design](../cascade-access-api/AI/access-api-design.md) and the [decision register](decision-register.md)). v0.2 applies the review of v0.1 ([`access-design-review.md`](access-design-review.md), 30 findings): the contract types and the visibility rule are now stated in this document instead of being cited from retired ones, the migration steps are renamed and re-sequenced, and the design errors the review found are corrected (§16 lists them). This document is the single source of truth for the access layer (L5): the table access contract, the table engines, secondary indexes, sequences, temporary tables and maintenance. The detailed engine designs live beside their crates: the [btree design](../cascade-btree/AI/btree-design.md), the [heap design](../cascade-heap/AI/heap-design.md) and the [page design](../cascade-page/AI/storage-page-mutation-design.md). The engine semantics they refine are kept in [`engine-semantics.md`](engine-semantics.md).
+**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-4 review's findings W1–W9 ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)) and for the round-3 review's High and Medium findings ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md); each is marked there with its fix), and for Kenneth's decisions: A1–A18 ratified (register D-6), the enum `Table` over a trait (D-5 item 1), and access-api C1–C13 (D-10) ( see the [access-api design](../cascade-access-api/AI/access-api-design.md) and the [decision register](decision-register.md)). v0.2 applies the review of v0.1 ([`access-design-review.md`](access-design-review.md), 30 findings): the contract types and the visibility rule are now stated in this document instead of being cited from retired ones, the migration steps are renamed and re-sequenced, and the design errors the review found are corrected (§16 lists them). This document is the single source of truth for the access layer (L5): the table access contract, the table engines, secondary indexes, sequences, temporary tables and maintenance. The detailed engine designs live beside their crates: the [btree design](../cascade-btree/AI/btree-design.md), the [heap design](../cascade-heap/AI/heap-design.md) and the [page design](../cascade-page/AI/storage-page-mutation-design.md). The engine semantics they refine are kept in [`engine-semantics.md`](engine-semantics.md).
 
 **Upstream:** [`architecture-design.md`](../../../docs/architecture-design.md) v0.10.2 — §4.5 (transactions), §4.6 (access), §4.8 (core sets), §1 (design rules). Where the two disagree, the architecture wins unless layer §13.2 says this document proposes a change. **Storage foundations:** [`storage-layer-design.md`](../../02-storage/AI/storage-layer-design.md) v0.5 §12, whose rules bind every engine. **Formats:** in code, not in documents — `cascade-types` (version words), `cascade-page` (page layouts), `cascade-wal-format` (records), `cascade-pgtypes` (keys).
 
@@ -157,24 +157,24 @@ Each decision carries one status: **Proposed** (the author's proposal, awaiting 
 
 | # | Decision | Section | Status |
 | :--- | :--- | :--- | :--- |
-| A1 | The mini-transaction — one logical page change together with its redo records, applied as a whole (§9.1) — is the only write primitive. An engine never changes a page any other way | §9.1 | Restates architecture §4.4 |
-| A2 | Redo has one dispatch point, `cascade-redo`. The byte transforms live at the format authorities, the payload encodings in `cascade-wal-format` | §9.2 | Proposed |
-| A3 | B-tree page formats live in `cascade-page`; `cascade-btree-core` owns tree logic, not bytes | §9.2 | Proposed; follows architecture §3.2 |
-| A4 | A scope is a shared-memory engine across its write core set. This supersedes the retired WP5 D8 (message-to-owner reads) | §8 | Restates architecture §4.8 |
-| A5 | Engines are built from a `TableDescriptor` and never read the catalog | §6.12 | Restates architecture §4.6 |
-| A6 | Segment and page allocation is a scope-level facility. Ids are never reused | §10 | Proposed |
-| A7 | The key contract stays in `cascade-pgtypes` until `cascade-datum` exists. The dependency is a documented exception. Text indexes support the `C` collation only until then | §5.2 | Proposed |
-| A8 | Visibility needs one injected contract, `VisibilitySource`, so engines do not depend on the runtime | §6.6 | Proposed |
-| A9 | `cascade-btree-core` is the tree mechanism for the IOT and for secondary indexes, and knows nothing about transactions | §11.1 | Restates architecture §4.6 |
-| A10 | The engine builds a mini-transaction's records, and the seam applies each record to the data page it names — the heap, IOT or index page in the buffer pool — through `cascade-redo`. Leader and replay therefore run one code path. A page's LSN is the end of its last record | §9.1, §9.3 | Proposed |
-| A11 | Row locks: on a heap, exclusive locks are recorded in the row header and shared locks in the lock manager; on an IOT, all in the lock manager | §6.10 | Proposed; changes architecture §4.5 (see §13.2) |
-| A12 | An engine that must wait sleeps in an injected wait seam (`WaitSource`) until woken, instead of polling. The wait layer's two aborts — deadlock victim, `lock_timeout` — arrive as errors | §6.5, §6.11 | Proposed |
-| A13 | Callers see an enum (`Table`, three arms: IOT, heap, temporary); the conformance suite is written once over a test-only trait that the engines and the fake implement, and `Table` delegates to it, so the suite covers the whole surface | §6.1, §6.13 | Proposed |
+| A1 | The mini-transaction — one logical page change together with its redo records, applied as a whole (§9.1) — is the only write primitive. An engine never changes a page any other way | §9.1 | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.4 |
+| A2 | Redo has one dispatch point, `cascade-redo`. The byte transforms live at the format authorities, the payload encodings in `cascade-wal-format` | §9.2 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A3 | B-tree page formats live in `cascade-page`; `cascade-btree-core` owns tree logic, not bytes | §9.2 | **Accepted** (Kenneth, 2026-11-27, register D-6). Follows architecture §3.2 |
+| A4 | A scope is a shared-memory engine across its write core set. This supersedes the retired WP5 D8 (message-to-owner reads) | §8 | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.8 |
+| A5 | Engines are built from a `TableDescriptor` and never read the catalog | §6.12 | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.6 |
+| A6 | Segment and page allocation is a scope-level facility. Ids are never reused | §10 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A7 | The key contract stays in `cascade-pgtypes` until `cascade-datum` exists. The dependency is a documented exception. Text indexes support the `C` collation only until then | §5.2 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A8 | Visibility needs one injected contract, `VisibilitySource`, so engines do not depend on the runtime | §6.6 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A9 | `cascade-btree-core` is the tree mechanism for the IOT and for secondary indexes, and knows nothing about transactions | §11.1 | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.6 |
+| A10 | The engine builds a mini-transaction's records, and the seam applies each record to the data page it names — the heap, IOT or index page in the buffer pool — through `cascade-redo`. Leader and replay therefore run one code path. A page's LSN is the end of its last record | §9.1, §9.3 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A11 | Row locks: on a heap, exclusive locks are recorded in the row header and shared locks in the lock manager; on an IOT, all in the lock manager | §6.10 | **Accepted** (Kenneth, 2026-11-27, register D-6). Changes architecture §4.5 (see §13.2) |
+| A12 | An engine that must wait sleeps in an injected wait seam (`WaitSource`) until woken, instead of polling. The wait layer's two aborts — deadlock victim, `lock_timeout` — arrive as errors | §6.5, §6.11 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A13 | Callers see an enum (`Table`, three arms: IOT, heap, temporary); the conformance suite is written once over a test-only trait that the engines and the fake implement, and `Table` delegates to it, so the suite covers the whole surface | §6.1, §6.13 | **Accepted** (Kenneth, 2026-11-27, register D-6) |
 | A14 | Each writing statement and each savepoint gets a subtransaction id; a snapshot carries the statement horizon, so a statement never sees its own changes, and savepoint rollback marks sub-ids aborted | §6.6 | **Accepted** (Kenneth, 2026-11-27, register D-11); changes architecture §4.5 |
-| A15 | The unique check reads the latest committed state, not the statement snapshot | §11.4 | Proposed (round 3) |
-| A16 | Each index change is its own mini-transaction, after the row's, in the same statement and transaction | §11.4 | Proposed (round 3) |
+| A15 | The unique check reads the latest committed state, not the statement snapshot | §11.4 | **Accepted** (Kenneth, 2026-11-27, register D-6). Proposed in round 3 |
+| A16 | Each index change is its own mini-transaction, after the row's, in the same statement and transaction | §11.4 | **Accepted** (Kenneth, 2026-11-27, register D-6). Proposed in round 3 |
 | A17 | A failure after a write's row step is an error that blocks commit until a savepoint rollback or an abort | §6.5 | **Accepted** (Kenneth, 2026-11-27, register D-14) |
-| A18 | Earlier own locks survive a savepoint rollback; lock hints follow a pin protocol | §6.10 | Proposed (round 4) |
+| A18 | Earlier own locks survive a savepoint rollback; lock hints follow a pin protocol | §6.10 | **Accepted** (Kenneth, 2026-11-27, register D-6). Proposed in round 4 |
 
 The decisions of the retired WP5 design (its D1–D15) are part of the contract in layer §6 and are no longer cited by number. Layer §16 maps each one to where it now lives. One of them is **superseded**: WP5 D8, message-to-owner reads, by A4.
 
@@ -980,7 +980,7 @@ So the status table grows with the number of transactions that have ever touched
 | Architecture | What it says | What this document proposes | Why |
 | :--- | :--- | :--- | :--- |
 | §4.5, `cascade-lock` | "Row locks themselves live in version words" | On a heap, exclusive row locks live in version words and shared ones in the lock manager. On an IOT, every row lock lives in the lock manager (A11, layer §6.10) | Several transactions can hold a shared lock on one row, which one word cannot list; and the IOT row has no word for a locker |
-| §4.6, `cascade-access-api` | A trait, `TableAccessMethod` | An enum with three arms (layer §6.1) | The futures must be `!Send`, and temporary tables are a third engine |
+| §4.6, `cascade-access-api` | A trait, `TableAccessMethod` | An enum with three arms (layer §6.1). **Accepted** by Kenneth on 2026-11-27 (register D-5 item 1); the architecture is updated | The futures must be `!Send`, and temporary tables are a third engine |
 | §4.4, `cascade-pagecache` | Only the cache's mini-transaction can change a page | The same, and the engine supplies records which the seam applies through `cascade-redo` (A10) | Leader and replay then share one code path |
 | §4.8, commit budget | "A commit … takes no lock" | The commit path takes a short scope-wide commit-section mutex for one timestamp and one LSN reservation (layer §8, round-3 fix V19) | Commit timestamps and LSNs must be issued in the same order; a lock-free replacement is possible but not designed |
 | §4.5, `cascade-txn` | One transaction id per transaction | Subtransaction ids per writing statement and per savepoint, with their top-level id in the status table (layer §6.6, round-3 fixes V1, V2) | Statement visibility and savepoint rollback on an engine without undo |
@@ -1025,24 +1025,24 @@ Three further points are confirmations, not changes: A3 follows the architecture
 
 | # | Decision | Status |
 | :--- | :--- | :--- |
-| A1 | The mini-transaction is the only write primitive. Layer §9.1 defines it | Restates architecture §4.4 |
-| A2 | One redo dispatch point; byte transforms at the format authorities | Proposed. It composes architecture §4.2 and page D4 |
-| A3 | B-tree page formats live in `cascade-page` | Proposed. Architecture §3.2 places them there; it corrects page §2 |
-| A4 | A scope is a shared-memory engine across its write core set | Restates architecture §4.8, ADR-0003. **Supersedes** the retired WP5 D8 |
-| A5 | Engines are built from a descriptor and never read the catalog | Restates architecture §4.6 |
-| A6 | Scope-level segment and page allocation; ids never reused | Proposed. Applies storage S18 to this layer |
-| A7 | The key contract stays in `cascade-pgtypes` for now, as a named exception | Proposed |
-| A8 | One injected `VisibilitySource` | Proposed |
-| A9 | `cascade-btree-core` is a transaction-blind tree | Restates architecture §4.6 |
-| A10 | The engine supplies records; the seam applies them through `cascade-redo`. A page's LSN is the end of its last record | Proposed |
-| A11 | Heap: exclusive row locks in the row header, shared ones in the lock manager. IOT: all in the lock manager | Proposed. Changes architecture §4.5 (layer §13.2) |
-| A12 | An injected wait seam (`WaitSource`): engines sleep until woken; deadlock and `lock_timeout` arrive as errors | Proposed |
-| A13 | An enum for callers; a test-only trait for the suite, with `Table` delegating to it | Proposed |
+| A1 | The mini-transaction is the only write primitive. Layer §9.1 defines it | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.4 |
+| A2 | One redo dispatch point; byte transforms at the format authorities | **Accepted** (Kenneth, 2026-11-27, register D-6). It composes architecture §4.2 and page D4 |
+| A3 | B-tree page formats live in `cascade-page` | **Accepted** (Kenneth, 2026-11-27, register D-6). Architecture §3.2 places them there; it corrects page §2 |
+| A4 | A scope is a shared-memory engine across its write core set | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.8, ADR-0003. **Supersedes** the retired WP5 D8 |
+| A5 | Engines are built from a descriptor and never read the catalog | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.6 |
+| A6 | Scope-level segment and page allocation; ids never reused | **Accepted** (Kenneth, 2026-11-27, register D-6). Applies storage S18 to this layer |
+| A7 | The key contract stays in `cascade-pgtypes` for now, as a named exception | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A8 | One injected `VisibilitySource` | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A9 | `cascade-btree-core` is a transaction-blind tree | **Accepted** (Kenneth, 2026-11-27, register D-6). Restates architecture §4.6 |
+| A10 | The engine supplies records; the seam applies them through `cascade-redo`. A page's LSN is the end of its last record | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A11 | Heap: exclusive row locks in the row header, shared ones in the lock manager. IOT: all in the lock manager | **Accepted** (Kenneth, 2026-11-27, register D-6). Changes architecture §4.5 (layer §13.2) |
+| A12 | An injected wait seam (`WaitSource`): engines sleep until woken; deadlock and `lock_timeout` arrive as errors | **Accepted** (Kenneth, 2026-11-27, register D-6) |
+| A13 | An enum for callers; a test-only trait for the suite, with `Table` delegating to it | **Accepted** (Kenneth, 2026-11-27, register D-6) |
 | A14 | Subtransaction ids per writing statement and savepoint; a snapshot carries the statement horizon; savepoint rollback aborts sub-ids (layer §6.6) | **Accepted** (Kenneth, 2026-11-27, register D-11). Changes architecture §4.5 (layer §13.2) |
-| A15 | The unique check reads the latest committed state, not the statement snapshot (layer §11.4) | Proposed (round-3 V3) |
-| A16 | Index maintenance is a separate mini-transaction per index, in the row's statement and transaction (layer §11.4) | Proposed (round-3 V6) |
+| A15 | The unique check reads the latest committed state, not the statement snapshot (layer §11.4) | **Accepted** (Kenneth, 2026-11-27, register D-6). Proposed in round-3 V3 |
+| A16 | Index maintenance is a separate mini-transaction per index, in the row's statement and transaction (layer §11.4) | **Accepted** (Kenneth, 2026-11-27, register D-6). Proposed in round-3 V6 |
 | A17 | A failure after a write's row step is `StatementFailed`; the transaction cannot commit until a savepoint rollback or an abort (layer §6.5) | **Accepted** (Kenneth, 2026-11-27, register D-14) |
-| A18 | Overwriting an earlier own subtransaction's lock word first records that lock in the lock manager; lock hints are set, checked and cleared under the page's exclusive pin (layer §6.10) | Proposed (round-4 W3, W8) |
+| A18 | Overwriting an earlier own subtransaction's lock word first records that lock in the lock manager; lock hints are set, checked and cleared under the page's exclusive pin (layer §6.10) | **Accepted** (Kenneth, 2026-11-27, register D-6). Proposed in round-4 W3, W8 |
 
 ## 16. Provenance and Changes
 
