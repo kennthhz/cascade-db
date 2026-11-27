@@ -169,7 +169,7 @@ Each decision carries one status: **Proposed** (the author's proposal, awaiting 
 | A10 | The engine builds a mini-transaction's records, and the seam applies each record to the data page it names — the heap, IOT or index page in the buffer pool — through `cascade-redo`. Leader and replay therefore run one code path. A page's LSN is the end of its last record | §9.1, §9.3 | Proposed |
 | A11 | Row locks: on a heap, exclusive locks are recorded in the row header and shared locks in the lock manager; on an IOT, all in the lock manager | §6.10 | Proposed; changes architecture §4.5 (see §13.2) |
 | A12 | An engine that must wait sleeps in an injected wait seam (`WaitSource`) until woken, instead of polling. The wait layer's two aborts — deadlock victim, `lock_timeout` — arrive as errors | §6.5, §6.11 | Proposed |
-| A13 | Callers see an enum (`AnyTable`, three arms: IOT, heap, temporary); the conformance suite is written once over a test-only trait that the engines and the fake implement, and `AnyTable` delegates to it, so the suite covers the whole surface | §6.1, §6.13 | Proposed |
+| A13 | Callers see an enum (`Table`, three arms: IOT, heap, temporary); the conformance suite is written once over a test-only trait that the engines and the fake implement, and `Table` delegates to it, so the suite covers the whole surface | §6.1, §6.13 | Proposed |
 | A14 | Each writing statement and each savepoint gets a subtransaction id; a snapshot carries the statement horizon, so a statement never sees its own changes, and savepoint rollback marks sub-ids aborted | §6.6 | Proposed (round 3); changes architecture §4.5 |
 | A15 | The unique check reads the latest committed state, not the statement snapshot | §11.4 | Proposed (round 3) |
 | A16 | Each index change is its own mini-transaction, after the row's, in the same statement and transaction | §11.4 | Proposed (round 3) |
@@ -190,7 +190,7 @@ The decisions of the retired WP5 design (its D1–D15) are part of the contract 
 | :--- | :--- | :--- | :--- |
 | `cascade-txn-api` | To create (L4) | The transaction seams engines consume: `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule (layer §6.6), `WaitSource` (§6.5), `TxnCtx` and `StmtCtx` (§6.7), and a scripted fake of all of them. Started early, with only what the access contract needs (access-api C1) | `cascade-types` |
 | `cascade-access-api` | To create | The contract of layer §6: the types, the suite's trait, the in-memory fake and the conformance suite | `cascade-types`, `cascade-txn-api`, `cascade-pgtypes` (A7), `cascade-telemetry` |
-| `cascade-access` | To create | The dispatch enums `AnyTable`, `TableScan` and `Maintenance` (layer §6.1). It sits above the engines, because the enums name their types | `cascade-access-api` and every engine crate |
+| `cascade-access-dispatch` | To create | The dispatch enums `Table`, `TableScan` and `Maintenance` (layer §6.1). It sits above the engines, because the enums name their types | `cascade-access-api` and every engine crate |
 | `cascade-page` | Landed | The page layer: prologue, kind registry and the heap format (kind 1); the B-tree and free-space-map formats as they land (A3) | `cascade-types` |
 | `cascade-btree` | Stub | The B+tree mechanism: descent, latching, structure changes, operations on byte keys | `cascade-types`, `cascade-page`, the page cache contract |
 | `cascade-heap` | Stub | The heap engine | `cascade-types`, `cascade-page`, the page cache contract, `cascade-access-api`, `cascade-index` once it exists |
@@ -220,13 +220,15 @@ This section is the whole contract. Every type the executor sees is defined here
 ### 6.1 Dispatch — an enum, not `dyn` or generics
 
 ```rust
-// In cascade-access, above the engine crates (access-api C1).
-pub enum AnyTable { Iot(IotTable), Heap(HeapTable), Temp(TempTable) }
+// In cascade-access-dispatch, above the engine crates (access-api C1).
+pub enum Table { Iot(IotTable), Heap(HeapTable), Temp(TempTable) }
 ```
 
-`AnyTable` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in this repository, so adding it is a compile-time change and not a contract break.
+`Table` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in this repository, so adding it is a compile-time change and not a contract break.
 
-**Where the enum lives (access-api C1).** Not in `cascade-access-api`: the enum names `IotTable`, `HeapTable` and `TempTable`, and every engine crate depends on the contract crate, so the enum there would be a dependency cycle. It lives in `cascade-access`, a thin crate above all the engines.
+**Names (decided by Kenneth, 2026-11-27).** The dispatch crate is `cascade-access-dispatch`, because all it does is route each call to the engine the catalog's table type names. The enum is `Table`, formerly `AnyTable`: callers hold "a table", and the arm says which engine stores it. `TableHandle` was not used because it already names the `{ rel, scope }` pair that `handle()` returns.
+
+**Where the enum lives (access-api C1).** Not in `cascade-access-api`: the enum names `IotTable`, `HeapTable` and `TempTable`, and every engine crate depends on the contract crate, so the enum there would be a dependency cycle. It lives in `cascade-access-dispatch`, a thin crate above all the engines.
 
 **Why there is also a trait (A13).** The rule behind it is one sentence: **write the tests once, and make every engine pass the same tests.** If each engine had its own hand-written tests, bugs would hide in the gaps between them. Running one test suite against four different engines needs a common plug — in Rust, a trait. But the official API must not be a trait, for the reasons above. So there are two doors with different jobs: the **trait is the private plug the test suite uses**, and the **enum is the public front door, whose methods only forward** to the plug. Since the front door only forwards, whatever a user can ask for goes to the thing the tests tested — there is no side door for an untested path to hide in. The trait is never in a production signature, so the rejection of traits above is about the public API and does not change.
 
@@ -257,7 +259,7 @@ On disk and in index entries a Tid is packed relation-locally (`Locator::Heap { 
 ### 6.3 The surface
 
 ```rust
-impl AnyTable {
+impl Table {
     // planner face
     pub fn handle(&self) -> TableHandle;            // TableHandle { rel: RelId, scope: ScopeId }
     pub fn capabilities(&self) -> &AmCapabilities;
@@ -535,7 +537,7 @@ pub struct StmtCtx {
 }
 ```
 
-`TxnCtx` is a concrete struct in `cascade-txn-api`, built by the transaction layer from four injected services: a clock with closed-timestamp waits, the `VisibilitySource`, the `WaitSource` and the scope's epoch (access-api C5). Engines consume it and never construct it. Its poison flag is interior (a `Cell`; the context is `!Send`), so a read that holds only `&TxnCtx`, or a scan that outlives the call that created it, can still poison the transaction (round-3 fix V25). `end_statement` returns each unresolved token as a pair of relation id and token id, so `cascade-access` can route the abort to its table (V26).
+`TxnCtx` is a concrete struct in `cascade-txn-api`, built by the transaction layer from four injected services: a clock with closed-timestamp waits, the `VisibilitySource`, the `WaitSource` and the scope's epoch (access-api C5). Engines consume it and never construct it. Its poison flag is interior (a `Cell`; the context is `!Send`), so a read that holds only `&TxnCtx`, or a scan that outlives the call that created it, can still poison the transaction (round-3 fix V25). `end_statement` returns each unresolved token as a pair of relation id and token id, so `cascade-access-dispatch` can route the abort to its table (V26).
 
 **How a read timestamp is chosen (round-3 fix V20).** A snapshot is closed when no commit can still appear below its read timestamp. Taking `read_ts = now` and waiting for the closed timestamp to pass it would make every read-committed statement wait for every concurrent commit to become durable, about the commit latency. So a snapshot takes `read_ts = max(closed_ts, session_token)`, where the session token is the commit timestamp of the session's own last commit (architecture §4.5, read-your-writes). It waits only when the token is ahead of the closed timestamp, which happens just after the session's own commit. For this to keep read-committed semantics across sessions, a commit is acknowledged to its client only once the closed timestamp has reached its commit timestamp, so any commit a client has heard about is visible to every snapshot taken afterwards. `fresh_snapshot` follows the same rule. The context carries the scope's epoch, and every engine call checks it: a call for an epoch the scope no longer holds returns `TamError::Fenced` before touching a page. That is a runtime outcome, not an assertion, because an epoch changes under a running transaction by design — a failover, or a scope reopened after a log failure.
 
@@ -560,7 +562,7 @@ Composing an upsert above the contract (look up the key, then insert or update) 
 2. **`complete_speculative(txn, token)`** changes nothing in storage. The insert becomes an ordinary one.
 3. **`abort_speculative(txn, token)`** **does change bytes.** The transaction goes on running (`ON CONFLICT DO UPDATE`, `DO NOTHING`), so the row must stop existing at once. On a heap, the engine stamps the row's deleter and the entry's delete word with the writer's uncommitted word. On an IOT, where the row is itself the primary-key entry and has no deleter word, it sets the leaf row's delete-mark and writes the undo record that carries the deleting word, in one group with undo first (round-3 fix V15). From then on the row is `Deleted { own: true }` for the writer, and for every other transaction it is invisible whatever the writer's outcome, because the same transaction created and deleted it.
 
-Two consequences for the conflict protocol. An entry whose create and delete words name the same in-flight transaction is not a conflict. Waiters for a key are woken when its delete word lands, not only when a transaction ends: a waiter sleeps on `WaitFor::Key`, and the engine signals that key when it stamps the delete word (round-3 fix V13). A token that the statement leaves unresolved is returned by `end_statement`, and the executor aborts it through `AnyTable::abort_unresolved` (access-api C6); `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches a list that is dropped.
+Two consequences for the conflict protocol. An entry whose create and delete words name the same in-flight transaction is not a conflict. Waiters for a key are woken when its delete word lands, not only when a transaction ends: a waiter sleeps on `WaitFor::Key`, and the engine signals that key when it stamps the delete word (round-3 fix V13). A token that the statement leaves unresolved is returned by `end_statement`, and the executor aborts it through `Table::abort_unresolved` (access-api C6); `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches a list that is dropped.
 
 ### 6.10 Row locks (A11)
 
@@ -662,7 +664,7 @@ An engine is constructed from a descriptor and a `TableEnv`. Engines never read 
 This section is A13 applied. The rule: **write the tests once; every engine takes the same test.** The tests plug into a private trait (§6.1); four implementations plug in beside them — the fake always, the three engines as they land. What each of the four is:
 
 - **A fake engine**: a multi-version table in memory with no pages and no log. Versions are `(creator, deleter, payload)` triples resolved through the same visibility rule, and conflicts come from a scripted `VisibilitySource`. It implements the trait like a real engine, in two locator flavours: `Heap`, where a locator names one version and every update moves it, and `Iot`, where the locator is the primary key and moves only when the key changes (access-api C10). The suite checks locator movement against both, and each engine is compared with its flavour. It is the executor's test double, and its machinery is the base of the temporary-table engine (§11.6) — which is why the temporary arm is cheap to add.
-- **A conformance suite**: one test per promise of §6, written as generic functions over the test-only trait, and run against every implementation of it — the fake and, as they land, the three engines. Because `AnyTable` delegates to the trait (§6.1), passing the suite is not a parallel obligation the engines can drift away from: it is the same code the executor reaches.
+- **A conformance suite**: one test per promise of §6, written as generic functions over the test-only trait, and run against every implementation of it — the fake and, as they land, the three engines. Because `Table` delegates to the trait (§6.1), passing the suite is not a parallel obligation the engines can drift away from: it is the same code the executor reaches.
 
 The suite covers: every outcome under each `WaitPolicy`; the read-committed re-check; locator movement; the scan protocol (rescan, mark/restore, drop); speculative arbitration, including two transactions racing on one key; poisoning and fencing; and the visibility truth table against a scripted status source.
 
@@ -1011,7 +1013,7 @@ Three further points are confirmations, not changes: A3 follows the architecture
 | Contract conformance | Every promise of layer §6 | The one generic suite, against the fake and every engine (layer §6.13) |
 | Visibility | The truth table of layer §6.6 and each engine's mapping, over random interleavings of begin, write, commit and abort | Property tests in the contract crate, shared by the engines |
 | Replay equivalence | For random workloads, pages rebuilt from the recorded groups equal the pages the leader produced, byte for byte | A differential harness over the in-memory seam's log and `cascade-redo`; the storage design's own differential test (storage §10) reuses it end to end |
-| Engine differential | The engines agree on rows, outcomes and visibility for the same operations | Generic workloads through `AnyTable`, arm against arm |
+| Engine differential | The engines agree on rows, outcomes and visibility for the same operations | Generic workloads through `Table`, arm against arm |
 | Concurrency | The shared per-scope structures survive interleaving | `loom` on page hints, the free-space map and sequence caches (architecture Rule 11); the page cache and log writer carry their own |
 | Row-level races | Reader against writer, prune against snapshot, vacuum against index entries, the HOT rules, speculative arbitration, row locks | Seeded interleavings through the fake seam and a scripted status source |
 | Crash and fence | An `Io` or `Fenced` at each step of a mini-transaction poisons cleanly; replay reaches the durable prefix | A fault-injected seam fake; the storage design's crash tests cover the bytes |
@@ -1033,7 +1035,7 @@ Three further points are confirmations, not changes: A3 follows the architecture
 | A10 | The engine supplies records; the seam applies them through `cascade-redo`. A page's LSN is the end of its last record | Proposed |
 | A11 | Heap: exclusive row locks in the row header, shared ones in the lock manager. IOT: all in the lock manager | Proposed. Changes architecture §4.5 (layer §13.2) |
 | A12 | An injected wait seam (`WaitSource`): engines sleep until woken; deadlock and `lock_timeout` arrive as errors | Proposed |
-| A13 | An enum for callers; a test-only trait for the suite, with `AnyTable` delegating to it | Proposed |
+| A13 | An enum for callers; a test-only trait for the suite, with `Table` delegating to it | Proposed |
 | A14 | Subtransaction ids per writing statement and savepoint; a snapshot carries the statement horizon; savepoint rollback aborts sub-ids (layer §6.6) | Proposed (round-3 V1, V2). Changes architecture §4.5 (layer §13.2) |
 | A15 | The unique check reads the latest committed state, not the statement snapshot (layer §11.4) | Proposed (round-3 V3) |
 | A16 | Index maintenance is a separate mini-transaction per index, in the row's statement and transaction (layer §11.4) | Proposed (round-3 V6) |

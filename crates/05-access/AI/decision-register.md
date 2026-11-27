@@ -10,7 +10,7 @@
 
 ## 1. Open decisions
 
-Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
+Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-15 to D-17, the DDL gaps, were added on 2026-11-27 at Kenneth's request. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
 
 ### D-1. How version words become self-describing
 
@@ -50,7 +50,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Accept the three changes of layer §13.2 and update `docs/architecture-design.md`? |
-| **Items** | (1) A13: callers see an enum `AnyTable` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids (D-11). The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
+| **Items** | (1) A13: callers see an enum `Table` with three arms, plus a test-only trait for the conformance suite, instead of the architecture's `TableAccessMethod` trait. (2) A11: heap exclusive row locks in the row header, shared ones in the lock manager; IOT row locks all in the lock manager. This replaces "row locks themselves live in version words". (3) A10: engines supply records and the seam applies them through `cascade-redo`. (4) The commit path's short commit-section mutex, against "a commit takes no lock" (round-3 V19). (5) A14: subtransaction ids (D-11). The architecture now carries these as marked "pending D-5" notes (round-3 V32), to be made plain text when decided. |
 | **Recommendation** | Accept all five. |
 | **Owner** | Kenneth |
 | **Blocks** | (1) Step 1. (2) Step 4. (3) Step 2. (4) Step 4. (5) Step 1. |
@@ -106,7 +106,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | | |
 | :--- | :--- |
 | **Question** | Accept decisions C1–C13 of the [access-api design](../cascade-access-api/AI/access-api-design.md)? |
-| **Highlights** | C1: three crates, because `AnyTable` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `AnyTable` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
+| **Highlights** | C1: three crates, because `Table` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `Table` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
 | **Recommendation** | Accept as written, or comment on the PR |
 | **Owner** | Kenneth |
 | **Blocks** | Step 1 |
@@ -132,6 +132,39 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | **Recommendation** | (a), now in layer §6.5. Changes the contract: unique violations from secondary indexes become errors, not values. |
 | **Owner** | Kenneth |
 | **Blocks** | Step 1 (the error type) |
+| **Status** | Open |
+
+### D-15. Who drops a table's or an index's storage
+
+| | |
+| :--- | :--- |
+| **Question** | Layer §6.12 says `DROP TABLE` and `DROP INDEX` drop their segments at commit, like `truncate`, but no contract call or component is named for it. |
+| **Options** | (a) A contract call `drop_storage(txn)` (and `drop_index(txn, index)`) on `Table`, which registers the segments to drop with `TxnCtx`; the transaction layer logs the drops as part of the commit record. (b) The catalog asks `ScopePages` directly to drop the segments named in the descriptor at commit, with no engine involved. |
+| **Recommendation** | (a). The engine is the only component that knows all of a table's segments (main, out-of-line, free-space map, undo, each index), so it should list them; the commit-time drop then follows the same path as `truncate`. |
+| **Owner** | Kenneth, with the catalog design |
+| **Blocks** | Step 8 (indexes), and `DROP TABLE` for any engine |
+| **Status** | Open |
+
+### D-16. `ALTER TABLE` that rewrites rows
+
+| | |
+| :--- | :--- |
+| **Question** | Some `ALTER TABLE` forms must rewrite every row: a column type change, an added column with a volatile default, `SET` of a new storage parameter that changes layout. The contract has no rewrite operation; a descriptor change alone works only for forms that need no rewrite (adding a nullable column, or one with a constant default stored in the descriptor). |
+| **Options** | (a) A physical rewrite through the contract: build a new segment set by scanning the old one under the old descriptor and inserting under the new one, then swap segments at commit, as `truncate` does (PostgreSQL's table rewrite). (b) Lazy conversion: rows carry a schema version and are converted on read and on the next write. (c) Refuse rewriting forms in version 1. |
+| **Recommendation** | (a) for version 1, with a write-blocking table lock like `build_index`, plus PostgreSQL's fast path: an added column with a constant default needs no rewrite (the default is kept in the descriptor). (b) is a later optimization. |
+| **Owner** | Kenneth, with the catalog design |
+| **Blocks** | ORM migrations that change column types; before general availability |
+| **Status** | Open |
+
+### D-17. Changing a table's engine (heap ↔ IOT)
+
+| | |
+| :--- | :--- |
+| **Question** | A table without a primary key uses the heap; one with a primary key may use the IOT. What happens on `ALTER TABLE … ADD PRIMARY KEY` or `DROP CONSTRAINT` on a primary key, or if a user wants a different engine? |
+| **Options** | (a) The table keeps its engine; adding a primary key to a heap table adds a unique index, and dropping an IOT's primary key is refused. (b) The change rewrites the table into the other engine with D-16's rewrite path. (c) An explicit `ALTER TABLE … SET ACCESS METHOD`, as PostgreSQL 15 has, using the rewrite path. |
+| **Recommendation** | (a) for version 1, which needs no new machinery and matches what PostgreSQL users expect from `ADD PRIMARY KEY`; then (c) once D-16's rewrite exists. Refusing to drop an IOT's primary key is a listed difference in product definition §5.5. |
+| **Owner** | Kenneth |
+| **Blocks** | Nothing before Step 7 |
 | **Status** | Open |
 
 ### D-12. The cleanup watermark in the managed service (round-3 review V8)
@@ -160,9 +193,10 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | # | Decision | By, when |
 | :--- | :--- | :--- |
 | D-3 | `Snapshot`, the visibility rule, `WaitSource` and `TxnCtx` live in a new, small `cascade-txn-api` (L4), created now with only what the access contract consumes (access-api C1) | Kenneth, 2026-11-27 |
-| C1 | Three crates: `cascade-txn-api`, `cascade-access-api`, and `cascade-access` for the dispatch enums above the engines | Kenneth, 2026-11-27 |
+| C1 | Three crates: `cascade-txn-api`, `cascade-access-api`, and `cascade-access-dispatch` for the dispatch enums above the engines | Kenneth, 2026-11-27 |
 | C5 | `TxnCtx` is concrete in `cascade-txn-api`; `begin_statement` and `fresh_snapshot` are async | Kenneth, 2026-11-27 |
 | C6 | `end_statement` returns unresolved speculative tokens; the executor aborts them | Kenneth, 2026-11-27 |
+| Names | The dispatch crate is `cascade-access-dispatch` (was `cascade-access`); the dispatch enum is `Table` (was `AnyTable`) | Kenneth, 2026-11-27 |
 | C10 | One fake engine with two locator flavours, `Heap` and `Iot` | Kenneth, 2026-11-27 |
 | H9 | While the heap insert record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order | Kenneth, 2026-11-26 |
 
