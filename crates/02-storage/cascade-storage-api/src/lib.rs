@@ -42,7 +42,7 @@ pub use error::{CorruptionSite, FrameError, IoError, KeyError, StoreError};
 pub use key_provider::{KeyProvider, KeyRef, KeyVersion, ScopeKey};
 pub use log_sink::LogSink;
 pub use log_source::{LogSource, LogSubscription};
-pub use page_source::PageSource;
+pub use page_source::{DurableLsn, PageSource};
 pub use scope_admin::{LogScopes, PageScopes};
 pub use types::{
     AppendMeta, FileId, FileName, HolderReport, Lineage, LogChunk, PageImage, PageKey, ReaderId,

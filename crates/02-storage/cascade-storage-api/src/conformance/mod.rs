@@ -819,3 +819,29 @@ async fn append_page_group<L: LogSink>(
     (log.append(&ctx, SCOPE, E1, Lsn(start), &bytes, meta(ts))).await.expect("appends");
     (log.wait_durable(&ctx, SCOPE, Lsn(start + bytes.len() as u64))).await.expect("durable")
 }
+
+/// The [`crate::page_source::DurableLsn`] view suite (§12.5): a scope
+/// with no published prefix reads 0; an advance is read back exactly; a
+/// stale advance never rewinds the view (the durable prefix only grows,
+/// §12.3); scopes are independent. The view itself is read-only, so the
+/// impl's advance knob is injected — `advance(scope, lsn)` must publish
+/// `lsn` as (at least) that scope's durable LSN. Sync — the view reads
+/// published state, nothing to await.
+pub fn durable_lsn_view_suite<T: crate::page_source::DurableLsn + ?Sized>(
+    source: &T,
+    mut advance: impl FnMut(ScopeId, Lsn),
+) {
+    // An untouched scope reads 0: nothing durable, nothing readable.
+    assert_eq!(source.durable_lsn(SCOPE), Lsn(0), "unpublished scope reads 0");
+    advance(SCOPE, Lsn(40));
+    assert_eq!(source.durable_lsn(SCOPE), Lsn(40), "the advance is read back");
+    // A stale publish must not rewind the view (monotone by §12.3).
+    advance(SCOPE, Lsn(10));
+    assert_eq!(source.durable_lsn(SCOPE), Lsn(40), "a stale advance is clamped");
+    // Other scopes stay independent.
+    let other = ScopeId(8);
+    assert_eq!(source.durable_lsn(other), Lsn(0), "scopes are independent");
+    advance(other, Lsn(5));
+    assert_eq!(source.durable_lsn(SCOPE), Lsn(40), "another scope's advance does not leak");
+    assert_eq!(source.durable_lsn(other), Lsn(5), "and is read back in its own scope");
+}

@@ -47,3 +47,22 @@ pub trait PageSource: Send + Sync {
         lsn: Lsn,
     ) -> LocalBoxFuture<'a, Result<(), StoreError>>;
 }
+
+/// The scope's durable LSN as compute sees it (§12.5): the end of the
+/// scope's contiguous durable log prefix, published by the log store and
+/// read by the page cache. The cache fetches an evicted page at this LSN
+/// (a leader; a follower or read replica fetches at its applied LSN — the
+/// managed service, later) and never evicts a page whose page LSN is
+/// above it, because the page store may not have its changes yet.
+///
+/// A narrow, dyn-compatible *view* so the page cache never depends on the
+/// log store — the same split as [`PageSource`]. The authoritative
+/// implementation is the log store's own `LogSink::durable_lsn`; this
+/// trait carries the published number to consumers that must not hold a
+/// log handle. Monotone by construction: the durable prefix only grows.
+pub trait DurableLsn: Send + Sync {
+    /// The end of the scope's contiguous durable prefix, right now.
+    /// Infallible — a view over published state; log failures surface on
+    /// the log path (§8.1), not here.
+    fn durable_lsn(&self, scope: ScopeId) -> Lsn;
+}

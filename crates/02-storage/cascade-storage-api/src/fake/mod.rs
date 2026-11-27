@@ -12,11 +12,13 @@
 //! object is honestly shared.
 
 mod block_device;
+mod durable_lsn;
 mod key_provider;
 mod log_store;
 mod page_store;
 
 pub use block_device::MemBlockDevice;
+pub use durable_lsn::MemDurableLsn;
 pub use key_provider::MemKeyProvider;
 pub use log_store::MemLogStore;
 pub use page_store::{MemPageStore, PageApply, PageRouter};
