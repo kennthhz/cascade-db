@@ -1,6 +1,6 @@
 # cascade-access-api design — the table access contract, its fake and its suite
 
-**Status:** Draft v0.1 for review, 2026-11-27. This is the implementation design for layer Step 1 (layer §12). It turns the contract of layer §6 into crates, modules, types and tests. It assumes the recommendations of decision register D-3 and D-5(1) and proposes how to settle them. Decisions are numbered C1–C13 (§12); none is accepted yet.
+**Status:** Draft v0.1 for review, 2026-11-27. This is the implementation design for layer Step 1 (layer §12). It turns the contract of layer §6 into crates, modules, types and tests. It assumes the recommendations of decision register D-3 and D-5(1) and proposes how to settle them. Decisions are numbered C1–C13 (§12). C1, C5, C6 and C10 were accepted by Kenneth on 2026-11-27; the rest are proposed.
 
 **Upstream:** the [layer design](../../AI/access-layer-design.md) v0.2 — §6 (the contract), §6.13 (the fake and the suite), §8 (execution model), §12 (Step 1). [`docs/architecture-design.md`](../../../../docs/architecture-design.md) v0.10.2 — Rules 1, 2, 6, 9, 10; §4.5 (`cascade-txn-api`); §4.6. The [decision register](../../AI/decision-register.md). Citation prefixes follow layer §2.2; "api §" means this document.
 
@@ -288,20 +288,20 @@ Each commit keeps the workspace building and the gate green.
 
 ## 12. Decisions
 
-All **Proposed**, awaiting Kenneth.
+Statuses: **Accepted** (by whom, when) or **Proposed**.
 
-| # | Decision |
-| :--- | :--- |
-| C1 | Three crates: `cascade-txn-api` (L4 seams), `cascade-access-api` (contract, fake, suite), `cascade-access` (dispatch enums above the engines). Fixes the dependency cycle of layer §6.1 and settles D-3 |
-| C2 | `AnyTable`, `TableScan` and `Maintenance` have a `Fake` arm behind the `fake` feature; production builds have the three arms of A13 |
-| C3 | `TableAccess`: a public trait with `async fn`s and associated `Scan` and `Maint` types. Only `cascade-access` and tests name it. `OpCtx` is an argument of every call; only `lock_row` takes a `WaitPolicy` |
-| C4 | `SpecToken` and `ResumeHint` are concrete opaque types in the contract, created by engines through hidden constructors |
-| C5 | `TxnCtx` is a concrete struct in `cascade-txn-api`, built from `TxnClock`, `VisibilitySource`, `WaitSource` and `EpochSource`. `begin_statement` and `fresh_snapshot` are `async`. `check_live` is the one epoch-and-poison check |
-| C6 | `end_statement` returns unresolved speculative tokens and the executor aborts them through `AnyTable::abort_unresolved`; replaces "the engine aborts them" in layer §6.9 |
-| C7 | `TamError` gains `RowTooLarge { len }` (PostgreSQL 54000) and `Unsupported` (for signatures that exist before their step) |
-| C8 | `WaitFor::SharedLocks` takes an opaque `LockKey`, and `Waited` carries `Deadlock` and `LockTimeout`, so L4 names no L5 type |
-| C9 | No `TableEnv` in the contract. Each engine's constructor takes its own environment |
-| C10 | One fake engine with two locator flavours, `Heap` and `Iot`, built on the shared visibility rule |
-| C11 | The suite: a `TableHarness`, groups S1–S12, single-threaded interleaving, capability-gated cases reported as skips |
-| C12 | Engine-against-fake property tests, with `proptest` as a dev-dependency of `cascade-access-api` |
-| C13 | Key helpers (`key_of`) live in the contract crate on top of the `cascade-pgtypes` encoders, under the A7 exception |
+| # | Decision | Status |
+| :--- | :--- | :--- |
+| C1 | Three crates: `cascade-txn-api` (L4 seams), `cascade-access-api` (contract, fake, suite), `cascade-access` (dispatch enums above the engines). Fixes the dependency cycle of layer §6.1 and settles D-3 | Accepted (Kenneth, 2026-11-27) |
+| C2 | `AnyTable`, `TableScan` and `Maintenance` have a `Fake` arm behind the `fake` feature; production builds have the three arms of A13 | Proposed |
+| C3 | `TableAccess`: a public trait with `async fn`s and associated `Scan` and `Maint` types. Only `cascade-access` and tests name it. `OpCtx` is an argument of every call; only `lock_row` takes a `WaitPolicy` | Proposed |
+| C4 | `SpecToken` and `ResumeHint` are concrete opaque types in the contract, created by engines through hidden constructors | Proposed |
+| C5 | `TxnCtx` is a concrete struct in `cascade-txn-api`, built from `TxnClock`, `VisibilitySource`, `WaitSource` and `EpochSource`. `begin_statement` and `fresh_snapshot` are `async`. `check_live` is the one epoch-and-poison check | Accepted (Kenneth, 2026-11-27) |
+| C6 | `end_statement` returns unresolved speculative tokens and the executor aborts them through `AnyTable::abort_unresolved`; replaces "the engine aborts them" in layer §6.9 | Accepted (Kenneth, 2026-11-27) |
+| C7 | `TamError` gains `RowTooLarge { len }` (PostgreSQL 54000) and `Unsupported` (for signatures that exist before their step) | Proposed |
+| C8 | `WaitFor::SharedLocks` takes an opaque `LockKey`, and `Waited` carries `Deadlock` and `LockTimeout`, so L4 names no L5 type | Accepted in part with C1: the opaque `LockKey`. `Waited` carrying the aborts is proposed |
+| C9 | No `TableEnv` in the contract. Each engine's constructor takes its own environment | Proposed |
+| C10 | One fake engine with two locator flavours, `Heap` and `Iot`, built on the shared visibility rule | Accepted (Kenneth, 2026-11-27) |
+| C11 | The suite: a `TableHarness`, groups S1–S12, single-threaded interleaving, capability-gated cases reported as skips | Proposed |
+| C12 | Engine-against-fake property tests, with `proptest` as a dev-dependency of `cascade-access-api` | Proposed |
+| C13 | Key helpers (`key_of`) live in the contract crate on top of the `cascade-pgtypes` encoders, under the A7 exception | Proposed |
