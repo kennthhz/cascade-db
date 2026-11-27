@@ -40,7 +40,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | :--- | :--- |
 | **Question** | Architecture §4.5 puts `Snapshot` and `Snapshot::visible` in `cascade-txn-api` (L4). The layer design §6.6 (A8) defines them in `cascade-access-api` (L5). `TxnCtx` is likewise "constructed by the transaction layer" but defined in L5. |
 | **Options** | (a) Move `Snapshot`, `TxnStatus`, `VisibilitySource`, the visibility rule and `TxnCtx` to `cascade-txn-api`; `cascade-access-api` depends on it. (b) Keep them in `cascade-access-api` and change the architecture. |
-| **Recommendation** | (a). Index kinds and the undo walk use the same rule, and L4 owning it matches the architecture. Until `cascade-txn-api` exists, they can sit in a module of `cascade-access-api` that moves without changing signatures. |
+| **Recommendation** | (a), by creating a small `cascade-txn-api` now with only what the access contract consumes, as [access-api design](../cascade-access-api/AI/access-api-design.md) C1 and C5 propose. Index kinds and the undo walk use the same rule, and L4 owning it matches the architecture. |
 | **Owner** | Kenneth |
 | **Blocks** | Step 1 (the contract's crate layout) |
 | **Status** | Open |
@@ -109,6 +109,17 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | D-9d | The upward dependency from `cascade-access-api` to `cascade-pgtypes` until `cascade-datum` exists (A7) | Accept as a named exception in the layering check | Step 1 |
 | D-9e | In the Step 3 slice a row is reserved and applied in the commit path, so a transaction cannot read its own uncommitted inserts | Accept for Step 3 and say so in the step's notes, or apply at insert and filter by an in-memory "own rows" set | Step 3 |
 | D-9f | A shared free-space predicate for `cascade-page` and `cascade-redo` instead of a mirror | Do it with the next change to either | — |
+
+### D-10. The access-api implementation design (Step 1)
+
+| | |
+| :--- | :--- |
+| **Question** | Accept decisions C1–C13 of the [access-api design](../cascade-access-api/AI/access-api-design.md)? |
+| **Highlights** | C1: three crates, because `AnyTable` cannot live in the contract crate without a dependency cycle. C2: a `Fake` arm on `AnyTable` behind a feature. C5: `TxnCtx` concrete in `cascade-txn-api`, with `begin_statement` and `fresh_snapshot` async. C6: unresolved speculative tokens returned by `end_statement`. C7: `RowTooLarge` and `Unsupported` errors. C8: no L5 types in `WaitFor`. C9: no `TableEnv` in the contract. |
+| **Recommendation** | Accept as written, or comment on the PR |
+| **Owner** | Kenneth |
+| **Blocks** | Step 1 |
+| **Status** | Open |
 
 ## 2. Decided
 
