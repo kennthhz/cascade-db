@@ -1,8 +1,10 @@
 # cascade-btree design — the B+tree mechanism
 
-**Status:** Draft v0.2 for review, 2026-11-26. v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): writers now pin before they validate, the root pointer is checked, tree keys and equal keys are defined, every entry carries its length, `mod_count` has a rule, and the no-merge policy is written down (R6, R7, R12–R14, R22, R23, R27–R29). Decision numbers are stable identifiers, so B8–B11, added by v0.2, sit where their subject is rather than in numeric order.
+**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-4 review (W1, W9) and the round-3 review ([`access-design-review-2026-11-27.md`](../../AI/access-design-review-2026-11-27.md): V3, V10, V11, V21, V36). v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): writers now pin before they validate, the root pointer is checked, tree keys and equal keys are defined, every entry carries its length, `mod_count` has a rule, and the no-merge policy is written down (R6, R7, R12–R14, R22, R23, R27–R29). Decision numbers are stable identifiers, so B8–B11, added by v0.2, sit where their subject is rather than in numeric order.
 
 **What this document is.** The detailed design of `cascade-btree`: the B+tree mechanism shared by the IOT's primary tree (`cascade-iot`) and by every secondary index (`cascade-index`). It owns the tree — descent, latching, structure changes, ordered iteration, and operations on byte keys — and nothing else. Page bytes belong to `cascade-page` (layer A3), record payloads to `cascade-wal-format`, redo dispatch to `cascade-redo`, and every visibility decision to the engines above it.
+
+**Background for readers new to B-tree concurrency (round-3 fix V36).** A B+tree keeps its entries in leaf pages ordered by key, linked left to right, with branch pages above them that route a search to the right leaf. The classic way to make it safe under concurrent writers is *latch coupling*: hold the parent's latch while taking the child's, then release the parent. That needs a latch to be held while the child is fetched. Here a page that is not in memory must be fetched with an `await`, and a buffer-pool pin may never be held across an `await` (pins are spin-style holds measured in microseconds, and a suspended task would block every other session on that core that wants the page). So this tree is *optimistic*: a reader copies each page without holding its parent, and afterwards checks that nothing it passed through has changed, starting over if something has (the idea behind optimistic lock coupling and Lehman–Yao's B-link trees). Writers pin only the leaf they change, and a split pins its few pages together after making them resident.
 
 **Upstream:** the [layer design](../../AI/access-layer-design.md) — §6.4 (locators and keys), §8 (execution model), §9 (the write path; §9.1 defines the mini-transaction), §11.1. The storage design's §12.4 (redo contract) and §12.5 (page cache rules). The [kept document](../../AI/engine-semantics.md) §1 and §3. The page design's L1–L3. Citation prefixes are defined in layer §2.2; terms in layer §3.
 
@@ -37,7 +39,7 @@ One generic tree serves both users. An IOT leaf and an index leaf differ only in
 
 A tree lives in exactly one segment, and every node pointer is a page number inside it (`u32`). That caps a tree at 2³² pages of 8 KiB, 32 TiB, which no version-1 table approaches. It also makes allocation, prefetch (the storage layer reads a segment's pages sequentially) and bulk load simpler. A tree across several segments would need wider child pointers and is a later format change.
 
-Page 0 of every tree segment is the **metapage**: the root's page number, the tree's height, and a tag that says which leaf codec the tree uses. It is an ordinary logged page. A root split records the new root and the metapage in the same mini-transaction as the split, so recovery never has to find a root by scanning. A tree handle in memory keeps the root's page number and the height; both are refreshed when a group that changes them is applied (§4).
+Page 0 of every tree segment is the **metapage**: the root's page number, the tree's height, and a tag that says which leaf codec the tree uses. It is an ordinary logged page. A root split records the new root and the metapage in the same mini-transaction as the split, so recovery never has to find a root by scanning. A tree handle in memory keeps the root's page number and the height; both are refreshed when a group that changes them is applied (§4), on a follower too, whether or not the metapage is resident there (§4, round-3 fix V21).
 
 ### 2.2 B2 — Page kinds and headers
 
@@ -53,7 +55,8 @@ branch (kind 2)                    IOT leaf (kind 3)              index leaf (ki
  8: page_lsn u64                    8: page_lsn u64                8: page_lsn u64
 16: mod_count u64   (§3.1)         16: mod_count u64              16: mod_count u64
 24: reserved 4                      24: next_leaf u32              24: next_leaf u32
-28: leftmost_child u32             28: reserved                    28: reserved
+28: leftmost_child u32             28: high_key_slot u16          28: high_key_slot u16
+                                   30: leaf_flags u16             30: leaf_flags u16
     (valid once entry_count > 0)
 32: slot array, growing up          32: slot array                 32: slot array
 
@@ -65,8 +68,9 @@ entries, growing down:
                                    [payload…]
 ```
 
-- **Branch entries route by right-child convention.** Entry *i* holds a separator `k_i` and the child that owns keys in `[k_i, k_{i+1})`. The header's `leftmost_child` covers everything below the first separator. Separators are full keys in version 1: no suffix truncation, no prefix compression (§10).
+- **Branch entries and routing.** Entry *i* holds a separator `k_i` and child *i*. The invariant is: every tree key in child *i−1* is ≤ `k_i`, and every tree key in child *i* is ≥ `k_i`. Equal keys may sit on both sides of a separator, because a long run can be cut (§2.3). The header's `leftmost_child` is child 0. A descent has two modes (round-3 fix V10): **leftmost**, used by lookups, scans and every operation on an existing entry, goes to child *i−1* when the key equals `k_i`, so it reaches the first leaf that may hold the key; **rightmost**, used only to insert a new entry, goes to child *i* on equality, so it reaches the end of the run, where a new entry belongs (§2.3). Separators are full keys in version 1: no suffix truncation, no prefix compression (§10).
 - **IOT leaf row.** The creator is a version word. `roll_ptr` is opaque here; its encoding belongs to the IOT design. The flag word has bit 0 `DELETE_MARK` and bit 1 `HAS_TOAST`; the rest are zero. An IOT row's lock lives in the lock manager, not in this header (layer §6.10). There is no deleter word. **A delete-mark is not self-contained:** whether a snapshot sees the row as deleted depends on when the deleting transaction committed, and only the undo record at `roll_ptr` carries that (layer §11.3). This crate sets and clears the bit and reads nothing into it.
+- **Leaf high key (round-4 fix W1).** Every leaf except the rightmost carries a **high key**: an upper fence, stored as a key-only cell whose slot `high_key_slot` names (`0xFFFF` on the rightmost leaf, meaning "no upper bound"). Every tree key in the leaf is at most its high key, and every key in the leaves to its right is at least it. A split gives the left node the separator as its high key and the right node the left node's old one. Purge-compact keeps it. Unlinking an empty leaf (§5.5) gives its left sibling the unlinked leaf's high key. Lehman and Yao's B-link tree uses the same fence. `leaf_flags` holds `UNLINKED` (§5.5).
 - **Index entry.** The locator is the primary key for an IOT table and a Tid for a heap table (`cascade-pgtypes`' `Locator`). Its length follows from the entry's: it is everything between the key and the two words.
 - **Sizes.** An entry is at most 8158 bytes, the most a fresh page holds (layer §7, step 2). A larger IOT row is stored out of line; a larger index key is refused when the index is defined.
 - **Fill.** Leaves split when an entry does not fit; branches when a separator does not. There is no fill-factor setting. The split-point rule in §5.1 is fixed.
@@ -87,7 +91,7 @@ The host builds the tree key; the tree stores it as opaque bytes.
 
 - Among equal tree keys, order is by insertion: the older entry sorts first, and a new entry goes last.
 - `lookup(key)` returns the **run** of entries with that tree key, oldest first. The host chooses among them by visibility.
-- A split does not cut inside a run, unless one run alone fills a page. A lookup that meets such a cut follows `next_leaf` while entries carry the same tree key.
+- A split does not cut inside a run, unless one run alone fills a page. A lookup descends in leftmost mode (§2.2), so it starts at the first leaf that holds the run, and follows `next_leaf` while entries carry the same tree key. Under the right-child rule alone a lookup would land right of the cut and miss the older part of the run (round-3 fix V10).
 
 ### 2.4 B9 — Every entry carries its own length
 
@@ -116,7 +120,7 @@ lookup(tree, key):
     node    = copy(root_no)               # a coherent copy; note (root_no, node.mod_count)
     path    = [(root_no, node.mod_count)]
     while node is a branch:
-        node = copy(route(node, key))     # may await if the page is not resident; nothing is held
+        node = copy(route(node, key, mode)) # leftmost or rightmost on equal keys (§2.2)
         path.push((node.page_no, node.mod_count))
     if tree.root.load() != root_no:       # the root changed during the walk
         continue
@@ -137,8 +141,12 @@ write(tree, key, make_record):
   loop
     leaf = lookup(tree, key)                          # §3.2, validated
     pin leaf exclusively                              # fail-fast: Contended → yield and retry
-    if leaf is not the rightmost leaf and key > leaf.last_tree_key:
-        unpin; continue                               # the leaf was split between lookup and pin
+    if leaf.unlinked or not covers(leaf, key, mode):
+        unpin; continue                               # split or unlinked since the lookup (W1)
+    # covers: the leaf has no high key, or key < high_key,
+    #         or key == high_key and mode is leftmost (equal keys may continue rightwards)
+    # (an insert descends rightmost; an operation on an existing entry descends leftmost and
+    #  moves right along next_leaf, one leaf copy at a time, until it finds the entry)
     if any node on the lookup's path, except the leaf, changed since the lookup copied it:
         unpin; continue
     record = make_record(leaf)                        # reads the pinned copy
@@ -147,7 +155,9 @@ write(tree, key, make_record):
     return
 ```
 
-**The pins come first and the validation after.** A leaf's key range can change only through a split of that leaf, and a split needs the leaf's exclusive pin — the one now held. So once the leaf is pinned, two checks are enough: the ancestors copied on the way down have not changed, and the key is not beyond the leaf's last key. Validating before pinning would leave a window in which another writer splits the leaf, and the insert would land in the wrong half.
+**Why the high key and not the last key (round-4 fix W1).** An earlier version compared the key with the last key *present* in the leaf. That is not the leaf's upper bound: after purge removes a leaf's upper keys, or empties it, a key that rightly belongs in the gap is greater than every key present, and the writer would restart forever. The high key is the leaf's range bound and changes only when the leaf splits or its right neighbour is unlinked into it, both under this leaf's exclusive pin.
+
+**The pins come first and the validation after.** A leaf's key range can change only through a split of that leaf, and a split needs the leaf's exclusive pin — the one now held. So once the leaf is pinned, two checks are enough: the ancestors copied on the way down have not changed, and the key is within the leaf's high key. Validating before pinning would leave a window in which another writer splits the leaf, and the insert would land in the wrong half.
 
 Nothing awaits between the pin and the unpin. The durability wait comes after the group is sealed (layer §9.1).
 
@@ -181,6 +191,8 @@ So every interleaving that could mislead a reader changes an ancestor's `mod_cou
 ## 4. Root Discovery and Opening a Tree (B4)
 
 `open(segment)` reads the metapage and returns a handle with the root's page number and the height. A root split's group updates both when it is applied. Readers validate against the root pointer on every lookup (§3.2). A stale handle costs one repeated lookup, never a wrong answer.
+
+**On a follower (round-3 fix V21).** A follower drops records for pages it does not hold (architecture §2.3). If it dropped a root split because the metapage was not resident, its handle would keep naming the old root, which after the split is only the left child, and the §3.2 check would compare against that same stale handle. So the apply path has one exception to "drop what is not resident": for a `BT_SPLIT` that installs a new root and for every `BT_META`, the follower's `cascade-redo` hook updates the tree handle's root and height from the record, whether or not any of its pages are resident. The records carry the new root's page number and height for exactly this purpose.
 
 ---
 
@@ -230,23 +242,28 @@ An update that changes the tree key is never in place. It is a delete-mark at th
 - **Stamp a word** (index leaf): write the entry's delete word. One record, naming the tree key and the word.
 - **Purge-compact** (§7): the host says which entries of a leaf are removable, and the tree rewrites the leaf without them.
 
-### 5.5 No merge and no root collapse (B6)
+### 5.5 No merge and no root collapse, but empty leaves are unlinked (B6, B12)
 
-Version 1 never moves an entry from one node to another and never removes a node.
+Version 1 never moves an entry from one node to another, never merges two half-full nodes, and never collapses the root. It does remove a leaf that has become **empty** (round-3 fix V11).
 
-- A branch never loses a separator, so it never falls below two children. **A root collapse cannot happen.** Its record type is reserved and never emitted.
-- A leaf shrinks only when purge-compact removes dead entries from it.
+**Why the empty-leaf case cannot wait.** The product's showcase workload is PostgreSQL as a job queue (product definition §4.1): rows are inserted with rising keys and deleted within minutes. Purge empties the leaves on the left of the tree, and without unlinking them every scan for the oldest job would cross an ever-growing run of empty pages, whose space is never returned. That is the bloat the product promises to beat.
 
-**The cost.** After a workload that deletes heavily, the tree keeps its height and its near-empty leaves. Every lookup pays the full height, and a range scan crosses empty pages.
+**Unlinking an empty leaf (B12).** When purge-compact leaves a leaf with no entries, and the leaf is not the only child of its parent, maintenance unlinks it as one structure change (§3.4's protocol, one mini-transaction, record `BT_LEAF_UNLINK`):
 
-**Why accept it.** Merge is the hardest part of a B-tree to make correct under concurrency and replay, and the IOT engine is the default engine: its rows leave nothing behind when they are updated, so its tree does not shrink the way a heap's does. The policy is reopened when a deletion-heavy benchmark measures the cost.
+1. Make resident and pin, in order: the parent, the left sibling (the parent's previous child, or for the parent's leftmost child, the leaf whose `next_leaf` names it, found by a leftmost descent for the empty leaf's old low key), and the empty leaf.
+2. Validate under the pins that the leaf is still empty and the links are as found.
+3. Remove the parent's entry for the leaf (or, for the leftmost child, make the next child the new `leftmost_child` and drop its separator); point the left sibling's `next_leaf` at the empty leaf's `next_leaf`; and rewrite the empty leaf as a **tombstone**: an empty leaf with an `UNLINKED` header flag that keeps its `next_leaf`.
+
+Readers stay correct without new latching. A lookup that copied the parent before the change sees its `mod_count` change and starts over (§3.2). A scan holding a copy of the left sibling from before the change follows the old link into the tombstone, finds no entries, and continues along the tombstone's `next_leaf`. **Page numbers are never reused (round-4 fix W9).** A tombstone keeps its page number forever, as layer A6 requires, and the page store releases its storage, so the space comes back but the number does not. Reuse would break two of the reader's safety arguments: a reused page whose `mod_count` restarted could match a count a slow reader had copied (§3.1), and a reused number could become a new root and reopen the root-pointer case of §3.2. The cleanup watermark cannot guard reuse either, because purge, index vacuum, structure changes and a follower's apply path descend without a snapshot. The cost is the page-number space: 2³² pages per segment. A queue churning 10,000 jobs a second, about a hundred leaves, uses it up in roughly 1.3 years. Before then maintenance rebuilds the tree into a fresh segment online (as `REINDEX CONCURRENTLY` would), which is listed in §10 as needed before a queue table can run unattended for that long. A branch never loses its last child, so branches never empty and the root never collapses; the empty leaves left behind are at most one per branch, about one in three hundred.
+
+**What is still accepted.** Half-full leaves are not merged, and the tree keeps its height after a mass delete. A lookup pays the full height, and a range scan over a sparsely populated region crosses half-empty pages. Merge is the hardest part of a B-tree to make correct under concurrency and replay; it is reopened when a deletion-heavy benchmark measures the cost.
 
 ---
 
 ## 6. What the Engines Build on This
 
 - **`cascade-iot`** (layer §11.3). A leaf row carries the creator word and `roll_ptr`. Insert: an undo record and a leaf-insert record in one group, undo first. Update: §5.3, with an undo delta first. Delete: the mark and an undo record. Read: a lookup, then the undo walk outside the tree, on a copy of the row — no pin is held during the walk. Purge of an undo record the walk still needs is prevented by the cleanup watermark, not by latching.
-- **`cascade-index`** (layer §11.4). The host supplies the tree key (§2.3). The unique check is a lookup, which returns the run at the key, and then the host's rule on each entry: an entry another transaction has in progress gives `Conflict::InProgress`; one committed and visible gives `UniqueViolation`; one committed after the snapshot gives `CommittedAfterSnapshot`. A speculative insert is an ordinary insert whose create word is the writer's; aborting it stamps the delete word (layer §6.9).
+- **`cascade-index`** (layer §11.4). The host supplies the tree key (§2.3). The unique check is a lookup, which returns the run at the key, and then the host's rule on each entry against the latest committed state, not the statement's snapshot (layer §11.4, round-3 fix V3): an entry another transaction created or deleted and has not ended gives `Conflict::InProgress`; one committed and not deleted by a committed transaction gives `UniqueViolation` (or, for a speculative insert whose snapshot cannot see it, `CommittedAfterSnapshot`); one whose delete committed frees the key. A speculative insert is an ordinary insert whose create word is the writer's; aborting it stamps the delete word (layer §6.9).
 - **`cascade-maintenance`**. Purge runs through `Maintenance::step` budgets. The host keeps a list of leaves that hold dead entries — a leaf joins it when a mark or a stamp lands on it — and offers them to purge one at a time.
 
 ---
@@ -280,11 +297,12 @@ Record type bytes extend `cascade-wal-format`'s table and are never renumbered. 
 | 24 | `BT_SPLIT` | the left node's image, the new right node's image, the parent's separator and its position, and for a root split the new root's image and the metapage's | Copies the images |
 | 25 | `BT_PURGE_COMPACT` | leaf kind, the entries that remain, in order | Rebuilds the leaf from them |
 | 26 | `BT_META` | the metapage's image | Copies it |
+| 28 | `BT_LEAF_UNLINK` | the parent's change, the left sibling's new `next_leaf` and high key, the tombstone's image | Applies the three changes (§5.5) |
 | 27 | `BT_ROOT_COLLAPSE` | — | **Reserved. Never emitted in version 1** (§5.5) |
 
 **Why a split carries images, not steps.** Replay then copies bytes and contains no tree logic at all, which keeps it on the right side of the determinism law and leaves the tree's logic in one crate. The price is size: a split logs two nodes, up to about 16 KiB, inside the 1 MiB group limit (storage §5.4). §10 says when that would be revisited.
 
-Records 20–23 name "which entry of the run", so that a delete-marked twin and its live replacement at one tree key are told apart.
+Records 20–23 name "which entry of the run on this page", so that a delete-marked twin and its live replacement at one tree key are told apart, even when the run continues on the next leaf.
 
 ---
 
@@ -296,7 +314,9 @@ Records 20–23 name "which entry of the run", so that a delete-marked twin and 
 - **Concurrency, model-checked** (`loom`, architecture Rule 11): the multi-pin order; validate-after-pin for a plain write; a lookup racing a root split; a lookup racing a leaf split.
 - **Scans under splits.** A scan's result at a snapshot equals the reference result while splits run.
 - **Mark and restore** across splits and purge-compact.
-- **Equal tree keys.** Runs are kept in insertion order, returned whole, and not cut by a split.
+- **Equal tree keys.** Runs are kept in insertion order and returned whole, including a run that a split had to cut across leaves (V10).
+- **Purge gaps.** An insert whose key falls between a leaf's last remaining key and its high key, and an insert into an emptied leaf, each succeed with no restart loop (W1).
+- **Empty-leaf unlink.** A scan racing an unlink returns every visible entry exactly once; a lookup racing an unlink restarts; a follower's handle follows root splits whose pages it does not hold (V11, V21).
 
 ---
 
@@ -309,6 +329,7 @@ Records 20–23 name "which entry of the run", so that a delete-marked twin and 
 | A latch fused into the buffer-pool frame, saving one copy per level | A measured optimization behind this protocol's interface |
 | A hot leaf (the rightmost one under sequential inserts) serializes its writers | Acknowledged in layer §8. A mitigation is not designed; it is taken up when a benchmark shows it matters |
 | The size of `BT_SPLIT` | Revisited if page-store ingest profiling shows split-heavy logs dominating |
+| Online rebuild of a tree into a fresh segment, for trees that exhaust their page-number space through churn (§5.5) | Before a queue table must run unattended for more than about a year |
 
 ---
 
@@ -334,9 +355,12 @@ Statuses mean: **Proposed**, awaiting the project owner; **Accepted**, by whom a
 | B3 | Optimistic descent. Readers copy, then validate; writers pin, then validate; no pin across an `await` or a tree level | Proposed |
 | B4 | The root pointer and the height are validated on every lookup | Proposed |
 | B5 | A split is one mini-transaction and one record, carrying images. It does not cut inside a run | Proposed |
-| B6 | No merge and no root collapse in version 1 | Proposed |
+| B6 | No merge and no root collapse in version 1 | Proposed (narrowed in round 3 by B12) |
 | B7 | Scans follow `next_leaf`. Mark and restore are anchored to a tree key | Proposed |
 | B8 | A non-unique index's tree key is key + locator. Equal tree keys are ordered by insertion, returned as a run | Proposed |
 | B9 | Every entry carries its own length | Proposed |
 | B10 | `mod_count` lives in the node's image and is incremented by every record that changes the node | Proposed |
 | B11 | A structure change makes its pages resident first, then takes all pins fail-fast, then validates under them | Proposed |
+| B12 | An empty leaf that is not its parent's only child is unlinked, leaving a tombstone; page numbers are never reused (§5.5) | Proposed (round-3 V11, revised round-4 W9) |
+| B14 | Every leaf but the rightmost carries a high key; a writer checks its key against it under the leaf's pin (§2.2, §3.3) | Proposed (round-4 W1) |
+| B13 | Two descent modes: leftmost for lookups and existing entries, rightmost for inserting (§2.2) | Proposed (round-3 V10) |
