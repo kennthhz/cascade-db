@@ -118,7 +118,9 @@ pub struct StmtCtx { pub snapshot: Snapshot, pub serial: u64, pub schema_version
 - **`SchemaVersion` moves here** from layer §6.2, because `StmtCtx` carries it.
 - **Poisoning through a shared reference (round-3 fix V25).** Reads take `&TxnCtx`, and a scan outlives the call that created it, yet an I/O failure met by either must poison the transaction. So the poison flag is a `Cell` and `poison` takes `&self`. `TxnCtx` is `!Send` already, so a `Cell` costs nothing. A scan keeps a shared borrow of the context for its lifetime and poisons through it.
 - **Speculative tokens (C6).** The context records each token an engine installs as a pair of relation id and `SpecId` (round-3 fix V26), because a `SpecId` alone does not say which table to route the abort to, and L4 cannot name the contract's `SpecToken`. `end_statement` returns the unresolved pairs, and `cascade-access` rebuilds a `SpecToken` from each; `cascade-access` provides `AnyTable::abort_unresolved(txn, ids)`, which the executor calls. Layer §6.9 said "the engine aborts them at `end_statement`", but `TxnCtx` cannot call an engine without depending on L5. A debug assertion catches an executor that drops the list.
-- **Reserved for D-1.** If stamping through the log is accepted, the context gains `record_stamp(StampPos)`. It is not added until D-1 is decided.
+- **Stamp positions (D-1).** Under D-1's current recommendation (post-commit stamping, layer §13.1, round-4 fix W5), the context gains `record_stamp(StampPos)`, which every engine calls for each in-flight word it writes, in rows and index entries. It is added when D-1 is decided.
+- **The failed state (round-4 fix W2).** `TxnCtx` has a `failed` flag beside the poison flag. An engine sets it when it returns `TamError::StatementFailed`; while it is set, `check_live` returns `StatementFailed` and the transaction layer refuses `COMMIT`. Unlike poisoning, it is cleared by a rollback to an enclosing savepoint, which aborts the failed statement's subtransaction id.
+- **Status resolution (round-4 fix W6).** The scripted world, like the real status table, stores a subtransaction as `{top, rolled_back}` and resolves it through its top, and it advances its closed timestamp only past published commits.
 
 ### 4.4 The scripted world (feature `fake`)
 
@@ -137,7 +139,7 @@ Modules and their content. Every type is as layer §6.2–§6.5 and §6.11–§6
 | `scan` | `ScanRow`, `Direction`, `SeqScanOpts`, `IndexScanOpts`, `ScanParams`, `ResumeHint`, `SsiReporter` | `ScanParams { range: Option<KeyRange> }`. `ResumeHint` is opaque bytes (C4). `SsiReporter` is an empty reserved struct |
 | `caps` | `AmCapabilities`, `TableStats`, `Budget`, `Progress` | `Budget { pages: u32 }`, `Progress { more: bool }` for now |
 | `descriptor` | `TableDescriptor`, `ColumnDef`, `KeyShape`, `IndexDef`, `ToastPolicy` | `TableEnv` is **not** here (C9) |
-| `error` | `TamError` | Adds `RowTooLarge { len }` and `Unsupported(&'static str)` (C7). SQLSTATE mapping through `cascade-error` |
+| `error` | `TamError` | Adds `RowTooLarge { len }` and `Unsupported(&'static str)` (C7), and `StatementFailed { cause }` (layer §6.5, round-4 W2). SQLSTATE mapping through `cascade-error`: `StatementFailed` reports its cause's code, 23505 for a unique violation |
 | `keys` | `key_of(row, cols) -> Option<KeyBytes>` | `None` when a column is null, which is how the unique check skips nulls (layer §11.4). Built on the `cascade-pgtypes` encoders (A7, C13) |
 
 **Exhaustiveness (Rule 9).** `WriteOutcome`, `Conflict`, `SpeculativeResult`, `RowLockMode` and `WaitPolicy` are matched exhaustively by the executor on purpose: a new outcome must be a compile error at every match. Everything else is `#[non_exhaustive]`.
@@ -264,8 +266,8 @@ Every engine runs the suite against `ScriptedWorld`, not against the real transa
 | S3 update and delete | Locator movement per flavour; `NotVisible` on a row gone for the snapshot; scans emit rows, never versions | §6.5 |
 | S4 conflicts and waits | Every row of the heap §4.4 table: writes under `Wait`, and `lock_row` under all three policies, including the wait bound expiring | §6.5 |
 | S5 the re-check | `CommittedAfterSnapshot` then `fetch_latest_committed` returns the newest version with its own locator; it waits for in-progress holders | §6.8 |
-| S6 row locks | The compatibility matrix of the four modes; a plain read never waits; locks survive a moving update; `SkipLocked` | §6.10 |
-| S7 unique and nulls | The unique-check table against the latest committed state: a key deleted by a transaction that committed after the snapshot is free; a key inserted by one is a violation for a plain insert; nulls never conflict | §11.4 |
+| S6 row locks | The compatibility matrix of the four modes; a plain read never waits; locks survive a moving update; `SkipLocked`; a lock taken before a savepoint survives rolling back an update made after it (W3) | §6.10 |
+| S7 unique and nulls | A conflict in an index step after the row step is `StatementFailed`, blocks commit, and leaves no trace after a savepoint rollback (W2). The unique-check table against the latest committed state: a key deleted by a transaction that committed after the snapshot is free; a key inserted by one is a violation for a plain insert; nulls never conflict | §11.4 |
 | S8 speculative insertion | All four results; abort makes the row vanish for the writer; two transactions racing on one key, the loser woken through `WaitFor::Key` by the abort, not the commit; unresolved tokens returned by `end_statement` with their relation | §6.9 |
 | S13 statements and savepoints | An `UPDATE` over a scan never meets its own new versions; `INSERT … SELECT` from the same table reads only earlier rows; a nested statement sees the outer statement's earlier writes; `ROLLBACK TO SAVEPOINT` hides exactly the writes since the savepoint, on both flavours | §6.6 |
 | S9 scans | Construction does no work; `rescan` at the same snapshot; `mark`/`restore` where advertised; drop without `close`; index scans in key order; index-only results | §6.8 |

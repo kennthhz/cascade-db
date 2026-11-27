@@ -48,7 +48,7 @@ A *cleanup watermark* is the oldest read timestamp any reader, on the leader, a 
 
 - **Code.** The heap page format, the shared buffer pool, and the redo path for one record type exist. The contract crates, the engines, the status table, the lock manager and the mini-transaction seam do not exist yet. The runtime's transaction manager is only a clock.
 - **Decisions.** Almost every design decision is still *Proposed*. Kenneth has accepted the three-crate split, the concrete transaction context, the handling of speculative tokens, and the placement rule for type-5 inserts. The open owner decisions are in the decision register, D-1 to D-13. The most consequential is D-1: how in-flight words become self-describing, so that the status table stays bounded.
-- **Known problems.** The round-4 review (PR #6) found nine high-impact issues that are not yet fixed. The two most urgent: a B-tree insert can loop forever when its key falls in a gap left by purge (W1), and a write that ends with a conflict after its row step can commit with its index work only partly done (W2). The other seven are about savepoint locks, freezing, status-table growth, snapshot stability, replica watermarks, lock hint bits and page reuse.
+- **Review status.** Four adversarial review rounds have run. Every High and Medium finding of round 3 and all nine high-impact findings of round 4 are fixed in the documents. Round 4's fixes added a leaf high key to the B-tree, made a failure after a write's row step an error that blocks commit, kept earlier locks across savepoint rollbacks, and changed the D-1 recommendation to post-commit stamping.
 
 ## 7. Terms
 

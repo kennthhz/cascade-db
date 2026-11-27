@@ -1,6 +1,6 @@
 # cascade-heap design — the heap engine
 
-**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-3 review ([`access-design-review-2026-11-27.md`](../../AI/access-design-review-2026-11-27.md): V2, V4–V8, V13, V14, V17, V22, V35, V36). v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): the chain walk, row locks, speculative abort, the re-check, vacuum's treatment of indexes and the free-space map are corrected (R3, R4, R5, R10, R11, R21, R24, R27).
+**Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-4 review (W2, W3, W4, W8; [`access-design-review-round4-2026-11-27.md`](../../AI/access-design-review-round4-2026-11-27.md)) and the round-3 review ([`access-design-review-2026-11-27.md`](../../AI/access-design-review-2026-11-27.md): V2, V4–V8, V13, V14, V17, V22, V35, V36). v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): the chain walk, row locks, speculative abort, the re-check, vacuum's treatment of indexes and the free-space map are corrected (R3, R4, R5, R10, R11, R21, R24, R27).
 
 **What this document is.** The detailed design of `cascade-heap`, the PostgreSQL-style engine behind the `AnyTable::Heap` arm: row versions appended to pages, HOT chains, incremental prune and vacuum. The *format* half is the page design's — the heap page, its slot states, its prune plans and its redo primitives (page D1–D6), already pinned by golden tests. This document is the *engine* half: the DML paths, the visibility walks, free space, vacuum, out-of-line storage, and the landing sequence.
 
@@ -142,7 +142,7 @@ When the row moves, its locks move with it: none is left behind on the old versi
 
 ### 4.3 Delete
 
-Find the newest version, run §4.4, then one group: `STAMP_DELETER(newest, xmax = uncommitted(own))` with `XMAX_UPDATES_KEY`. Then, one mini-transaction per index, delete words on every entry of the row, found through the chain's root (§3, §4.6). The tuple's bytes stay where they are. Prune removes them once the cleanup watermark has passed the delete (§7.1).
+Find the newest version, run §4.4, then one group: `STAMP_DELETER(newest, xmax = uncommitted(own))` with `XMAX_UPDATES_KEY` and `clear_next` (§5.2, round-4 fix W4). Then, one mini-transaction per index, delete words on every entry of the row, found through the chain's root (§3, §4.6). The tuple's bytes stay where they are. Prune removes them once the cleanup watermark has passed the delete (§7.1).
 
 ### 4.4 Conflicts, waits and row locks (H3)
 
@@ -165,11 +165,13 @@ A holder that has committed or aborted is not a holder. The wait has the bound t
 | :--- | :--- |
 | `FOR UPDATE` | The version's deleter word is set to `uncommitted(own)`, with the flags `XMAX_LOCK_ONLY` and `XMAX_UPDATES_KEY` |
 | `FOR NO KEY UPDATE` | The same, with `XMAX_LOCK_ONLY` only |
-| `FOR SHARE`, `FOR KEY SHARE` | A lock-manager entry for the relation and the version's locator. Nothing is written to the page |
+| `FOR SHARE`, `FOR KEY SHARE` | A lock-manager entry for the relation and the version's locator, plus the row's `HAS_MANAGER_LOCKS` hint, set under the page's exclusive pin (layer §6.10) |
 
 `XMAX_LOCK_ONLY` tells a plain read to ignore the deleter word: the engine passes no deleter to the visibility rule, so readers never wait and never see a locked row as deleted. Every write and every exclusive locker consults both places — the header word and the lock manager's shared holders — for the version it targets. The two flags are bits in the `next` word's flag field, which the page layer assigns: format F2 assigns three, and the rest are unassigned.
 
 `lock_row` runs the conflict check first and returns `Locked { outcome, row }`, with the row present if the lock was taken. One lookup serves `SELECT … FOR UPDATE`.
+
+**Overwriting one's own earlier lock (round-4 fix W3).** If the deleter word holds a lock-only stamp by an earlier subtransaction of the writer's own transaction, the writer first records that lock in the lock manager under the earlier sub-id and sets `HAS_MANAGER_LOCKS`, in the same group as its stamp, so that a rollback to a savepoint between the two does not release the lock. All lock checks and hint changes happen under the page's exclusive pin (layer §6.10, W8).
 
 **Locks move with the row.** An update never leaves a lock on the old version. Afterwards the engine records on the new version every lock the old one carried: its own, and other transactions' shared locks, which a non-key update does not conflict with. That is how a later key-changing update on the new version still finds them.
 
@@ -183,7 +185,7 @@ The contract is layer §6.9. The heap's part of it:
 
 ### 4.6 Index maintenance
 
-Every insert, update and delete changes the row's index entries in the same statement, through `cascade-index`. Layer §11.4 has the table of which write changes which entry. Until `cascade-index` lands (Step 8), a heap table cannot have a primary key or a unique constraint (layer §12).
+Every insert, update and delete changes the row's index entries in the same statement, through `cascade-index`. These index steps come after the row step, so they always wait on a conflict whatever the `WaitPolicy`, and a unique violation or an expired wait there is `TamError::StatementFailed`, which blocks commit until the statement's subtransaction is rolled back (layer §6.5, round-4 fix W2). Layer §11.4 has the table of which write changes which entry. Until `cascade-index` lands (Step 8), a heap table cannot have a primary key or a unique constraint (layer §12).
 
 ---
 
@@ -212,14 +214,16 @@ fetch(snap, loc):
       Live        → switch row_visible(xmin, deleter)             # layer §6.6; no deleter if XMAX_LOCK_ONLY
                       Live       → return this version
                       Deleted    → if not next.has_next(): return None
-                                   succ = next
-                                   if succ is not a Live slot, or creator(succ) ≠ deleter(this):
-                                       return None                         # a stale link (V5)
-                                   (page, slot) = succ
+                                   (page, slot) = next                     # never stale (W4)
                       NotBornYet → return None
 ```
 
-**A hop is checked (round-3 fix V5).** The walk follows `next` only if the successor's creator word is exactly the predecessor's deleter word: the same (sub)transaction id, since one update stamps both. Otherwise the link is stale and the walk ends. A stale link arises when an update that crossed pages is rolled back: the old version stays live with `next` still set, the successor is pruned and its slot vacuumed and reused, and a later transaction deletes the old version without relinking. Without the check, a reader that sees that delete would follow the link to whatever row now occupies the slot. PostgreSQL guards the same case by comparing the next tuple's `xmin` with the previous one's `xmax`. An update always overwrites `next`, so only a delete or a lock can leave such a link behind.
+**No stale link is ever followed (round-3 fix V5, revised by round-4 fix W4).** A stale link arises when an update that crossed pages is rolled back: the old version stays live with `next` still set, and its successor is pruned and its slot vacuumed and reused. Round 3 guarded the hop by comparing the successor's creator word with the predecessor's deleter word. That comparison breaks once words are stamped to commit timestamps page by page (layer §13.1), because the two words can be in different forms, and it can also pass falsely when one statement deletes the old version and its own insert lands in the reused slot. The rule is now structural instead:
+
+- **A pure delete clears `next`.** `HEAP_STAMP_DELETER` for a delete (not for an update, and not for a lock) also clears the chain pointer and `HEAP_ONLY`, in the same record.
+- An update always overwrites `next`. A lock-only stamp leaves it, but a lock is never a visible deleter, so the walk never hops from a locked version.
+
+So the walk hops only from a version whose visible deleter is an update, and that update wrote the link in the same record group that created the successor. A stale link can exist only on a version whose deleter is aborted or lock-only, and the walk never hops from such a version. Debug builds still assert that the successor's creator resolves to the same top-level transaction and commit as the predecessor's deleter.
 
 **`Deleted` is not "gone".** When an update replaces a version, the old version is `Deleted` and its successor is the row. The hop is what makes an update reached through an old locator work.
 
@@ -233,7 +237,7 @@ A chain v1 (created at t1), v2 (at t2), v3 (at t3):
 | t1 to t2 | v1 | `NotBornYet` → none |
 | t2 to t3 | v1 is `Deleted` → hop → v2 | v2 |
 | after t3 | v1 is `Deleted` → v2 is `Deleted` → v3 | v2 is `Deleted` → v3 |
-| v2's update rolled back, v2's slot reused by row R, then v1 deleted by Y at t4; snapshot after t4 | v1 is `Deleted`; R's creator is not Y → none | (v2's Tid now names R: an ordinary fetch of R) |
+| v2's update rolled back, v2's slot reused by row R, then v1 deleted by Y at t4 (which clears v1's `next`); snapshot after t4 | v1 is `Deleted`, no `next` → none | (v2's Tid now names R: an ordinary fetch of R) |
 
 The walk is bounded by the chain's length. A link to the page it is on that revisits a slot is corruption and asserts.
 
@@ -335,7 +339,7 @@ Record type bytes extend `cascade-wal-format`'s table and are never renumbered. 
 | :--- | :--- | :--- | :--- |
 | 5 | `HEAP_INSERT` | `[segment u32][cell verbatim]` | Landed. Kept forever for replay of existing logs; **not emitted** once Step 4 lands |
 | 10 | `HEAP_INSERT_V2` | `[segment][page_no][slot][cell verbatim]` | Places the cell at the named slot. Replay reproduces the leader's layout exactly |
-| 11 | `HEAP_STAMP_DELETER` | `[segment][page_no][slot][deleter word][flag bits]` | Writes the deleter word and the flags. Used by delete, update and an exclusive row lock |
+| 11 | `HEAP_STAMP_DELETER` | `[segment][page_no][slot][deleter word][flag bits][clear_next]` | Writes the deleter word and the flags. Used by delete, update and an exclusive row lock. A delete sets `clear_next`, which also clears the chain pointer and `HEAP_ONLY` (round-4 fix W4) |
 | 12 | `HEAP_RELINK` | `[segment][page_no][slot][pointer and HEAP_ONLY bit]` | Writes the chain pointer and `HEAP_ONLY`; preserves the lock flags (round-3 fix V17) |
 | 13 | `HEAP_PRUNE` | `[segment][page_no][the plan's verdicts]` | Transforms the page by the plan. Verdicts, never a watermark (page D2) |
 | 14 | `HEAP_SLOT_FREE` | `[segment][page_no][slot]` | Marks the slot unused |
@@ -356,7 +360,7 @@ The page design's §6 pins the format: marker goldens, the parse refusal matrix,
 
 - **The chain walk.** For every chain shape and every snapshot time, `fetch` from every Tid in the chain returns what §5.2's table says. A property test over random update chains and random snapshots.
 - **Visibility end to end.** Random interleavings of begin, write, commit and abort through the in-memory seam and a scripted `VisibilitySource`; every snapshot's scan result equals the reference model's.
-- **Chain invariants.** A `HEAP_ONLY` link never leaves its page. No cycles. A stale link left by a rolled-back cross-page update is never followed after its successor's slot is reused (V5). The root found for any version is the slot its index entries name (V4).
+- **Chain invariants.** A `HEAP_ONLY` link never leaves its page. No cycles. A stale link left by a rolled-back cross-page update is never followed after its successor's slot is reused, with stamping interleaved at random (V5, W4). The root found for any version is the slot its index entries name (V4).
 - **The conflict table**, every row under every `WaitPolicy`, including the expiry of the wait bound and the poisoned paths.
 - **Row locks.** Two transactions cannot hold conflicting locks on one row; several can hold `FOR SHARE`; a plain read never waits; a lock survives an update that moves the row.
 - **Speculative insertion.** Two transactions race on one key; the loser's wait ends when the winner aborts the speculative insert, not when the winner's transaction ends.
@@ -413,7 +417,7 @@ Statuses mean: **Proposed**, awaiting the project owner; **Accepted**, by whom a
 | H7 | Out-of-line values are chunks of a hidden heap relation with a unique index. The pointer format is reserved now and frozen at Step 8 | Proposed |
 | H8 | `HEAP_INSERT_V2` (type 10) names its page and slot. Emission switches at Step 4; type 5 stays replayable forever | Proposed |
 | H9 | While the record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order. Free-space placement and slot reuse begin with type 10 | **Accepted** (Kenneth, 2026-11-26). It supersedes the runtime plan's FR-46 acceptance that the two layouts may differ |
-| H10 | The chain walk of §5.2: `Deleted` hops to a successor whose creator equals the deleter, `NotBornYet` is "no row" | Proposed (hop check added in round 3, V5) |
+| H10 | The chain walk of §5.2: `Deleted` hops to the successor, `NotBornYet` is "no row". A pure delete clears `next`, so no stale link is ever hopped | Proposed (revised in round 4, W4) |
 | H11 | A prune plan is computed while the page is pinned exclusively | Proposed |
 | H12 | The free-space map is a tree of maxima: span pages over 2048 heap pages, a root over spans | Proposed |
 | H13 | The re-check waits for the row's holders, then takes a fresh snapshot, then walks (§5.2.1) | Proposed (order corrected in round 3, V7) |
