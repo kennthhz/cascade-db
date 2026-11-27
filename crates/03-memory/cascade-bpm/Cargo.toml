@@ -9,12 +9,12 @@ authors.workspace      = true
 description = "Userspace Buffer Pool Manager. Pillar §3.5. Per-database page accounting (§6.1 reservation)."
 
 [dependencies]
-cascade-types     = { workspace = true }
-cascade-telemetry = { workspace = true }
-cascade-storage   = { workspace = true }
-libc              = { workspace = true }
+cascade-types       = { workspace = true }
+cascade-telemetry   = { workspace = true }
+cascade-storage-api = { workspace = true }
+libc                = { workspace = true }
 
 [dev-dependencies]
 futures-lite      = { workspace = true }
-glommio           = { workspace = true }
+cascade-wal-format = { workspace = true }
 static_assertions = { workspace = true }

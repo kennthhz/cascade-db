@@ -174,11 +174,11 @@ dependencies = [
 name = "cascade-bpm"
 version = "0.1.0"
 dependencies = [
- "cascade-storage",
+ "cascade-storage-api",
  "cascade-telemetry",
  "cascade-types",
+ "cascade-wal-format",
  "futures-lite",
- "glommio",
  "libc",
  "static_assertions",
 ]

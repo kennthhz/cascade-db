@@ -1,143 +1,78 @@
-//! T1.9 + T3.2 + T6.2: the buffer pool — hit/miss/pin/unpin, panic
-//! release, lookup races, pool-full, the WAL-before-data writeback gate,
-//! gated eviction — and the T6.2 cross-core generalization: multiple
-//! reactors sharing one `Arc<Bpm>`, each with its own `CoreStorage` on one
-//! data dir (the production shape: the pool is shared, the store is
-//! reactor-bound). Every test runs real `CoreStorage` over a temp dir.
+//! T1.9 + T6.2 + storage M8: the buffer pool. Hit/miss/pin/unpin, panic
+//! release, lookup races, pool-full; the T6.2 cross-core generalization
+//! (multiple reactors sharing one `Arc<Bpm>`); and the M8 cache rules:
+//! misses read at the scope's durable LSN, pages are never written back,
+//! and eviction drops only what the durable LSN covers (§12.5).
 //!
-//! Two behavior changes from the single-reactor slice are pinned here:
-//! flushes no longer refuse pinned pages (coherent snapshots + the write
-//! ticket make them safe — writers proceed during gate waits), while
-//! eviction still refuses them (a claim needs the pin word at zero).
+//! The harness is the storage contract's own fakes: `MemLogStore` and
+//! `MemPageStore` (the real contract surface: `LogSink`/`LogSource`/
+//! `LogScopes` plus `PageSource`/`PageScopes`, conformance-covered in
+//! cascade-storage-api) with the conformance suite's toy redo, and a
+//! `MemDurableLsn` the tests advance by hand. No glommio. The pool has no
+//! I/O of its own anymore (no write-back, no gate waits), so every future
+//! resolves inline and plain `block_on` polls them, on the main thread or
+//! on worker threads for the cross-core tests. (The old suite's watchdog
+//! existed for glommio's lost-completion freezes; with no ring in this
+//! suite, a hang here is an honest deadlock.)
 
-use std::{
-    future::Future,
-    path::PathBuf,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc, Barrier, Mutex,
-    },
-    time::Duration,
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc, Barrier, Mutex,
 };
 
-use cascade_bpm::{Bpm, BpmConfig, BpmError, PerDbAccounting, WalDurability};
-use cascade_storage::{
-    CoreStorage, PageStore, StorageError,
-};
+use cascade_bpm::{Bpm, BpmConfig, BpmError, PerDbAccounting};
+use cascade_storage_api::conformance::{toy_apply, toy_route};
+use cascade_storage_api::fake::{test_ctx, MemDurableLsn, MemLogStore, MemPageStore};
+use cascade_storage_api::log_sink::LogSink;
+use cascade_storage_api::page_source::PageSource;
+use cascade_storage_api::scope_admin::{LogScopes, PageScopes};
+use cascade_storage_api::types::AppendMeta;
+use cascade_storage_api::{KeyRef, OpCtx, StoreError};
 use cascade_types::{
-    AlignedBuf, DatabaseId, Lsn, PageId, SegmentId, PAGE_SIZE,
+    DatabaseId, Epoch, Hlc, Lsn, PageId, ScopeId, SegmentId, PAGE_SIZE,
 };
-use static_assertions::{assert_impl_all, assert_not_impl_any};
+use cascade_wal_format::{encode, encode_with_flags, WalRecord, FLAG_GROUP_END};
+use futures_lite::future::block_on;
+use static_assertions::assert_impl_all;
 
-/// The eternal-futex backstop. This development environment carries a
-/// documented hazard (WSL2 5.15 + glommio 0.9 can lose an io_uring
-/// completion; a ring whose PARK wakeup is lost freezes every task on it
-/// — first diagnosed in cascade-runtime/src/testutil.rs at ~1-in-20
-/// suites, and since observed here: one 10× stability loop's first run
-/// sat in futex wait for five hours). Nothing running on a wedged ring
-/// can contain it, so the watchdog converts the eternal hang into a fast,
-/// loud failure: at the budget it dumps every thread's /proc syscall line
-/// — `io_uring_enter` on the reactors names the frozen-ring class, while
-/// two threads parked on each other's futexes would name a real deadlock
-/// instead — to a side file and stderr, then aborts.
-mod watchdog {
-    use std::sync::Once;
-    use std::time::Duration;
+const SCOPE: ScopeId = ScopeId(7);
+const DB: DatabaseId = DatabaseId(7);
+const SEGMENT: SegmentId = SegmentId(3);
+const KEY: KeyRef = KeyRef { key_id: 1 };
 
-    static ARM: Once = Once::new();
-
-    pub fn arm() {
-        ARM.call_once(|| {
-            let secs = std::env::var("CASCADE_TEST_WATCHDOG_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(90);
-            let budget = Duration::from_secs(secs);
-            std::thread::Builder::new()
-                .name("bpm-suite-watchdog".into())
-                .spawn(move || {
-                    std::thread::sleep(budget);
-                    let mut dump = format!(
-                        "=== BPM SUITE WATCHDOG: {budget:?} budget exceeded ===\n"
-                    );
-                    let tasks = std::fs::read_dir("/proc/self/task")
-                        .map(|d| d.flatten().collect::<Vec<_>>())
-                        .unwrap_or_default();
-                    for t in tasks {
-                        let tid = t.file_name().to_string_lossy().into_owned();
-                        let comm = std::fs::read_to_string(format!(
-                            "/proc/self/task/{tid}/comm"
-                        ))
-                        .unwrap_or_default();
-                        let syscall = std::fs::read_to_string(format!(
-                            "/proc/self/task/{tid}/syscall"
-                        ))
-                        .unwrap_or_default();
-                        let wchan = std::fs::read_to_string(format!(
-                            "/proc/self/task/{tid}/wchan"
-                        ))
-                        .unwrap_or_default();
-                        dump.push_str(&format!(
-                            "TID {} [{}] wchan={} syscall={}\n",
-                            tid,
-                            comm.trim(),
-                            wchan.trim(),
-                            syscall.trim()
-                        ));
-                    }
-                    dump.push_str("=== BPM SUITE WATCHDOG: aborting ===\n");
-                    let side = std::env::temp_dir().join(format!(
-                        "cascade-bpm-watchdog-{}.log",
-                        std::process::id()
-                    ));
-                    let _ = std::fs::write(&side, &dump);
-                    eprint!("{dump}");
-                    std::process::abort();
-                })
-                .expect("bpm suite watchdog thread spawns");
-        });
-    }
-}
-
-fn reactor_named(name: &str) -> glommio::LocalExecutor {
-    glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
-        .name(name)
-        .make()
-        .expect("executor builds")
-}
-
-static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
-
-/// A temp data dir cleaned up on drop. Cross-reactor tests keep it alive
-/// on the main thread past every join.
-fn temp_dir() -> PathBuf {
-    watchdog::arm();
-    let dir = std::env::temp_dir().join(format!(
-        "cascade-bpm-test-{}-{}",
-        std::process::id(),
-        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
-}
-
-/// The single-reactor fixture: one pool, one store, one executor — the
-/// T1.9/T3.2 shape, unchanged except that the pool now holds no store and
-/// every call passes it.
-struct Pool {
-    dir: PathBuf,
+/// One node of the harness: a log store, a page store over it, the
+/// durable-LSN view the tests advance by hand, and the pool under test.
+struct Rig {
+    log: Arc<MemLogStore>,
+    pages: Arc<MemPageStore<MemLogStore>>,
+    durable: Arc<MemDurableLsn>,
     bpm: Arc<Bpm>,
-    store: CoreStorage,
+    /// The log's next append start — seeding is main-thread-only in these
+    /// tests.
+    next_lsn: Mutex<u64>,
 }
 
-impl Pool {
-    fn with_frames(max_frames: u32) -> Self {
+impl Rig {
+    fn with_frames(max_frames: u32) -> Arc<Rig> {
         Self::build(max_frames, None)
     }
 
-    fn build(max_frames: u32, numa: Option<u32>) -> Self {
-        let dir = temp_dir();
+    fn build(max_frames: u32, numa: Option<u32>) -> Arc<Rig> {
+        let log = Arc::new(MemLogStore::new());
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 7);
+        block_on(async {
+            log.create_scope(&ctx, SCOPE, Epoch(1), KEY).await.expect("scope created");
+        });
+        let pages = Arc::new(MemPageStore::new(
+            Arc::clone(&log),
+            Arc::new(toy_route),
+            Arc::new(toy_apply),
+        ));
+        block_on(async {
+            pages.attach(&ctx, SCOPE, None, KEY).await.expect("page scope attached");
+        });
+        let durable = Arc::new(MemDurableLsn::new());
         let bpm = Bpm::arced(
             BpmConfig {
                 max_frames,
@@ -145,185 +80,201 @@ impl Pool {
                 numa,
             },
             PerDbAccounting::default(),
+            Arc::clone(&durable) as Arc<dyn cascade_storage_api::DurableLsn>,
         );
-        let store = CoreStorage::new(0, dir.clone());
-        Pool { dir, bpm, store }
+        Arc::new(Rig {
+            log,
+            pages,
+            durable,
+            bpm,
+            next_lsn: Mutex::new(0),
+        })
+    }
+
+    /// Appends one mini-transaction whose HEAP_INSERT routes to `page_no`
+    /// (the toy contract: the cell is `[page_no u32][content..]`) and
+    /// makes it durable. Returns the INSERT record's END LSN — the page
+    /// LSN the toy apply stamps (S17).
+    fn seed(&self, page_no: u32, content: &[u8]) -> Lsn {
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 7);
+        let mut cell = Vec::with_capacity(4 + content.len());
+        cell.extend_from_slice(&page_no.to_le_bytes());
+        cell.extend_from_slice(content);
+        let start = *self.next_lsn.lock().unwrap();
+        let ins = encode(
+            &WalRecord::HeapInsert {
+                xid: start,
+                segment: SEGMENT,
+                cell,
+            },
+            Lsn(start),
+            1,
+        );
+        let com = encode_with_flags(
+            &WalRecord::CommitTxn {
+                xid: start,
+                commit_ts: Hlc(start),
+            },
+            Lsn(start + ins.len() as u64),
+            1,
+            FLAG_GROUP_END,
+        );
+        let ins_len = ins.len();
+        let mut bytes = ins;
+        bytes.extend(com);
+        block_on(async {
+            self.log
+                .append(
+                    &ctx,
+                    SCOPE,
+                    Epoch(1),
+                    Lsn(start),
+                    &bytes,
+                    AppendMeta {
+                        max_commit_ts: Some(Hlc(start)),
+                        writer_durable: Lsn(0),
+                    },
+                )
+                .await
+                .expect("seed appends");
+            self.log
+                .wait_durable(&ctx, SCOPE, Lsn(start + bytes.len() as u64))
+                .await
+                .expect("seed makes the group durable");
+        });
+        *self.next_lsn.lock().unwrap() = start + bytes.len() as u64;
+        Lsn(start + ins_len as u64)
+    }
+
+    /// Raises the durable-LSN view — what the pool reads pages at and
+    /// what its eviction rule defers to.
+    fn durable_to(&self, lsn: Lsn) {
+        self.durable.advance(SCOPE, lsn);
     }
 
     fn page(&self, page_no: u32) -> PageId {
         PageId {
-            db: DatabaseId(7),
-            segment: SegmentId(3),
+            db: DB,
+            segment: SEGMENT,
             page_no,
         }
     }
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// A reactor thread with its own `CoreStorage` over the shared dir — the
-/// second core of a cross-core test. The body runs on that thread's
-/// executor; only `Send` things (the `Arc<Bpm>`, owned data) cross over.
-fn spawn_reactor<F, Fut>(
-    name: &str,
-    core_id: usize,
-    dir: PathBuf,
-    bpm: Arc<Bpm>,
-    body: F,
-) -> std::thread::JoinHandle<()>
-where
-    F: FnOnce(CoreStorage, Arc<Bpm>) -> Fut + Send + 'static,
-    Fut: Future<Output = ()>,
-{
-    let name = name.to_string();
-    std::thread::Builder::new()
-        .name(name.clone())
-        .spawn(move || {
-            let ex = glommio::LocalExecutorBuilder::new(glommio::Placement::Unbound)
-                .name(&name)
-                .make()
-                .expect("executor builds");
-            ex.run(async move {
-                let store = CoreStorage::new(core_id, dir);
-                body(store, bpm).await;
-            });
-        })
-        .expect("reactor thread spawns")
-}
-
-fn page_id(page_no: u32) -> PageId {
-    PageId {
-        db: DatabaseId(7),
-        segment: SegmentId(3),
-        page_no,
-    }
-}
-
-/// `CoreStorage` wrapper counting disk reads — the double-install
-/// detector: after N reactors all load one page, exactly one reactor may
-/// have read it from disk. Same shape as the production store otherwise.
-struct CountingStore {
-    inner: CoreStorage,
+/// `MemPageStore` wrapper counting reads and recording every `at_lsn` it
+/// was asked for — the miss-point and double-install detectors.
+struct CountingSource {
+    inner: Arc<MemPageStore<MemLogStore>>,
     reads: Arc<AtomicU32>,
+    at_lsns: Arc<Mutex<Vec<Lsn>>>,
 }
 
-impl CountingStore {
-    fn new(inner: CoreStorage) -> Self {
-        CountingStore {
+impl CountingSource {
+    fn new(inner: Arc<MemPageStore<MemLogStore>>) -> Self {
+        CountingSource {
             inner,
             reads: Arc::new(AtomicU32::new(0)),
+            at_lsns: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
 
-impl PageStore for CountingStore {
-    async fn read_page(&self, page_id: PageId) -> Result<AlignedBuf, StorageError> {
+impl PageSource for CountingSource {
+    fn get_page<'a>(
+        &'a self,
+        ctx: &'a OpCtx<'_>,
+        scope: ScopeId,
+        page: cascade_storage_api::PageKey,
+        at_lsn: Lsn,
+    ) -> cascade_types::LocalBoxFuture<'a, Result<cascade_storage_api::PageImage, StoreError>>
+    {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        self.inner.read_page(page_id).await
+        self.at_lsns.lock().unwrap().push(at_lsn);
+        self.inner.get_page(ctx, scope, page, at_lsn)
     }
 
-    async fn write_page(
-        &self,
-        page_id: PageId,
-        buf: AlignedBuf,
-    ) -> Result<AlignedBuf, StorageError> {
-        self.inner.write_page(page_id, buf).await
+    fn materialized_lsn(&self, scope: ScopeId) -> Result<Lsn, StoreError> {
+        self.inner.materialized_lsn(scope)
     }
 
-    async fn read_pages(
-        &self,
-        start_page_id: PageId,
-        count: u32,
-    ) -> Result<Vec<AlignedBuf>, StorageError> {
-        self.inner.read_pages(start_page_id, count).await
+    fn oldest_readable_lsn(&self, scope: ScopeId) -> Result<Lsn, StoreError> {
+        self.inner.oldest_readable_lsn(scope)
     }
 
-    async fn write_pages(
-        &self,
-        start_page_id: PageId,
-        bufs: Vec<AlignedBuf>,
-    ) -> Result<Vec<AlignedBuf>, StorageError> {
-        self.inner.write_pages(start_page_id, bufs).await
-    }
-
-    async fn allocate_extent(
-        &self,
-        db_id: u32,
-        space_id: u32,
-        num_pages: u32,
-    ) -> Result<u32, StorageError> {
-        self.inner.allocate_extent(db_id, space_id, num_pages).await
-    }
-
-    async fn free_extent(
-        &self,
-        db_id: u32,
-        space_id: u32,
-        start_page: u32,
-        num_pages: u32,
-    ) -> Result<(), StorageError> {
-        self.inner.free_extent(db_id, space_id, start_page, num_pages).await
+    fn set_read_floor<'a>(
+        &'a self,
+        ctx: &'a OpCtx<'_>,
+        scope: ScopeId,
+        reader: cascade_storage_api::ReaderId,
+        lsn: Lsn,
+    ) -> cascade_types::LocalBoxFuture<'a, Result<(), StoreError>> {
+        self.inner.set_read_floor(ctx, scope, reader, lsn)
     }
 }
 
 // --- shape -------------------------------------------------------------------
 
-/// I2 survives the generalization, split in two: the POOL is now shared
-/// (Send + Sync — the whole point of T6.2, guards included), while the
-/// STORE stays strictly reactor-bound (its file handles never cross
-/// threads). The store moved out of the pool; it cannot smuggle `!Send`
-/// back in.
+/// I2 survives the generalization, split in two: the POOL is shared
+/// (Send + Sync — the whole point of T6.2, guards included), and the
+/// PageSource contract is Send + Sync too (a source handle may be shared
+/// as `Arc<dyn PageSource>`) — while the PRODUCTION sources stay
+/// reactor-bound per core at the cascade-pagestore layer. The store moved
+/// out of the pool; nothing store-shaped can smuggle back in.
 #[test]
-fn pool_is_cross_core_and_the_store_is_not() {
+fn pool_is_cross_core_and_the_source_contract_is_shareable() {
     assert_impl_all!(Bpm: Send, Sync);
     assert_impl_all!(cascade_bpm::PageGuard: Send, Sync);
     assert_impl_all!(cascade_bpm::PageGuardMut: Send, Sync);
     assert_impl_all!(PerDbAccounting: Send, Sync);
-    assert_not_impl_any!(CoreStorage: Send, Sync);
+    assert_impl_all!(MemPageStore<MemLogStore>: Send, Sync);
+    // The contract's dyn form exists — the pool takes `&impl PageSource`
+    // per call, but a caller may hold the object behind an Arc.
+    let rig = Rig::with_frames(2);
+    let dyn_source: Arc<dyn PageSource> = Arc::clone(&rig.pages) as Arc<dyn PageSource>;
+    assert_impl_all!(CountingSource: Send, Sync);
+    drop(dyn_source);
 }
 
-// --- T1.9: pin/unpin basics, now through the per-call store ------------------
+// --- T1.9: pin/unpin basics ---------------------------------------------------
 
 #[test]
 fn miss_reads_then_hit_pins() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(0);
-        // Miss: fresh page reads as zeroes, exactly one frame used.
-        {
-            let guard = t.bpm.page(&t.store, page).await.expect("miss loads the page");
-            assert_eq!(t.bpm.frames_in_use(), 1);
-            assert!(guard.iter().all(|&b| b == 0), "fresh page is zeroes");
-            assert_eq!(t.bpm.pin_count(&page), 1);
-        }
-        // The writer guard (the cross-core pool splits reader and writer
-        // entry points).
-        {
-            let mut guard = t
-                .bpm
-                .page_exclusive(&t.store, page)
-                .await
-                .expect("writer pin");
-            guard.write(|p| p[10] = 0xAB);
-        }
-        assert_eq!(t.bpm.pin_count(&page), 0, "guard drop unpins");
-        assert_eq!(t.bpm.is_dirty(&page), Some(true), "write marked dirty");
+    let t = Rig::with_frames(4);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
+    // Miss: fresh page reads as zeroes, exactly one frame used.
+    {
+        let guard = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page))
+            .expect("miss loads the page");
+        assert_eq!(t.bpm.frames_in_use(), 1);
+        assert!(guard.iter().all(|&b| b == 0), "fresh page is zeroes");
+        assert_eq!(t.bpm.pin_count(&page), 1);
+    }
+    // The writer guard applies a logged change (the M8 apply path: the
+    // stamp is the page's LSN; the same bytes went to the log first —
+    // the caller's half of the mini-transaction rule).
+    {
+        let mut guard = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+            .expect("writer pin");
+        guard.write_logged(Lsn(40), |p| p[10] = 0xAB);
+    }
+    assert_eq!(t.bpm.pin_count(&page), 0, "guard drop unpins");
+    assert_eq!(t.bpm.is_dirty(&page), Some(true), "write marked the page");
+    assert_eq!(t.bpm.page_lsn(&page), Some(Some(Lsn(40))), "the stamp is the page's LSN");
 
-        // Hit: same frame, no second load, mutation visible in memory
-        // (writeback is explicit).
-        {
-            let g1 = t.bpm.page(&t.store, page).await.expect("hit");
-            let _g2 = t.bpm.page(&t.store, page).await.expect("hit again");
-            assert_eq!(t.bpm.frames_in_use(), 1, "no duplicate frame");
-            assert_eq!(t.bpm.pin_count(&page), 2);
-            assert_eq!(g1[10], 0xAB, "earlier write visible through the hit");
-        }
-        assert_eq!(t.bpm.pin_count(&page), 0);
-    });
+    // Hit: same frame, no second load, applied change visible in memory
+    // (nothing here ever writes back — the page store has its own copy
+    // from the log).
+    {
+        let g1 = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("hit");
+        let _g2 = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("hit again");
+        assert_eq!(t.bpm.frames_in_use(), 1, "no duplicate frame");
+        assert_eq!(t.bpm.pin_count(&page), 2);
+        assert_eq!(g1[10], 0xAB, "earlier apply visible through the hit");
+    }
+    assert_eq!(t.bpm.pin_count(&page), 0);
 }
 
 /// The exclusive pin: a writer guard refuses a second writer AND any
@@ -331,193 +282,178 @@ fn miss_reads_then_hit_pins() {
 /// refuse a writer. Shared pins coexist freely.
 #[test]
 fn exclusive_writer_refuses_readers_and_writers() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(3);
-        let mut writer = t
-            .bpm
-            .page_exclusive(&t.store, page)
-            .await
-            .expect("first writer");
-        writer.write(|p| p[4] = 0x44);
+    let t = Rig::with_frames(4);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(3);
+    let mut writer = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+        .expect("first writer");
+    writer.write_logged(Lsn(5), |p| p[4] = 0x44);
 
-        match t.bpm.page(&t.store, page).await {
-            Err(BpmError::Contended(p)) => assert_eq!(p, page),
-            Ok(_) => panic!("reader must refuse while the writer holds EXCL"),
-            Err(other) => panic!("expected Contended, got {other:?}"),
-        }
-        match t.bpm.page_exclusive(&t.store, page).await {
-            Err(BpmError::Contended(p)) => assert_eq!(p, page),
-            Ok(_) => panic!("second writer must refuse"),
-            Err(other) => panic!("expected Contended, got {other:?}"),
-        }
+    match block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)) {
+        Err(BpmError::Contended(p)) => assert_eq!(p, page),
+        Ok(_) => panic!("reader must refuse while the writer holds EXCL"),
+        Err(other) => panic!("expected Contended, got {other:?}"),
+    }
+    match block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page)) {
+        Err(BpmError::Contended(p)) => assert_eq!(p, page),
+        Ok(_) => panic!("second writer must refuse"),
+        Err(other) => panic!("expected Contended, got {other:?}"),
+    }
 
-        drop(writer);
-        let r1 = t.bpm.page(&t.store, page).await.expect("reader 1");
-        let r2 = t.bpm.page(&t.store, page).await.expect("reader 2");
-        assert_eq!(t.bpm.pin_count(&page), 2, "readers share the frame");
-        match t.bpm.page_exclusive(&t.store, page).await {
-            Err(BpmError::Contended(_)) => {}
-            Ok(_) => panic!("writer must refuse while readers hold the frame"),
-            Err(other) => panic!("expected Contended, got {other:?}"),
-        }
-        drop((r1, r2));
-        let _w2 = t
-            .bpm
-            .page_exclusive(&t.store, page)
-            .await
-            .expect("writer after readers");
-    });
+    drop(writer);
+    let r1 = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("reader 1");
+    let r2 = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("reader 2");
+    assert_eq!(t.bpm.pin_count(&page), 2, "readers share the frame");
+    match block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page)) {
+        Err(BpmError::Contended(_)) => {}
+        Ok(_) => panic!("writer must refuse while readers hold the frame"),
+        Err(other) => panic!("expected Contended, got {other:?}"),
+    }
+    drop((r1, r2));
+    let _w2 = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
+        .expect("writer after readers");
 }
 
 #[test]
 fn panic_while_pinned_releases_the_pin() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(1);
-        let guard = t.bpm.page(&t.store, page).await.expect("pinned");
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _last_use = guard; // moved in: dropped by the unwind
-            panic!("planted");
-        }));
-        assert!(outcome.is_err());
-        assert_eq!(
-            t.bpm.pin_count(&page),
-            0,
-            "the unwind dropped the guard → pin released"
-        );
-        assert_eq!(t.bpm.accounting().pinned(DatabaseId(7)), 0);
-    });
+    let t = Rig::with_frames(4);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(1);
+    let guard = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("pinned");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _last_use = guard; // moved in: dropped by the unwind
+        panic!("planted");
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(
+        t.bpm.pin_count(&page),
+        0,
+        "the unwind dropped the guard → pin released"
+    );
+    assert_eq!(t.bpm.accounting().pinned(DB), 0);
 }
 
 #[test]
 fn racing_lookups_from_one_reactor_share_one_frame() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(2);
-        let (a, b) =
-            futures_lite::future::zip(t.bpm.page(&t.store, page), t.bpm.page(&t.store, page))
-                .await;
-        let a = a.expect("first loader");
-        let b = b.expect("second loader");
-        assert_eq!(
-            t.bpm.frames_in_use(),
-            1,
-            "both miss → the page is inserted exactly once, both pin it"
-        );
-        assert_eq!(t.bpm.pin_count(&page), 2);
-        drop((a, b));
-        assert_eq!(t.bpm.pin_count(&page), 0);
-    });
+    let t = Rig::with_frames(4);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(2);
+    let (a, b) = block_on(futures_lite::future::zip(
+        t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page),
+        t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page),
+    ));
+    let a = a.expect("first loader");
+    let b = b.expect("second loader");
+    assert_eq!(
+        t.bpm.frames_in_use(),
+        1,
+        "both miss → the page is inserted exactly once, both pin it"
+    );
+    assert_eq!(t.bpm.pin_count(&page), 2);
+    drop((a, b));
+    assert_eq!(t.bpm.pin_count(&page), 0);
 }
 
 /// Pool full with every frame PINNED refuses — the greedy eviction may
-/// only take unpinned victims. Releasing the pin lets the next miss evict
+/// only take unpinned victims. Releasing the pin lets the next miss drop
 /// the clean victim instead of refusing.
 #[test]
 fn pinned_frame_refuses_but_released_frame_evicts() {
-    let t = Pool::with_frames(1);
-    reactor_named("bpm-test").run(async {
-        let _held = t.bpm.page(&t.store, t.page(0)).await.expect("first page fits");
-        match t.bpm.page(&t.store, t.page(1)).await {
-            Err(BpmError::PoolFull { max_frames }) => assert_eq!(max_frames, 1),
-            Ok(_) => panic!("expected PoolFull, got a pinned page"),
-            Err(other) => panic!("expected PoolFull, got {other:?}"),
-        }
-        drop(_held);
-        // The clean unpinned victim is now evictable — the second page
-        // fits, reusing the frame.
-        let second = t.bpm.page(&t.store, t.page(1)).await.expect("evicts the victim");
-        assert_eq!(t.bpm.frames_in_use(), 1, "the frame was reused");
-        assert_eq!(t.bpm.is_dirty(&t.page(0)), None, "victim unmapped");
-        drop(second);
-    });
+    let t = Rig::with_frames(1);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let _held = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(0)))
+        .expect("first page fits");
+    match block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1))) {
+        Err(BpmError::PoolFull { max_frames }) => assert_eq!(max_frames, 1),
+        Ok(_) => panic!("expected PoolFull, got a pinned page"),
+        Err(other) => panic!("expected PoolFull, got {other:?}"),
+    }
+    drop(_held);
+    // The clean unpinned victim is now droppable — the second page fits,
+    // reusing the frame.
+    let second = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1)))
+        .expect("drops the victim");
+    assert_eq!(t.bpm.frames_in_use(), 1, "the frame was reused");
+    assert_eq!(t.bpm.page_lsn(&t.page(0)), None, "victim unmapped");
+    drop(second);
 }
 
 #[test]
 fn accounting_follows_pins_not_frames() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let db = DatabaseId(7);
-        let a = t.bpm.page(&t.store, t.page(0)).await.expect("pin a");
-        let b = t.bpm.page(&t.store, t.page(1)).await.expect("pin b");
-        assert_eq!(t.bpm.accounting().pinned(db), 2);
-        drop(a);
-        assert_eq!(t.bpm.accounting().pinned(db), 1);
-        drop(b);
-        assert_eq!(t.bpm.accounting().pinned(db), 0);
-    });
+    let t = Rig::with_frames(4);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let a = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(0))).expect("pin a");
+    let b = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1))).expect("pin b");
+    assert_eq!(t.bpm.accounting().pinned(DB), 2);
+    drop(a);
+    assert_eq!(t.bpm.accounting().pinned(DB), 1);
+    drop(b);
+    assert_eq!(t.bpm.accounting().pinned(DB), 0);
 }
 
 #[test]
 fn pages_are_page_sized() {
-    let t = Pool::with_frames(2);
-    reactor_named("bpm-test").run(async {
-        let guard = t.bpm.page(&t.store, t.page(0)).await.expect("loaded");
-        assert_eq!(guard.len(), PAGE_SIZE);
-    });
+    let t = Rig::with_frames(2);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let guard = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(0)))
+        .expect("loaded");
+    assert_eq!(guard.len(), PAGE_SIZE);
 }
 
 // --- T6.2: cross-core sharing -------------------------------------------------
 
 /// THE T6.2 core test: four reactors on four threads share one pool and
-/// load the same page at once. Exactly one disk read (double-install
-/// detector), exactly one frame, every guard sees the same bytes.
+/// load the same page at once. The source sees 1..=REACTORS reads (each
+/// miss reads outside every lock — §8.1's no-I/O-under-locks rule) but
+/// the INSTALL is exactly once: one frame, ever, every guard seeing the
+/// same bytes.
 #[test]
 fn double_install_from_many_reactors_is_exactly_once() {
-    let dir = temp_dir();
-    let bpm = Bpm::arced(
-        BpmConfig {
-            max_frames: 8,
-            cores_on_numa: 4,
-            numa: None,
-        },
-        PerDbAccounting::default(),
-    );
+    let t = Rig::build(8, None);
+    let counting = Arc::new(CountingSource::new(Arc::clone(&t.pages)));
     const REACTORS: usize = 4;
     let barrier = Arc::new(Barrier::new(REACTORS));
-    let total_reads = Arc::new(Mutex::new(Vec::<Arc<AtomicU32>>::new()));
-    let page = page_id(0);
+    let page = t.page(0);
 
     let mut handles = Vec::new();
-    for core in 0..REACTORS {
-        let bpm = Arc::clone(&bpm);
+    for _core in 0..REACTORS {
+        let bpm = Arc::clone(&t.bpm);
+        let counting = Arc::clone(&counting);
         let barrier = Arc::clone(&barrier);
-        let dir = dir.clone();
-        let total_reads = Arc::clone(&total_reads);
-        handles.push(spawn_reactor("bpm-xcore", core, dir, bpm, move |store, bpm| async move {
-            let counting = CountingStore::new(store);
-            total_reads.lock().unwrap().push(Arc::clone(&counting.reads));
-            barrier.wait();
-            let guard = bpm.page(&counting, page).await.expect("cross-core load");
-            assert!(guard.iter().all(|&b| b == 0), "fresh page is zeroes");
-            // Hold until everyone has loaded, so the pin race window is
-            // fully exercised before any unpins.
-            barrier.wait();
-            drop(guard);
-        }));
+        let h = std::thread::Builder::new()
+            .name("bpm-xcore".into())
+            .spawn(move || {
+                let span = cascade_telemetry::Span::noop();
+                let ctx = test_ctx(&span, 7);
+                barrier.wait();
+                let guard =
+                    block_on(bpm.page(counting.as_ref(), &ctx, SCOPE, page))
+                        .expect("cross-core load");
+                assert!(guard.iter().all(|&b| b == 0), "fresh page is zeroes");
+                // Hold until everyone has loaded, so the pin race window is
+                // fully exercised before any unpins.
+                barrier.wait();
+                drop(guard);
+            })
+            .expect("reactor thread spawns");
+        handles.push(h);
     }
     for h in handles {
         h.join().expect("reactor joined cleanly");
     }
-    let reads: u32 = total_reads
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|c| c.load(Ordering::Relaxed))
-        .sum();
-    // The INSTALL is exactly once — one frame, ever. The disk READ is not
-    // deduplicated by design: each miss reads outside every lock (§8.1's
-    // no-I/O-under-locks rule), so concurrent same-page misses may each
-    // read before the winner publishes; the re-check only stops a second
-    // install. 1..=REACTORS reads, one frame.
+    let reads = counting.reads.load(Ordering::Relaxed);
     assert!(
         (1..=REACTORS as u32).contains(&reads),
-        "expected 1..={REACTORS} disk reads, got {reads}"
+        "expected 1..={REACTORS} source reads, got {reads}"
     );
-    assert_eq!(bpm.frames_in_use(), 1, "one frame, not four");
-    assert_eq!(bpm.pin_count(&page), 0);
-    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(t.bpm.frames_in_use(), 1, "one frame, not four");
+    assert_eq!(t.bpm.pin_count(&page), 0);
 }
 
 /// Guards are `'static` and `Send`: a pin taken on one reactor can be
@@ -525,627 +461,239 @@ fn double_install_from_many_reactors_is_exactly_once() {
 /// and the freed frame serves a load from yet another reactor.
 #[test]
 fn guards_move_across_reactors() {
-    let dir = temp_dir();
-    let bpm = Bpm::arced(
-        BpmConfig {
-            max_frames: 4,
-            cores_on_numa: 2,
-            numa: None,
-        },
-        PerDbAccounting::default(),
-    );
-    let page = page_id(5);
+    let t = Rig::with_frames(4);
+    let page = t.page(5);
     {
-        let bpm = Arc::clone(&bpm);
-        let ex = reactor_named("bpm-main");
-        ex.run(async {
-            let guard = bpm.page(&CoreStorage::new(0, dir.clone()), page).await.expect("pin");
-            // Hand the guard to another thread while pinned.
-            let (tx, rx) = std::sync::mpsc::channel();
-            let handle = std::thread::spawn(move || {
-                let ex = reactor_named("bpm-drop");
-                ex.run(async move {
-                    let guard: cascade_bpm::PageGuard = rx.recv().expect("guard arrives");
-                    assert_eq!(guard[0], 0);
-                    drop(guard); // unpins on THIS reactor
-                });
-            });
-            tx.send(guard).expect("guard crosses threads");
-            handle.join().expect("dropping thread joins");
-            assert_eq!(bpm.pin_count(&page), 0, "cross-thread unpin worked");
+        let bpm = Arc::clone(&t.bpm);
+        let pages = Arc::clone(&t.pages);
+        let span = cascade_telemetry::Span::noop();
+        let ctx = test_ctx(&span, 7);
+        let guard = block_on(bpm.page(pages.as_ref(), &ctx, SCOPE, page)).expect("pin");
+        // Hand the guard to another thread while pinned.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let guard: cascade_bpm::PageGuard = rx.recv().expect("guard arrives");
+            assert_eq!(guard[0], 0);
+            drop(guard); // unpins on THIS thread
         });
+        tx.send(guard).expect("guard crosses threads");
+        handle.join().expect("dropping thread joins");
+        assert_eq!(bpm.pin_count(&page), 0, "cross-thread unpin worked");
     }
-    // A third reactor loads it (the frame is still resident — hit path).
-    let h = spawn_reactor("bpm-third", 2, dir.clone(), Arc::clone(&bpm), move |store, bpm| async move {
-        let g = bpm.page(&store, page).await.expect("hit from another reactor");
-        assert_eq!(g.len(), PAGE_SIZE);
-    });
+    // Another reactor loads it (the frame is still resident — hit path).
+    let bpm = Arc::clone(&t.bpm);
+    let pages = Arc::clone(&t.pages);
+    let h = std::thread::Builder::new()
+        .name("bpm-third".into())
+        .spawn(move || {
+            let span = cascade_telemetry::Span::noop();
+            let ctx = test_ctx(&span, 7);
+            let g = block_on(bpm.page(pages.as_ref(), &ctx, SCOPE, page))
+                .expect("hit from another reactor");
+            assert_eq!(g.len(), PAGE_SIZE);
+        })
+        .expect("third reactor spawns");
     h.join().expect("third reactor joins");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write-vs-flush race, cross-core, with a CRC-validated read-back: a
-/// writer hammers one page through exclusive guards while a flusher
-/// flushes it continuously from another reactor. The store's CRC makes
-/// any torn or interleaved image fail the final read-back; the final
-/// image must carry the writer's last generation.
+// --- storage M8: the cache rules ----------------------------------------------
+
+/// The miss path reads at the scope's durable LSN (§4.5, §12.5): the
+/// pool asks its DurableLsn view and hands that exact number to the
+/// source. (The view mirrors the log's durable prefix, so the test seeds
+/// a real group and raises the view to its boundary — the fake refuses a
+/// request past what the log has made durable, which is promise 2.)
 #[test]
-fn write_vs_flush_race_stress_keeps_images_coherent() {
-    let dir = temp_dir();
-    let bpm = Bpm::arced(
-        BpmConfig {
-            max_frames: 4,
-            cores_on_numa: 2,
-            numa: None,
-        },
-        PerDbAccounting::default(),
+fn miss_reads_at_the_scopes_durable_lsn() {
+    let t = Rig::with_frames(4);
+    let stamp = t.seed(9, &[0x07]);
+    t.durable_to(stamp);
+    let counting = CountingSource::new(Arc::clone(&t.pages));
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(9);
+    let _guard = block_on(t.bpm.page(&counting, &ctx, SCOPE, page)).expect("load");
+    let ats = counting.at_lsns.lock().unwrap().clone();
+    assert_eq!(
+        ats,
+        vec![stamp],
+        "the miss fetched the page exactly as of the durable LSN"
     );
-    bpm.set_gate(Arc::new(FakeGate {
-        durable: AtomicU64::new(u64::MAX), // everything covered: flushes run at full speed
-        waits: AtomicU32::new(0),
-        fail: false,
-    }));
-    let page = page_id(1);
-    const ITERS: u32 = 300;
-
-    let writer = {
-        let bpm = Arc::clone(&bpm);
-        let dir = dir.clone();
-        spawn_reactor("bpm-writer", 0, dir, bpm, move |store, bpm| async move {
-            for i in 0..ITERS {
-                let mut g = bpm
-                    .page_exclusive(&store, page)
-                    .await
-                    .expect("writer pin");
-                g.write_logged(Lsn(u64::from(i) + 1), |p| {
-                    // Marker ≥ 4: bytes 0..4 are the store's CRC slot.
-                    p[4..8].copy_from_slice(&i.to_le_bytes());
-                    p[8] = 0xA5;
-                });
-                drop(g);
-            }
-        })
-    };
-    let flusher = {
-        let bpm = Arc::clone(&bpm);
-        let dir = dir.clone();
-        spawn_reactor("bpm-flusher", 1, dir, bpm, move |store, bpm| async move {
-            for _ in 0..(ITERS * 2) {
-                // Refusals (ticket held / generation moved) are protocol,
-                // not failure.
-                bpm.flush_page(&store, page).await.expect("flush protocol");
-                glommio::timer::sleep(Duration::from_micros(200)).await;
-            }
-        })
-    };
-    writer.join().expect("writer joins");
-    flusher.join().expect("flusher joins");
-
-    // Final flush from the main reactor, then a CRC-validated read-back:
-    // the store must hold the last generation, never a torn hybrid. The
-    // flusher's late flushes may have already written and cleared the
-    // final generation — `Ok(false)` then means "nothing left to do".
-    let ex = reactor_named("bpm-verify");
-    ex.run(async {
-        let store = CoreStorage::new(9, dir.clone());
-        let _ = bpm.flush_page(&store, page).await.expect("final flush");
-        let on_disk = store.read_page(page).await.expect("CRC-validated read");
-        assert_eq!(on_disk.as_slice()[8], 0xA5, "marker present");
-        let counter = u32::from_le_bytes(
-            on_disk.as_slice()[4..8].try_into().expect("counter bytes"),
-        );
-        assert_eq!(counter, ITERS - 1, "the final generation survived the race");
-    });
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Gate waits under concurrency: the flusher parks on the gate while a
-/// SECOND reactor re-modifies the page — the flush must extend its wait
-/// and land the newer image (the cross-reactor form of the single-reactor
-/// re-modification case).
+/// A seeded page loads with the store's image and the image's own page
+/// LSN (S17) — not the read point.
 #[test]
-fn gate_wait_under_cross_reactor_concurrency() {
-    let dir = temp_dir();
-    let bpm = Bpm::arced(
-        BpmConfig {
-            max_frames: 4,
-            cores_on_numa: 2,
-            numa: None,
-        },
-        PerDbAccounting::default(),
+fn loaded_page_serves_the_store_image_and_page_lsn() {
+    let t = Rig::with_frames(4);
+    let stamp = t.seed(0, &[0xA5, 0x5A]);
+    t.durable_to(stamp);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
+    let guard = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("load");
+    assert_eq!(guard[0], 0xA5, "the toy apply writes content at offset 0");
+    assert_eq!(guard[1], 0x5A);
+    drop(guard);
+    assert_eq!(
+        t.bpm.page_lsn(&page),
+        Some(Some(stamp)),
+        "the frame remembers the image's page LSN, not the read point"
     );
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    let page = page_id(2);
+}
 
-    // Stamp e1 on the main reactor.
+/// §12.5's rule, pinned: a page whose stamp is above the durable LSN is
+/// never evicted — not by name, not by the ladder. When durability
+/// covers the stamp, the same page drops and the miss proceeds. The
+/// undurable window is the honest pool pressure (§12.5's open question).
+#[test]
+fn never_evicts_above_the_durable_lsn() {
+    let t = Rig::with_frames(1);
+    let stamp = t.seed(0, &[0x01]);
+    let group_end = *t.next_lsn.lock().unwrap();
+    t.durable_to(stamp);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let victim = t.page(0);
     {
-        let bpm = Arc::clone(&bpm);
-        let dir = dir.clone();
-        let ex = reactor_named("bpm-stamper");
-        ex.run(async {
-            let store = CoreStorage::new(0, dir);
-            let mut g = bpm.page_exclusive(&store, page).await.expect("load");
-            g.write_logged(Lsn(100), |p| p[5] = 0x55);
-        });
+        let mut g = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, victim))
+            .expect("load victim");
+        // The apply-ahead-of-durability fiction: a group applied to the
+        // cached page whose log bytes the durable LSN has not covered
+        // yet (group_end = the boundary being reserved in the log).
+        g.write_logged(Lsn(group_end), |p| p[6] = 0x66);
     }
+    assert!(
+        !t.bpm.evict_page(victim).expect("no error — a refusal"),
+        "above the durable LSN: eviction refuses"
+    );
+    assert_eq!(t.bpm.frames_in_use(), 1, "still resident");
+    // The ladder refuses too: a full pool with this one undurable frame
+    // cannot serve the miss.
+    match block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1))) {
+        Err(BpmError::PoolFull { max_frames }) => assert_eq!(max_frames, 1),
+        Ok(_) => panic!("the undurable victim must not be dropped"),
+        Err(other) => panic!("expected PoolFull, got {other:?}"),
+    }
+    // Durability covers the stamp; now the same page drops with no write
+    // (there is no write path at all), and the miss proceeds.
+    t.durable_to(Lsn(group_end));
+    let second = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1)))
+        .expect("the miss succeeds once the durable LSN covers the victim");
+    assert_eq!(t.bpm.frames_in_use(), 1, "victim dropped, newcomer loaded");
+    assert_eq!(t.bpm.page_lsn(&victim), None, "victim gone");
+    drop(second);
+}
 
-    let flusher = {
-        let bpm = Arc::clone(&bpm);
-        let dir = dir.clone();
-        spawn_reactor("bpm-flusher", 1, dir, bpm, move |store, bpm| async move {
-            let wrote = bpm.flush_page(&store, page).await.expect("flush");
-            assert!(wrote, "the flush lands once durability catches up");
-        })
-    };
-    // While the flusher is parked on e1, re-modify from a third reactor
-    // under e2.
-    let rewriter = {
-        let bpm = Arc::clone(&bpm);
-        let gate = Arc::clone(&gate);
-        let dir = dir.clone();
-        spawn_reactor("bpm-rewriter", 2, dir, bpm, move |store, bpm| async move {
-            // Let the flusher reach the gate first.
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            assert!(
-                gate.waits.load(Ordering::Relaxed) >= 1,
-                "flusher is parked in the gate"
-            );
-            let mut g = bpm.page_exclusive(&store, page).await.expect("re-open");
-            g.write_logged(Lsn(200), |p| p[6] = 0x66);
-            drop(g);
-            // Durability reaches e1 (not enough for the moved stamp), then e2.
-            gate.durable.store(100, Ordering::Relaxed);
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            assert_eq!(
-                bpm.is_dirty(&page),
-                Some(true),
-                "the extended wait keeps the page dirty"
-            );
-            gate.durable.store(200, Ordering::Relaxed);
-        })
-    };
-    // Hang forensics: this is the test the eternal hang concentrates in,
-    // so it carries an inspector that publishes the gate's live state
-    // every 2 s. On a healthy run the test ends before the first line
-    // ever prints; on a hang the series names who stopped advancing —
-    // durable moving = the rewriter is alive, waits incrementing = the
-    // flusher is still cycling through the gate, dirty state = flush
-    // progress.
-    let stop = Arc::new(AtomicBool::new(false));
+/// Dropping a durable-covered page loses nothing: the store serves the
+/// same image again on the next miss (§12.5's invariant).
+#[test]
+fn evict_below_durable_drops_and_the_store_serves_it_again() {
+    let t = Rig::with_frames(2);
+    let stamp = t.seed(0, &[0x42]);
+    t.durable_to(stamp);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
     {
-        let gw_gate = Arc::clone(&gate);
-        let gw_bpm = Arc::clone(&bpm);
-        let gw_stop = Arc::clone(&stop);
-        let ins_page = page;
-        std::thread::spawn(move || {
-            let mut ticks = 0u32;
-            while !gw_stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(100));
-                ticks += 1;
-                if ticks % 20 == 0 {
-                    eprintln!(
-                        "[gate-inspector] durable={} waits={} dirty={:?}",
-                        gw_gate.durable.load(Ordering::Relaxed),
-                        gw_gate.waits.load(Ordering::Relaxed),
-                        gw_bpm.is_dirty(&ins_page)
-                    );
-                }
-            }
-        });
+        let g = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page)).expect("load");
+        assert_eq!(g[0], 0x42);
     }
-    flusher.join().expect("flusher joins");
-    rewriter.join().expect("rewriter joins");
-    stop.store(true, Ordering::Relaxed);
-
-    let ex = reactor_named("bpm-verify");
-    ex.run(async {
-        let store = CoreStorage::new(9, dir.clone());
-        let on_disk = store.read_page(page).await.expect("CRC-validated read");
-        assert_eq!(on_disk.as_slice()[6], 0x66, "the NEWER image is what landed");
-    });
-    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        t.bpm.evict_page(page).expect("durable-covered page evicts"),
+        "dropped"
+    );
+    assert_eq!(t.bpm.frames_in_use(), 0, "frame reclaimed");
+    let again = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, page))
+        .expect("re-load after the drop");
+    assert_eq!(again[0], 0x42, "the store served the same image again");
+    assert_eq!(
+        t.bpm.page_lsn(&page),
+        Some(Some(stamp)),
+        "and the same page LSN with it"
+    );
 }
 
-// --- T3.2: the WAL-before-data writeback gate (adapted) -----------------------
-
-/// Controllable fake gate: the test moves `durable` forward by hand; waits
-/// poll on a 1 ms tick until coverage (or fail immediately when `fail`).
-/// `waits` counts gate entries — the blocked-flush assertions read it.
-/// `AtomicU64` because gates are `Send + Sync` now (shared across
-/// reactors).
-struct FakeGate {
-    durable: AtomicU64,
-    waits: AtomicU32,
-    fail: bool,
-}
-
-impl WalDurability for FakeGate {
-    fn durable_lsn(&self) -> Lsn {
-        Lsn(self.durable.load(Ordering::Relaxed))
-    }
-
-    fn wait_durable(
-        &self,
-        lsn: Lsn,
-    ) -> Pin<Box<dyn Future<Output = Result<(), BpmError>> + '_>> {
-        self.waits.fetch_add(1, Ordering::Relaxed);
-        if self.fail {
-            return Box::pin(async { Err(BpmError::WalGate("planted gate failure".into())) });
-        }
-        Box::pin(async move {
-            while self.durable.load(Ordering::Relaxed) < lsn.0 {
-                glommio::timer::sleep(Duration::from_millis(1)).await;
-            }
-            Ok(())
-        })
-    }
-}
-
-/// The plan's planted case: a dirty page stamped with an undurable WAL
-/// boundary must block writeback — not write, not lie — until durability
-/// advances past it, and only then reach the store and clear dirty.
-/// The flush runs concurrently with the probe via `zip` on this one
-/// reactor (the flush parks inside the gate; the probe pokes it).
+/// Unlogged changes (plain `write`, no stamp) are never evictable in v1:
+/// the log cannot rebuild them, so an eviction would lose the image
+/// outright. The ladder skips such a frame — pool pressure, honestly.
 #[test]
-fn writeback_blocks_until_the_gate_reports_durability() {
-    let t = Pool::with_frames(4);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(0);
-        let end = Lsn(100);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, page)
-                .await
-                .expect("load");
-            g.write_logged(end, |p| p[5] = 0x5A);
-        }
-        assert_eq!(t.bpm.page_lsn(&page), Some(Some(end)));
-
-        let probe = async {
-            // While the gate is closed: parked (at least one gate entry),
-            // still dirty, and nothing on disk.
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            assert!(gate.waits.load(Ordering::Relaxed) >= 1, "flusher entered the gate");
-            assert_eq!(t.bpm.is_dirty(&page), Some(true), "blocked page stays dirty");
-            let on_disk = t.store.read_page(page).await.expect("disk read");
-            assert!(
-                on_disk.as_slice().iter().all(|&b| b == 0),
-                "nothing may reach the store ahead of its WAL"
-            );
-            // Durability advances past the stamp; the same flush completes.
-            gate.durable.store(end.0, Ordering::Relaxed);
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-        };
-        let ((), wrote) = futures_lite::future::zip(probe, t.bpm.flush_page(&t.store, page)).await;
-        assert!(wrote.expect("flush succeeds"), "the page was written");
-        assert_eq!(t.bpm.is_dirty(&page), Some(false), "written page clears dirty");
-        let on_disk = t.store.read_page(page).await.expect("disk read");
-        assert_eq!(on_disk.as_slice()[5], 0x5A, "the gated image is on disk");
-    });
-}
-
-/// Fault injection at the gate: a gate that fails leaves the page dirty
-/// and the store untouched — writeback refused, not half-done.
-#[test]
-fn writeback_refused_when_the_gate_fails() {
-    let t = Pool::with_frames(4);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: true,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(1);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, page)
-                .await
-                .expect("load");
-            g.write_logged(Lsn(50), |p| p[3] = 0x33);
-        }
-        match t.bpm.flush_page(&t.store, page).await {
-            Err(BpmError::WalGate(_)) => {}
-            other => panic!("expected a gate refusal, got {other:?}"),
-        }
-        assert_eq!(t.bpm.is_dirty(&page), Some(true), "refused page stays dirty");
-        let on_disk = t.store.read_page(page).await.expect("disk read");
-        assert!(on_disk.as_slice().iter().all(|&b| b == 0), "nothing reached the store");
-    });
-}
-
-/// A page carrying a WAL boundary but no attached gate must refuse
-/// writeback outright — an ungated write of a logged page is the exact
-/// violation WAL-before-data exists to prevent. Silent success here would
-/// be the bug.
-#[test]
-fn stamped_page_without_a_gate_refuses_writeback() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(2);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, page)
-                .await
-                .expect("load");
-            g.write_logged(Lsn(7), |p| p[1] = 0x11);
-        }
-        match t.bpm.flush_page(&t.store, page).await {
-            Err(BpmError::WalGate(msg)) => {
-                assert!(msg.contains("no durability gate"), "message names the problem: {msg}");
-            }
-            other => panic!("expected the gate-less refusal, got {other:?}"),
-        }
-        assert_eq!(t.bpm.is_dirty(&page), Some(true));
-    });
-}
-
-/// An unlogged dirty page (plain `write`, no stamp) is unlogged by
-/// construction — the caller's contract, like PG's unlogged tables — and
-/// writes ungated, no gate attached at all.
-#[test]
-fn unlogged_dirty_page_writes_ungated() {
-    let t = Pool::with_frames(4);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(3);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, page)
-                .await
-                .expect("load");
-            g.write(|p| p[9] = 0x99);
-        }
-        assert_eq!(t.bpm.page_lsn(&page), Some(None), "plain write stamps nothing");
-        let wrote = t.bpm.flush_page(&t.store, page).await.expect("ungated write succeeds");
-        assert!(wrote);
-        assert_eq!(t.bpm.is_dirty(&page), Some(false));
-        let on_disk = t.store.read_page(page).await.expect("disk read");
-        assert_eq!(on_disk.as_slice()[9], 0x99);
-    });
-}
-
-/// The subtlest path: the page is re-modified while the gate wait is
-/// parked — its stamp moves past the boundary that just became durable —
-/// so the flush must extend its wait and write the NEWER image, then
-/// clear dirty. Clearing dirty on the stale pass would lose the
-/// re-modification on the next eviction.
-#[test]
-fn re_modification_during_the_gate_wait_extends_the_wait() {
-    let t = Pool::with_frames(4);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(0);
-        let e1 = Lsn(100);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, page)
-                .await
-                .expect("load");
-            g.write_logged(e1, |p| p[5] = 0x55);
-        }
-
-        let probe = async {
-            // The flush parks on e1; re-modify under it (the flush holds
-            // no pin — that is the point of the post-await re-checks).
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            let e2 = Lsn(200);
-            {
-                let mut g = t
-                    .bpm
-                    .page_exclusive(&t.store, page)
-                    .await
-                    .expect("re-open");
-                g.write_logged(e2, |p| p[6] = 0x66);
-            }
-            // Durability reaches e1 only — not enough for the moved stamp.
-            gate.durable.store(e1.0, Ordering::Relaxed);
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            assert_eq!(
-                t.bpm.is_dirty(&page),
-                Some(true),
-                "the extended wait keeps the page dirty"
-            );
-            gate.durable.store(e2.0, Ordering::Relaxed);
-        };
-        let ((), wrote) = futures_lite::future::zip(probe, t.bpm.flush_page(&t.store, page)).await;
-        assert!(wrote.expect("flush eventually succeeds"));
-        assert_eq!(t.bpm.is_dirty(&page), Some(false), "written through the new stamp");
-        let on_disk = t.store.read_page(page).await.expect("disk read");
-        assert_eq!(on_disk.as_slice()[6], 0x66, "the newer image is what landed");
-    });
-}
-
-/// T6.2 behavior change, pinned deliberately: flushes no longer refuse
-/// PINNED pages — the coherent snapshot + write ticket make them safe,
-/// and writers must proceed during gate waits. Eviction still refuses
-/// (its claim needs the pin word at zero).
-#[test]
-fn flush_succeeds_on_a_pinned_page_but_eviction_refuses() {
-    let t = Pool::with_frames(2);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(500),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(0);
-        let mut guard = t
-            .bpm
-            .page_exclusive(&t.store, page)
-            .await
+fn unlogged_dirty_page_refuses_eviction() {
+    let t = Rig::with_frames(1);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(3);
+    {
+        let mut g = block_on(t.bpm.page_exclusive(t.pages.as_ref(), &ctx, SCOPE, page))
             .expect("load");
-        // Marker at index 6 — bytes 0..4 are the store's CRC slot.
-        guard.write_logged(Lsn(10), |p| p[6] = 0x22);
-        let wrote = t
-            .bpm
-            .flush_page(&t.store, page)
-            .await
-            .expect("flushing a pinned page is safe now");
-        assert!(wrote, "the pinned page's snapshot was written");
-        let evicted = t.bpm.evict_page(&t.store, page).await.expect("no error — a refusal");
-        assert!(!evicted, "pinned page refused eviction");
-        assert_eq!(t.bpm.frames_in_use(), 1, "still resident");
-        let on_disk = t.store.read_page(page).await.expect("disk read");
-        assert_eq!(on_disk.as_slice()[6], 0x22, "the pinned generation reached disk");
-        drop(guard);
-        assert!(
-            t.bpm.evict_page(&t.store, page).await.expect("evict after unpin"),
-            "unpinned page evicts"
-        );
-    });
+        g.write(|p| p[9] = 0x99);
+    }
+    assert_eq!(t.bpm.page_lsn(&page), Some(None), "plain write stamps nothing");
+    assert!(
+        !t.bpm.evict_page(page).expect("no error — a refusal"),
+        "unlogged changes refuse eviction"
+    );
+    assert_eq!(t.bpm.frames_in_use(), 1, "still resident");
+    // And the ladder cannot drop it either.
+    match block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(1))) {
+        Err(BpmError::PoolFull { .. }) => {}
+        Ok(_) => panic!("the unlogged victim must not be dropped"),
+        Err(other) => panic!("expected PoolFull, got {other:?}"),
+    }
 }
 
-/// Eviction routes dirty pages through the same gate (no second writeback
-/// path), and a freed frame is reusable — the pool-full refusal clears
-/// once the victim is evicted.
+/// A clean loaded page drops without touching the source — eviction is
+/// an unmap, and the M8 pool has no write path to hide behind it.
 #[test]
-fn dirty_eviction_routes_through_the_gate_and_reclaims_the_frame() {
-    let t = Pool::with_frames(1);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let victim = t.page(0);
-        let end = Lsn(80);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, victim)
-                .await
-                .expect("load victim");
-            // Marker at index 10: page-image bytes 0..4 are the on-disk CRC slot
-            // (traits.rs) — the store stamps over them, so a marker below 4
-            // never reaches the file.
-            g.write_logged(end, |p| p[10] = 0x01);
-        }
-        assert_eq!(t.bpm.frames_in_use(), 1);
-
-        let probe = async {
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            assert!(
-                gate.waits.load(Ordering::Relaxed) >= 1,
-                "eviction entered the gate — no bypass path"
-            );
-            assert_eq!(t.bpm.frames_in_use(), 1, "still resident while gated");
-            gate.durable.store(end.0, Ordering::Relaxed);
-        };
-        let ((), evicted) =
-            futures_lite::future::zip(probe, t.bpm.evict_page(&t.store, victim)).await;
-        assert!(evicted.expect("evict succeeds"), "evicted");
-        assert_eq!(t.bpm.is_dirty(&victim), None, "no longer resident");
-        assert_eq!(t.bpm.frames_in_use(), 0, "frame reclaimed");
-
-        // The freed slot serves a new load, and the evicted page reads
-        // back from the store — its gated image.
-        let reloaded = t.bpm.page(&t.store, victim).await.expect("re-load after eviction");
-        assert_eq!(t.bpm.frames_in_use(), 1, "the freed frame was reused");
-        assert_eq!(reloaded[10], 0x01, "the gated image survived eviction");
-
-        // Pool full again → refusal; evict (the reload is unlogged and
-        // unpinned, so eviction is gate-free) → a second page fits.
-        let second = t.page(1);
-        match t.bpm.page(&t.store, second).await {
-            Err(BpmError::PoolFull { max_frames }) => assert_eq!(max_frames, 1),
-            Ok(_) => panic!("expected PoolFull, got a pinned page"),
-            Err(other) => panic!("expected PoolFull, got {other:?}"),
-        }
-        drop(reloaded);
-        assert!(
-            t.bpm.evict_page(&t.store, victim).await.expect("clean eviction"),
-            "evicted"
-        );
-        let _ = t.bpm.page(&t.store, second).await.expect("fits after eviction");
-    });
+fn clean_loaded_page_evicts_without_touching_the_source() {
+    let t = Rig::with_frames(2);
+    let counting = CountingSource::new(Arc::clone(&t.pages));
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let page = t.page(0);
+    {
+        let _g = block_on(t.bpm.page(&counting, &ctx, SCOPE, page)).expect("load");
+    }
+    let reads_after_load = counting.reads.load(Ordering::Relaxed);
+    assert!(t.bpm.evict_page(page).expect("clean page evicts"));
+    assert_eq!(
+        counting.reads.load(Ordering::Relaxed),
+        reads_after_load,
+        "eviction did no I/O — it dropped, it did not write"
+    );
+    assert_eq!(t.bpm.frames_in_use(), 0);
 }
 
-/// Clean pages evict without touching the gate or the store.
+/// The ladder's last rung on a full pool: a miss drops a DURABLE-COVERED
+/// dirty victim in place — no source call, no wait — and the load
+/// completes. The caller never sees a refusal.
 #[test]
-fn clean_eviction_writes_nothing() {
-    let t = Pool::with_frames(2);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let page = t.page(0);
-        drop(t.bpm.page(&t.store, page).await.expect("load clean"));
-        assert!(t.bpm.evict_page(&t.store, page).await.expect("evicts"));
-        assert_eq!(t.bpm.frames_in_use(), 0);
-        assert_eq!(gate.waits.load(Ordering::Relaxed), 0, "the gate was never entered");
-        let on_disk = t.store.read_page(page).await.expect("disk read");
-        assert!(on_disk.as_slice().iter().all(|&b| b == 0), "a clean eviction wrote nothing");
-    });
-}
-
-/// The eviction LADDER under a full pool: a miss while the only frame
-/// holds a dirty stamped victim must evict THROUGH THE GATE — parking on
-/// the undurable boundary inside the miss itself — then complete the
-/// load. The caller never sees a refusal; the WAL-before-data invariant
-/// holds on the automatic path too.
-#[test]
-fn miss_on_full_pool_evicts_a_dirty_victim_through_the_gate() {
-    let t = Pool::with_frames(1);
-    let gate = Arc::new(FakeGate {
-        durable: AtomicU64::new(0),
-        waits: AtomicU32::new(0),
-        fail: false,
-    });
-    t.bpm.set_gate(Arc::clone(&gate) as Arc<dyn WalDurability>);
-    reactor_named("bpm-test").run(async {
-        let victim = t.page(0);
-        {
-            let mut g = t
-                .bpm
-                .page_exclusive(&t.store, victim)
-                .await
-                .expect("load victim");
-            g.write_logged(Lsn(80), |p| p[10] = 0x01);
-        }
-
-        let probe = async {
-            glommio::timer::sleep(Duration::from_millis(3)).await;
-            assert!(
-                gate.waits.load(Ordering::Relaxed) >= 1,
-                "the miss parked on the victim's gate"
-            );
-            // Open the gate; the parked eviction completes and the miss
-            // proceeds.
-            gate.durable.store(80, Ordering::Relaxed);
-        };
-        let ((), loaded) = futures_lite::future::zip(probe, t.bpm.page(&t.store, t.page(1))).await;
-        let _ = loaded.expect("the miss completes once the gate opens");
-        assert_eq!(t.bpm.frames_in_use(), 1, "victim evicted, newcomer loaded");
-        assert_eq!(t.bpm.is_dirty(&victim), None, "victim gone");
-        let on_disk = t.store.read_page(victim).await.expect("CRC-validated read");
-        assert_eq!(on_disk.as_slice()[10], 0x01, "victim's gated image survived");
-    });
+fn miss_on_full_pool_drops_a_durable_covered_victim() {
+    let t = Rig::with_frames(1);
+    let counting = CountingSource::new(Arc::clone(&t.pages));
+    let stamp = t.seed(0, &[0x01]);
+    t.durable_to(stamp);
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let victim = t.page(0);
+    {
+        let mut g = block_on(t.bpm.page_exclusive(&counting, &ctx, SCOPE, victim))
+            .expect("load victim");
+        // Logged and durable-covered (stamp == durable): dirty but
+        // droppable.
+        g.write_logged(stamp, |p| p[10] = 0x01);
+    }
+    assert_eq!(counting.reads.load(Ordering::Relaxed), 1);
+    let loaded = block_on(t.bpm.page(&counting, &ctx, SCOPE, t.page(1)))
+        .expect("the miss completes, dropping the covered victim");
+    assert_eq!(t.bpm.frames_in_use(), 1, "victim dropped, newcomer loaded");
+    assert_eq!(t.bpm.page_lsn(&victim), None, "victim gone");
+    assert_eq!(
+        counting.reads.load(Ordering::Relaxed),
+        2,
+        "exactly the newcomer's miss — the drop made no source call"
+    );
+    drop(loaded);
 }
 
 // --- placement ------------------------------------------------------------------
@@ -1154,17 +702,17 @@ fn miss_on_full_pool_evicts_a_dirty_victim_through_the_gate() {
 /// the warn-and-degrade contract (I4a), runnable on any host.
 #[test]
 fn unroutable_node_degrades_to_first_touch() {
-    let t = Pool::build(2, Some(999));
+    let t = Rig::build(2, Some(999));
     assert!(
         !t.bpm.node_bound(),
         "no kernel has node 999 — placement must be reported as best-effort"
     );
     // The degraded pool still works end to end.
-    reactor_named("bpm-test").run(async {
-        let page = t.page(0);
-        let g = t.bpm.page(&t.store, page).await.expect("degraded pool serves");
-        assert_eq!(g.len(), PAGE_SIZE);
-    });
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    let g = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(0)))
+        .expect("degraded pool serves");
+    assert_eq!(g.len(), PAGE_SIZE);
 }
 
 /// Parses `/proc/self/numa_maps`, returning the N<k> per-node page counts
@@ -1228,19 +776,20 @@ fn frames_bind_to_their_node_on_bare_metal() {
         return;
     }
     let numa = nodes[1]; // bind to a non-default node — the sharper discriminator
-    let t = Pool::build(8, Some(numa));
+    let t = Rig::build(8, Some(numa));
     assert!(t.bpm.node_bound(), "the kernel accepted the bind on bare metal");
 
-    reactor_named("bpm-test").run(async {
-        // Fault the frames: load 4 pages (every load faults its frame).
-        for i in 0..4 {
-            let g = t.bpm.page(&t.store, t.page(i)).await.expect("faults a frame");
-            assert_eq!(g.len(), PAGE_SIZE);
-        }
-        let counts = numa_maps_counts(t.bpm.ram_addr());
-        let total: u64 = counts.values().sum();
-        assert!(total > 0, "the pool mapping has no resident pages");
-        let on_node = counts.get(&numa).copied().unwrap_or(0);
-        assert_eq!(on_node, total, "pool frames span nodes: {counts:?}");
-    });
+    let span = cascade_telemetry::Span::noop();
+    let ctx = test_ctx(&span, 7);
+    // Fault the frames: load 4 pages (every load faults its frame).
+    for i in 0..4 {
+        let g = block_on(t.bpm.page(t.pages.as_ref(), &ctx, SCOPE, t.page(i)))
+            .expect("faults a frame");
+        assert_eq!(g.len(), PAGE_SIZE);
+    }
+    let counts = numa_maps_counts(t.bpm.ram_addr());
+    let total: u64 = counts.values().sum();
+    assert!(total > 0, "the pool mapping has no resident pages");
+    let on_node = counts.get(&numa).copied().unwrap_or(0);
+    assert_eq!(on_node, total, "pool frames span nodes: {counts:?}");
 }

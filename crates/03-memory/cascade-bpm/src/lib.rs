@@ -7,25 +7,25 @@
 //! The production design (§8.1) is **one BPM per NUMA, shared by all cores
 //! on that NUMA**: `Send + Sync`, a sharded page table, per-frame latching,
 //! and frames from an in-crate `mbind` mapping so a boot on the pool's node
-//! binds every page to it (I4a). The BPM owns no store: every I/O call
-//! takes `&impl PageStore` — the caller's own reactor-local store, which is
-//! what makes §8.1's "no file handle across reactors" rule structural
-//! (nothing can touch a page without naming a store, and the only stores in
-//! scope are the caller's).
+//! binds every page to it (I4a). The BPM owns no store: every read call
+//! takes `&impl PageSource` — the caller's own reactor-local handle, which
+//! is what makes §8.1's "no file handle across reactors" rule structural
+//! (nothing can touch a page without naming a source, and the only sources
+//! in scope are the caller's).
 //!
 //! Frame access is the ADR-0003 item-3 model: one `std::Mutex` per frame
-//! guards the page bytes AND the frame's metadata (page id, dirty bit,
-//! page_lsn, a modification counter), so every snapshot and every mutation
-//! is a short, bounded critical section that can never span an await (the
-//! I11 story by construction). Guards hold a **copy-out snapshot** (an owned
-//! 8 KiB `AlignedBuf`) — one memcpy per touch, accepted, PG-style page
+//! guards the page bytes AND the frame's metadata (page id, scope, dirty
+//! bit, page_lsn), so every snapshot and every mutation is a short,
+//! bounded critical section that can never span an await (the I11 story by
+//! construction). Guards hold a **copy-out snapshot** (an owned 8 KiB
+//! `AlignedBuf`) — one memcpy per touch, accepted, PG-style page
 //! granularity — so a guard is `'static`: ownable across awaits and across
 //! threads, with no borrow of the pool.
 //!
 //! Pin protocol (the v1 latch; the OLC read-write latch lands with the
 //! btree): the low 30 bits of a per-frame `AtomicU32` are the shared pin
 //! count (readers `fetch_add`), bit 31 is the exclusive/writer flag
-//! (`page_exclusive` CASes `0 → EXCL|1`), bit 30 is the CLAIM flag that
+//! (`page_exclusive` CASes `0 → 0x8000_0001`), bit 30 is the CLAIM flag that
 //! reserves a frame for a load-in-progress or an eviction. The flag words
 //! of a successful reader pin, a successful writer pin, and a claim are
 //! mutually exclusive single-word CAS states — no interleaving lets two of
@@ -37,53 +37,57 @@
 //! held — the caller owns the retry (the heap's append-vs-scan progress
 //! lives at that level, not here).
 //!
-//! ## WAL-before-data writeback (T3.2, generalized cross-core)
+//! ## The cache rules (storage M8, §12.5 — the log is the only durable
+//! write)
 //!
-//! The writeback gate is this crate's half of the single most load-bearing
-//! crash-safety invariant (wal invariant 1, FR-24): no dirty page reaches
-//! the store before the WAL covering its latest modification is durable. A
-//! logged write stamps the frame with the WAL end boundary covering it
-//! ([`PageGuardMut::write_logged`]); [`Bpm::flush_page`] waits on the
-//! [`WalDurability`] gate until that boundary is durable, and only then
-//! writes.
+//! The pool is a **read cache over `PageSource`, never a write-back**: the
+//! log is the only durable write on the commit path, and only the page
+//! store writes pages. Compute changes a cached page by *applying* its
+//! mini-transaction group to the frame
+//! ([`PageGuardMut::write_logged`], which stamps the page's LSN with the
+//! group's end boundary, S17) and appending the same bytes to the log —
+//! the page store materializes the page independently by replaying the
+//! log. Nothing here ever writes a page back, so there is no flush path,
+//! no dirty-writeback, and no checkpoint.
 //!
-//! Cross-core, the safety argument is different from the single-reactor
-//! slice, and tighter: the flusher holds **no pin**, so writers proceed
-//! freely during the gate wait (blocking them for a WAL stall would stall
-//! every session touching the page). What the protocol requires instead is
-//! (a) the snapshot and its stamp are captured under the frame mutex — a
-//! coherent generation, never a half-written image; (b) the actual store
-//! write is serialized per frame by a write ticket and **re-verified
-//! against the snapshot's generation** before it lands — so a page that
-//! was re-modified, evicted, or reloaded while the flusher sat on the gate
-//! can never have an older image clobber a newer one at the store; and
-//! (c) the dirty bit clears only if the generation is untouched since the
-//! snapshot. Every written image is one whose WAL boundary was verified
-//! durable at snapshot time; every skipped or stale write leaves the page
-//! dirty for the next pass. Eviction ([`Bpm::evict_page`], and the greedy
-//! in-miss eviction a full pool runs) claims the frame first — pins
-//! refused, so no one can mutate it — and then routes through the same
-//! gate-snapshot helper: eviction never has a second writeback path.
+//! - **The miss path reads at the scope's durable LSN** (§4.5): the pool
+//!   asks its [`DurableLsn`] view for the number and fetches the page
+//!   exactly as of it. The image's own page LSN — the end of the last
+//!   record applied (S17) — is what the frame remembers.
+//! - **A page is never evicted while its page LSN is above the durable
+//!   LSN** (§12.5): the page store may not have its changes yet. Once
+//!   durability covers the stamp, dropping the page loses nothing — the
+//!   store rebuilds it — so a durable-covered dirty page is dropped in
+//!   place, with no write.
+//! - **Unlogged changes are never evicted in v1**: a frame modified
+//!   through plain `write` (no stamp) cannot be rebuilt from the log, so
+//!   eviction would lose the image outright. Such a frame is skipped by
+//!   the eviction ladder and refused by [`Bpm::evict_page`] — the caller's
+//!   contract (like PG's unlogged tables) with eviction taking the crash
+//!   semantics' place: the cost shows up as pool pressure, the honest
+//!   backpressure §12.5 leaves as an open question.
 //!
-//! The gate is injected (`Bpm::set_gate`): the BPM never depends on the WAL
-//! crate — the runtime glues the two together. A stamped page with no gate
-//! attached refuses writeback outright; a dirty page with no stamp is
-//! unlogged by construction (the caller's contract, like PG's unlogged
-//! tables) and writes ungated.
+//! Eviction (the greedy ladder, ADR-0003 item 6) claims the frame first —
+//! pins refused, so no one can mutate it — then drops: a clean victim, or
+//! a durable-covered one. `PoolFull` only when every frame is pinned,
+//! claimed, or undurable — which is what makes "a table larger than the
+//! pool" survivable for scans, and what makes a lagging durable LSN the
+//! real pressure signal.
+//!
+//! The durable-LSN view is injected at construction: the pool never
+//! depends on the log store — the runtime glues the two together.
 
 use std::{
     collections::HashMap,
-    future::Future,
     io,
-    pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicU32, Ordering},
         Arc, Mutex, OnceLock, RwLock, Weak,
     },
 };
 
-use cascade_storage::PageStore;
-use cascade_types::{AlignedBuf, DatabaseId, Lsn, PageId, PAGE_SIZE};
+use cascade_storage_api::{DurableLsn, OpCtx, PageKey, PageSource, StoreError};
+use cascade_types::{AlignedBuf, DatabaseId, Lsn, PageId, ScopeId, PAGE_SIZE};
 
 // --- placement (ADR-0003 item 5: the frozen hash lives here) -----------------
 
@@ -255,28 +259,6 @@ impl PerDbAccounting {
     }
 }
 
-// --- the gate ------------------------------------------------------------------
-
-/// The WAL-durability oracle the writeback gate waits on (FR-24). The BPM
-/// defines the contract and never depends on the WAL crate — the runtime
-/// provides the impl over the per-DB `WalWriter`; tests provide fakes.
-/// `Send + Sync` because pools are shared across reactors (ADR-0003: the
-/// gate rides `Arc<dyn WalDurability>`).
-pub trait WalDurability: Send + Sync {
-    /// Highest durable LSN right now — the gate's fast path (skip the wait
-    /// when coverage already holds).
-    fn durable_lsn(&self) -> Lsn;
-
-    /// Resolves when durability covers `lsn`. `Err` is a WAL failure: the
-    /// writeback must not proceed, and the page stays dirty. The returned
-    /// future borrows `self` for the wait's duration; it is polled on the
-    /// caller's reactor (never sent across threads).
-    fn wait_durable(
-        &self,
-        lsn: Lsn,
-    ) -> Pin<Box<dyn Future<Output = Result<(), BpmError>> + '_>>;
-}
-
 // --- config + errors -------------------------------------------------------------
 
 /// Pool sizing. `max_frames` is the pool's whole capacity; frames freed by
@@ -294,8 +276,10 @@ pub struct BpmConfig {
 
 #[derive(Debug)]
 pub enum BpmError {
-    /// Every frame is pinned or claimed and no unpinned victim exists —
-    /// the pool genuinely cannot serve another page right now.
+    /// Every frame is pinned or claimed, or the only candidates are
+    /// undurable, and the pool genuinely cannot serve another page right
+    /// now — the durable LSN lagging is the honest pressure signal
+    /// (§12.5's open question).
     PoolFull {
         max_frames: u32,
     },
@@ -306,14 +290,12 @@ pub enum BpmError {
     /// guard is alive) or claimed (a load or eviction holds it). The caller
     /// retries at its own level — the BPM never spins.
     Contended(PageId),
-    /// The WAL-durability gate refused or failed — the writeback did not
-    /// happen and the page stays dirty (WAL-before-data, FR-24).
-    WalGate(String),
-    Storage(cascade_storage::StorageError),
+    /// The page source refused or failed — the page is not resident.
+    Storage(StoreError),
 }
 
-impl From<cascade_storage::StorageError> for BpmError {
-    fn from(e: cascade_storage::StorageError) -> Self {
+impl From<StoreError> for BpmError {
+    fn from(e: StoreError) -> Self {
         BpmError::Storage(e)
     }
 }
@@ -389,25 +371,6 @@ impl ShardedTable {
             .map(|s| s.read().unwrap_or_else(|e| e.into_inner()).len())
             .sum()
     }
-
-    /// All `(page_id, frame)` pairs, sorted — the checkpoint scan set and
-    /// diagnostics. The snapshot is per-shard (one read lock at a time, no
-    /// cross-shard consistency claim: a page dirtied mid-scan is simply
-    /// missed until the next pass, as the T4.2 contract states).
-    fn entries(&self) -> Vec<(PageId, u32)> {
-        let mut out = Vec::new();
-        for shard in &self.shards {
-            out.extend(
-                shard
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .map(|(&p, &i)| (p, i)),
-            );
-        }
-        out.sort_by_key(|(p, _)| (p.db.0, p.segment.0, p.page_no));
-        out
-    }
 }
 
 // --- frames -----------------------------------------------------------------------
@@ -429,34 +392,30 @@ enum PinRefusal {
 }
 
 /// Everything mutable about a resident page, under one lock with its
-/// bytes. A page's *generation* is `(page_id, page_lsn, mod_count)`: the
-/// writeback protocol's re-verification compares it against what a
-/// snapshot captured — any change means the frame's content moved on and
-/// the stale write must not land.
+/// bytes. `page_lsn` is the end LSN of the last record applied to the
+/// cached image (S17) — stamped by `write_logged` on the apply path and
+/// carried in from the fetched image on the load path; it is what the
+/// §12.5 eviction rule compares against the scope's durable LSN. `dirty`
+/// now means exactly "the image carries changes the log may not cover":
+/// true after any `write`; for a stamped page it is redundant with the
+/// stamp and kept for the unlogged case and diagnostics.
 #[derive(Default)]
 struct FrameInner {
     /// `None` while the frame is unclaimed cargo (never resident).
     page_id: Option<PageId>,
+    /// The scope the page belongs to — set at fill; the eviction rule
+    /// looks up the *victim's own* scope's durable LSN.
+    scope: Option<ScopeId>,
     dirty: bool,
-    /// The WAL end boundary covering the page's latest logged modification
-    /// (T3.2). `None` = unlogged (fresh load, or only unlogged writes).
+    /// The end LSN of the last record applied to the cached image (S17);
+    /// `None` = the image has never been written (fresh zeros).
     page_lsn: Option<Lsn>,
-    /// Bumped on EVERY mutation (`write` and `write_logged` alike) — the
-    /// dirty-clear condition's teeth: an unlogged write between a flush's
-    /// snapshot and its dirty-clear would otherwise be silently dropped.
-    mod_count: u64,
 }
 
 struct Frame {
-    /// Bytes + metadata under one lock: snapshots, mutations, and the
-    /// dirty-clear all serialize here. Bounded (one memcpy), never across
-    /// an await (the flusher drops it before every gate wait).
+    /// Bytes + metadata under one lock: snapshots and mutations serialize
+    /// here. Bounded (one memcpy), never across an await.
     inner: Mutex<FrameInner>,
-    /// The write ticket: held across the store write, from generation
-    /// re-verification to dirty-clear. Two flushes of one page serialize
-    /// here, so the store can never receive their images out of generation
-    /// order — the cross-core clobber seal (module doc, item b).
-    write_ticket: AtomicBool,
     pin: AtomicU32,
 }
 
@@ -464,14 +423,13 @@ impl Frame {
     fn new() -> Self {
         Frame {
             inner: Mutex::new(FrameInner::default()),
-            write_ticket: AtomicBool::new(false),
             pin: AtomicU32::new(0),
         }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FrameInner> {
         // Poison tolerance: a panicking write closure must not wedge the
-        // frame forever. The page may be mid-mutation (the WAL protects
+        // frame forever. The page may be mid-mutation (the log protects
         // durability; the memory image stays whatever the panic left).
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -554,9 +512,10 @@ impl Frame {
 // --- the pool ----------------------------------------------------------------------
 
 /// One buffer pool (the per-NUMA case of FR-22). `Send + Sync`: shared by
-/// every core on its NUMA. Owns NO store — every I/O call takes the
-/// caller's own `&impl PageStore` (§8.1's no-file-handle-across-reactors
-/// rule, made structural).
+/// every core on its NUMA. Owns NO store and never writes a page anywhere:
+/// reads go through the caller's own `&impl PageSource` per call (§8.1's
+/// no-file-handle-across-reactors rule, made structural), and the log is
+/// the only durable write (storage M8, §12.5).
 pub struct Bpm {
     config: BpmConfig,
     ram: PageRam,
@@ -566,9 +525,9 @@ pub struct Bpm {
     /// Frames freed by eviction; the loader claims one out of here.
     free: Mutex<Vec<u32>>,
     table: ShardedTable,
-    /// The WAL-durability gate for writeback (T3.2). Set once at boot;
-    /// overwriting is allowed for tests.
-    gate: RwLock<Option<Arc<dyn WalDurability>>>,
+    /// The scope's durable LSN, as published by the log store — the miss
+    /// path reads at it and the eviction rule defers to it (§12.5).
+    durable: Arc<dyn DurableLsn>,
     accounting: PerDbAccounting,
     /// Whether the kernel accepted the node binding for the frame mapping
     /// (false = first-touch degrade; observable for the bare-metal check).
@@ -582,7 +541,10 @@ pub struct Bpm {
 impl Bpm {
     /// Pre-allocates `config.max_frames` frames of page RAM (the pool's
     /// own `mbind` mapping — ADR-0003 item 4) and the sharded page table.
-    fn new(config: BpmConfig, accounting: PerDbAccounting) -> Self {
+    /// `durable` is the scope's published durable-LSN view — load-bearing
+    /// on every miss and every eviction, so it is a constructor argument,
+    /// not an afterthought.
+    fn new(config: BpmConfig, accounting: PerDbAccounting, durable: Arc<dyn DurableLsn>) -> Self {
         let ram = PageRam::map(config.max_frames as usize)
             .expect("pool mapping reserves (mmap failure is a boot-stopper)");
         let node_bound = match config.numa {
@@ -610,7 +572,7 @@ impl Bpm {
             bump: AtomicU32::new(0),
             free: Mutex::new(Vec::new()),
             table: ShardedTable::new(config.cores_on_numa),
-            gate: RwLock::new(None),
+            durable,
             accounting,
             node_bound,
             self_ref: OnceLock::new(),
@@ -620,15 +582,14 @@ impl Bpm {
     /// The canonical constructor: build inside `Arc::new` and wire the
     /// pool's self-handle. Every guard recovers a strong handle through
     /// it, so a guard can be held across awaits and threads.
-    pub fn arced(config: BpmConfig, accounting: PerDbAccounting) -> Arc<Bpm> {
-        let bpm = Arc::new(Bpm::new(config, accounting));
+    pub fn arced(
+        config: BpmConfig,
+        accounting: PerDbAccounting,
+        durable: Arc<dyn DurableLsn>,
+    ) -> Arc<Bpm> {
+        let bpm = Arc::new(Bpm::new(config, accounting, durable));
         let _ = bpm.self_ref.set(Arc::downgrade(&bpm));
         bpm
-    }
-
-    /// Attaches the WAL-durability gate (T3.2).
-    pub fn set_gate(&self, gate: Arc<dyn WalDurability>) {
-        *self.gate.write().unwrap_or_else(|e| e.into_inner()) = Some(gate);
     }
 
     pub fn accounting(&self) -> &PerDbAccounting {
@@ -658,13 +619,16 @@ impl Bpm {
             .expect("the caller's pool handle outlives this call — the guard's Arc is sound")
     }
 
-    /// FR-23: hit → pin; miss → read through the caller's own store →
-    /// insert (exactly once, cross-core) → pin. The returned guard owns an
-    /// 8 KiB snapshot — `'static`, ownable across awaits and threads — and
-    /// unpins on drop, including through a panic.
-    pub async fn page<S: PageStore>(
+    /// FR-23: hit → pin; miss → read through the caller's own page source
+    /// at the scope's durable LSN (§4.5) → insert (exactly once,
+    /// cross-core) → pin. The returned guard owns an 8 KiB snapshot —
+    /// `'static`, ownable across awaits and threads — and unpins on drop,
+    /// including through a panic.
+    pub async fn page<S: PageSource>(
         &self,
-        store: &S,
+        source: &S,
+        ctx: &OpCtx<'_>,
+        scope: ScopeId,
         page_id: PageId,
     ) -> Result<PageGuard, BpmError> {
         // Hit: pinned under the shard read lock, which is what excludes a
@@ -676,8 +640,20 @@ impl Bpm {
         }
 
         // Miss: the read runs with no locks held (siblings and sibling
-        // reactors proceed freely).
-        let data = store.read_page(page_id).await?;
+        // reactors proceed freely), at the durable LSN — the leader's read
+        // point (§4.5, §12.5).
+        let at_lsn = self.durable.durable_lsn(scope);
+        let image = source
+            .get_page(
+                ctx,
+                scope,
+                PageKey {
+                    segment: page_id.segment,
+                    page_no: page_id.page_no,
+                },
+                at_lsn,
+            )
+            .await?;
 
         // Re-check: another reactor may have loaded the same page while we
         // read. Pages are inserted exactly once per pool.
@@ -685,7 +661,7 @@ impl Bpm {
             return hit;
         }
 
-        let idx = self.acquire_frame(store).await?;
+        let idx = self.acquire_frame()?;
         let frame = &self.frames[idx as usize];
         debug_assert_eq!(
             frame.pin_word(),
@@ -694,14 +670,16 @@ impl Bpm {
         );
 
         // Fill under the claim: the frame is table-absent (unobservable to
-        // hits, flushes, and victim scans) until the publish below.
+        // hits and victim scans) until the publish below. The frame
+        // remembers the IMAGE's page LSN (S17), not the read point — that
+        // is what the eviction rule compares against durability.
         {
             let mut inner = frame.lock();
             inner.page_id = Some(page_id);
+            inner.scope = Some(scope);
             inner.dirty = false;
-            inner.page_lsn = None;
-            inner.mod_count = 0;
-            self.copy_into_frame(idx, &data);
+            inner.page_lsn = (image.page_lsn.0 != 0).then_some(image.page_lsn);
+            self.copy_into_frame(idx, &image.buf);
         }
         let winner = self.table.get_or_insert(page_id, idx);
         if winner != idx {
@@ -724,7 +702,7 @@ impl Bpm {
             bpm: self.clone_arc(),
             idx,
             page_id,
-            snapshot: data,
+            snapshot: image.buf,
         })
     }
 
@@ -735,9 +713,11 @@ impl Bpm {
     /// tail-append protocol bumps to the next page on contention rather
     /// than spinning here — that is the starvation-freedom story, and it
     /// lives at the AM level by design).
-    pub async fn page_exclusive<S: PageStore>(
+    pub async fn page_exclusive<S: PageSource>(
         &self,
-        store: &S,
+        source: &S,
+        ctx: &OpCtx<'_>,
+        scope: ScopeId,
         page_id: PageId,
     ) -> Result<PageGuardMut, BpmError> {
         if let Some(hit) = self.exclusive_hit(page_id) {
@@ -746,21 +726,32 @@ impl Bpm {
 
         // Miss: load, then re-check (another loader may have published
         // while we read) before occupying a frame of our own.
-        let data = store.read_page(page_id).await?;
+        let at_lsn = self.durable.durable_lsn(scope);
+        let image = source
+            .get_page(
+                ctx,
+                scope,
+                PageKey {
+                    segment: page_id.segment,
+                    page_no: page_id.page_no,
+                },
+                at_lsn,
+            )
+            .await?;
         if let Some(hit) = self.exclusive_hit(page_id) {
             return hit;
         }
 
-        let idx = self.acquire_frame(store).await?;
+        let idx = self.acquire_frame()?;
         let frame = &self.frames[idx as usize];
         // Fill under the claim — same discipline as `page`.
         {
             let mut inner = frame.lock();
             inner.page_id = Some(page_id);
+            inner.scope = Some(scope);
             inner.dirty = false;
-            inner.page_lsn = None;
-            inner.mod_count = 0;
-            self.copy_into_frame(idx, &data);
+            inner.page_lsn = (image.page_lsn.0 != 0).then_some(image.page_lsn);
+            self.copy_into_frame(idx, &image.buf);
         }
         let winner = self.table.get_or_insert(page_id, idx);
         if winner != idx {
@@ -776,19 +767,19 @@ impl Bpm {
             bpm: self.clone_arc(),
             idx,
             page_id,
-            snapshot: data,
+            snapshot: image.buf,
         })
     }
 
     /// Frame acquisition for a loader (the minimal greedy eviction, ADR-0003
     /// item 6): a freed frame, else a fresh one, else a clean unpinned
-    /// victim, else — one attempt — a dirty unpinned victim flushed through
-    /// the gate. `PoolFull` only when every frame is pinned or claimed,
-    /// which is what makes "a table larger than the pool" survivable for
-    /// scans without turning the next miss into an error. The returned
-    /// frame is CLAIMED and table-absent: the loader fills and publishes
-    /// it under that claim.
-    async fn acquire_frame<S: PageStore>(&self, store: &S) -> Result<u32, BpmError> {
+    /// victim, else a durable-covered unpinned victim dropped in place —
+    /// no write, no I/O, nothing to wait on (§12.5: dropping a page whose
+    /// page LSN is at or below the durable LSN loses nothing). `PoolFull`
+    /// only when every frame is pinned, claimed, or undurable. The
+    /// returned frame is CLAIMED and table-absent: the loader fills and
+    /// publishes it under that claim.
+    fn acquire_frame(&self) -> Result<u32, BpmError> {
         if let Some(idx) = self.take_free() {
             return Ok(idx);
         }
@@ -810,7 +801,7 @@ impl Bpm {
                 return Ok(idx);
             }
         }
-        if self.evict_one_dirty(store).await? {
+        if self.unmap_one_durable_victim() {
             if let Some(idx) = self.take_free() {
                 return Ok(idx);
             }
@@ -834,11 +825,30 @@ impl Bpm {
         }
     }
 
+    /// The §12.5 eviction rule over one frame's metadata: a page whose
+    /// page LSN is at or below its scope's durable LSN loses nothing when
+    /// dropped — every record for it below the stamp is in the durable
+    /// prefix, and the page store serves it again at the durable LSN.
+    /// Unlogged changes (dirty with no stamp) are never evictable in v1 —
+    /// the log cannot rebuild them, so an eviction would lose the image
+    /// outright. `scope` is `None` only for unoccupied cargo (never
+    /// scanned).
+    fn evictable(&self, scope: Option<ScopeId>, dirty: bool, page_lsn: Option<Lsn>) -> bool {
+        match (dirty, page_lsn) {
+            (true, None) => false, // unlogged changes: not rebuildable
+            (_, Some(stamp)) => match scope {
+                Some(scope) => stamp <= self.durable.durable_lsn(scope),
+                None => false, // defensive: an occupied frame always has a scope
+            },
+            (false, None) => true, // never modified since load
+        }
+    }
+
     /// Scans for an unpinned clean resident frame, claims it, and unmaps
     /// it straight onto the free list (`true` = one frame freed). Clean
-    /// victims need no I/O at all — the claim exists so the re-verify
-    /// (dirty could move between peek and claim) and the unmap are
-    /// exclusive.
+    /// victims are the ladder's cheap rung: no rule to check beyond the
+    /// re-verify. The claim exists so the re-verify (the metadata could
+    /// move between peek and claim) and the unmap are exclusive.
     fn unmap_one_clean_victim(&self) -> bool {
         for (idx, frame) in self.frames.iter().enumerate() {
             {
@@ -866,57 +876,46 @@ impl Bpm {
         false
     }
 
-    /// Flushes and frees one dirty victim, appending its frame to the free
-    /// list. `Ok(false)` = no claimable dirty victim exists.
-    async fn evict_one_dirty<S: PageStore>(&self, store: &S) -> Result<bool, BpmError> {
+    /// Scans for an unpinned DURABLE-COVERED dirty victim and drops it in
+    /// place (`true` = one frame freed). This is M8's replacement for the
+    /// write-back rung: a page whose stamp the durable LSN covers needs
+    /// no write — the page store rebuilds it from the log — so eviction
+    /// is an unmap. A victim above the durable LSN (or carrying unlogged
+    /// changes) is skipped, never written anywhere: the pool applies
+    /// backpressure instead (§12.5's open question).
+    fn unmap_one_durable_victim(&self) -> bool {
         for (idx, frame) in self.frames.iter().enumerate() {
-            let page_id = {
+            {
+                // Cheap peek: skip clean frames — the durable rung only
+                // takes dirty ones (clean ones went to the rung above).
                 let inner = frame.lock();
-                match (inner.page_id, inner.dirty) {
-                    (Some(p), true) => p,
-                    _ => continue,
+                if inner.page_id.is_none() || !inner.dirty {
+                    continue;
                 }
-            };
+            }
             if !frame.try_claim() {
                 continue;
             }
-            if let Err(e) = self.flush_claimed(store, idx as u32, page_id).await {
-                // The claim must not die with the error — a claimed frame
-                // is refused by every pin and would leak out of the pool.
-                frame.release_claim();
-                return Err(e);
-            }
+            // Re-verify under the claim: the metadata may have moved
+            // between the unlocked peek and the claim.
+            let page_id = {
+                let inner = frame.lock();
+                match inner.page_id {
+                    Some(p)
+                        if self.evictable(inner.scope, inner.dirty, inner.page_lsn) =>
+                    {
+                        p
+                    }
+                    _ => {
+                        frame.release_claim();
+                        continue;
+                    }
+                }
+            };
             self.unmap_claimed(idx as u32, page_id);
-            return Ok(true);
+            return true;
         }
-        Ok(false)
-    }
-
-    /// Writeback of a CLAIMED frame (eviction's path): the claim excludes
-    /// every pin, so the generation cannot move — one gate pass, one
-    /// snapshot, one write. Shared by every eviction route (there is no
-    /// second writeback path).
-    async fn flush_claimed<S: PageStore>(
-        &self,
-        store: &S,
-        idx: u32,
-        page_id: PageId,
-    ) -> Result<(), BpmError> {
-        let frame = &self.frames[idx as usize];
-        let stamp = frame.lock().page_lsn;
-        if let Some(target) = stamp {
-            let gate = self.gate_handle()?;
-            if gate.durable_lsn() < target {
-                gate.wait_durable(target).await?;
-            }
-        }
-        if !frame.lock().dirty {
-            return Ok(()); // clean victim — nothing to write
-        }
-        let snapshot = self.snapshot_frame(idx);
-        store.write_page(page_id, snapshot).await?;
-        frame.lock().dirty = false;
-        Ok(())
+        false
     }
 
     /// Unmaps a claimed frame and returns it to the free list.
@@ -925,9 +924,9 @@ impl Bpm {
         {
             let mut inner = self.frames[idx as usize].lock();
             inner.page_id = None;
+            inner.scope = None;
             inner.dirty = false;
             inner.page_lsn = None;
-            inner.mod_count = 0;
         }
         self.frames[idx as usize].release_claim();
         self.free
@@ -942,9 +941,9 @@ impl Bpm {
         {
             let mut inner = frame.lock();
             inner.page_id = None;
+            inner.scope = None;
             inner.dirty = false;
             inner.page_lsn = None;
-            inner.mod_count = 0;
         }
         frame.release_claim();
         self.free
@@ -953,131 +952,15 @@ impl Bpm {
             .push(idx);
     }
 
-    /// Writeback for one page (T3.2, FR-24 — cross-core form). The flusher
-    /// holds NO pin: writers proceed freely during the gate wait (blocking
-    /// them for a WAL stall would stall every session touching the page).
-    /// The store write is serialized per frame by the write ticket and
-    /// re-verified against the snapshot's generation — a page re-modified,
-    /// evicted, or reloaded while this flush sat on the gate can never have
-    /// its newer store image clobbered by this older one (module doc,
-    /// items a–c). Absent pages write nothing (`Ok(false)`).
-    pub async fn flush_page<S: PageStore>(
-        &self,
-        store: &S,
-        page_id: PageId,
-    ) -> Result<bool, BpmError> {
-        let Some(idx) = self.table.get(&page_id) else {
-            return Ok(false);
-        };
-        let frame = &self.frames[idx as usize];
-        // One flusher per frame at a time: the second entrant refuses
-        // rather than racing its images at the store.
-        if frame
-            .write_ticket
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return Ok(false);
-        }
-        let outcome = self.flush_guarded(store, idx, page_id).await;
-        frame.write_ticket.store(false, Ordering::Release);
-        outcome
-    }
-
-    /// The ticket holder's body: gate-snapshot → verify → write → clear.
-    async fn flush_guarded<S: PageStore>(
-        &self,
-        store: &S,
-        idx: u32,
-        page_id: PageId,
-    ) -> Result<bool, BpmError> {
-        // The loop's mutex guards live only inside these scoped blocks —
-        // every await sits strictly outside them (the I11 discipline,
-        // structurally visible to clippy's held-across-await lint).
-        enum Snapshot {
-            /// A writer moved the stamp mid-decision — re-decide.
-            Moved,
-            /// Coverage holds and the page is clean — nothing to write.
-            Clean,
-            /// A coherent generation to write.
-            Ready(Option<Lsn>, u64, AlignedBuf),
-        }
-        let frame = &self.frames[idx as usize];
-        let (lsn_at_snap, mod_at_snap, snapshot) = loop {
-            // Pass 1: stamp + gate coverage. (No concurrent byte mutation
-            // is possible even without the mutex while a snapshot runs —
-            // mutators need EXCL/CLAIM — but the mutex keeps the stamp and
-            // the image from straddling a mutation.)
-            let (stamp, mod_count, dirty, covered) = {
-                let inner = frame.lock();
-                let covered = match inner.page_lsn {
-                    Some(target) => self.gate_handle()?.durable_lsn() >= target,
-                    None => true,
-                };
-                (inner.page_lsn, inner.mod_count, inner.dirty, covered)
-            };
-            if !covered {
-                let gate = self.gate_handle()?;
-                gate.wait_durable(stamp.unwrap()).await?;
-                continue; // re-read fresh after the wait
-            }
-            // Pass 2: the coherent snapshot decision — the guard dies
-            // inside the block, before any await this loop can reach.
-            let decision = {
-                let inner = frame.lock();
-                if inner.page_lsn != stamp {
-                    Snapshot::Moved // a writer moved the stamp mid-decision
-                } else if !dirty {
-                    Snapshot::Clean
-                } else {
-                    Snapshot::Ready(stamp, mod_count, self.snapshot_frame(idx))
-                }
-            };
-            match decision {
-                Snapshot::Moved => continue,
-                Snapshot::Clean => return Ok(false),
-                Snapshot::Ready(lsn, m, snap) => break (lsn, m, snap),
-            }
-        };
-        // Generation re-verification: the write lands only if the frame
-        // still holds exactly the generation we snapshotted (else it was
-        // re-modified / evicted / reloaded — the store's newer-or-equal
-        // image must stand, and the page stays dirty here).
-        {
-            let inner = frame.lock();
-            let unchanged = inner.page_id == Some(page_id)
-                && inner.page_lsn == lsn_at_snap
-                && inner.mod_count == mod_at_snap;
-            if !unchanged {
-                return Ok(false);
-            }
-        }
-        store.write_page(page_id, snapshot).await?;
-        // Clear dirty only if the generation is untouched since the
-        // snapshot — a re-modified page keeps its dirty bit for the next
-        // pass (its newer stamp was verified on ITS flush).
-        let mut inner = frame.lock();
-        if inner.page_id == Some(page_id)
-            && inner.page_lsn == lsn_at_snap
-            && inner.mod_count == mod_at_snap
-        {
-            inner.dirty = false;
-        }
-        Ok(true)
-    }
-
     /// Evict one page (named victim — the automatic selection is the
-    /// loader's greedy path). Dirty pages flush through the gate first —
-    /// the same gate-snapshot code as [`flush_page`](Bpm::flush_page), so
-    /// eviction cannot bypass WAL-before-data — then the frame is
-    /// reclaimed for reuse. `Ok(false)` = refused (pinned or a load in
-    /// flight — a claim requires the pin word fully zero); `Ok(true)` =
-    /// the page is gone (or was never resident — idempotent).
-    pub async fn evict_page<S: PageStore>(
-        &self,
-        store: &S,
-        page_id: PageId,
-    ) -> Result<bool, BpmError> {
+    /// loader's greedy path). The page is DROPPED, not written: an
+    /// eviction of a page whose stamp is at or below the durable LSN loses
+    /// nothing (§12.5), and no code path in this crate writes a page
+    /// anywhere. `Ok(false)` = refused (pinned, a load in flight, above
+    /// the durable LSN, or unlogged changes present — a claim requires
+    /// the pin word fully zero); `Ok(true)` = the page is gone (or was
+    /// never resident — idempotent).
+    pub fn evict_page(&self, page_id: PageId) -> Result<bool, BpmError> {
         let Some(idx) = self.table.get(&page_id) else {
             return Ok(true);
         };
@@ -1085,9 +968,14 @@ impl Bpm {
         if !frame.try_claim() {
             return Ok(false); // pinned, exclusively held, or loading
         }
-        if let Err(e) = self.flush_claimed(store, idx, page_id).await {
+        let evictable = {
+            let inner = frame.lock();
+            inner.page_id == Some(page_id)
+                && self.evictable(inner.scope, inner.dirty, inner.page_lsn)
+        };
+        if !evictable {
             frame.release_claim();
-            return Err(e);
+            return Ok(false);
         }
         self.unmap_claimed(idx, page_id);
         Ok(true)
@@ -1141,18 +1029,6 @@ impl Bpm {
 
     // --- helpers -----------------------------------------------------------------
 
-    fn gate_handle(&self) -> Result<Arc<dyn WalDurability>, BpmError> {
-        self.gate
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .ok_or_else(|| {
-                BpmError::WalGate(
-                    "page carries a WAL boundary but no durability gate is attached".into(),
-                )
-            })
-    }
-
     /// Copies the frame's bytes out (8 KiB memcpy — the accepted cost).
     /// SAFETY (callers): `idx < max_frames` (indices come from the frame
     /// array), and no concurrent byte mutation — guaranteed either by
@@ -1192,30 +1068,21 @@ impl Bpm {
             .unwrap_or(0)
     }
 
-    /// Dirty bit for a resident page (`None` if not resident).
+    /// Whether the resident image carries changes (`None` if not
+    /// resident).
     pub fn is_dirty(&self, page_id: &PageId) -> Option<bool> {
         self.table
             .get(page_id)
             .map(|idx| self.frames[idx as usize].lock().dirty)
     }
 
-    /// The WAL boundary the page's latest logged modification was covered
-    /// by: `Some(None)` = resident but unlogged, `None` = not resident.
+    /// The end LSN of the last record applied to the resident image
+    /// (S17): `Some(None)` = resident but never written, `None` = not
+    /// resident.
     pub fn page_lsn(&self, page_id: &PageId) -> Option<Option<Lsn>> {
         self.table
             .get(page_id)
             .map(|idx| self.frames[idx as usize].lock().page_lsn)
-    }
-
-    /// Every resident dirty page, in stable (sorted) order — the
-    /// checkpointer's scan set (T4.2). The bit is re-checked at flush time.
-    pub fn dirty_pages(&self) -> Vec<PageId> {
-        self.table
-            .entries()
-            .into_iter()
-            .filter(|entry| self.frames[entry.1 as usize].lock().dirty)
-            .map(|entry| entry.0)
-            .collect()
     }
 
     /// Frames currently carrying a page.
@@ -1264,7 +1131,7 @@ impl Drop for PageGuard {
 /// RAII exclusive pin (the writer guard): `page_exclusive`'s product. The
 /// exclusive pin is held for the guard's whole life, so every mutation is
 /// a short critical section and the pin protocol (not a lock held across
-/// an await) is what checkpoints and other readers coordinate against.
+/// an await) is what other readers coordinate against.
 #[must_use = "the exclusive pin lasts exactly as long as the guard is alive — bind it"]
 pub struct PageGuardMut {
     bpm: Arc<Bpm>,
@@ -1284,13 +1151,17 @@ impl PageGuardMut {
     /// the call and can never span an await (the I11 discipline by
     /// construction). The guard's snapshot is refreshed afterwards, so its
     /// own reads see its own writes.
+    ///
+    /// Unlogged modification is the caller's contract (like PG's unlogged
+    /// tables): the image keeps the change, but the page store cannot
+    /// rebuild it, so this page will refuse eviction until it is dropped
+    /// by an explicit decision of the layer above (a temp store, later).
     pub fn write<R>(&mut self, f: impl FnOnce(&mut [u8]) -> R) -> R {
         let frame = &self.bpm.frames[self.idx as usize];
         let mut inner = frame.lock();
         inner.dirty = true;
-        inner.mod_count += 1;
         // SAFETY: idx < max_frames; the EXCL pin excludes every other
-        // mutator, and the frame mutex excludes the flusher's snapshot.
+        // mutator, and the frame mutex excludes concurrent snapshots.
         let result = unsafe {
             let bytes =
                 std::slice::from_raw_parts_mut(self.bpm.ram.frame_ptr(self.idx), PAGE_SIZE);
@@ -1300,17 +1171,20 @@ impl PageGuardMut {
         result
     }
 
-    /// The logged form of [`write`](PageGuardMut::write) (T3.2, FR-24):
-    /// the caller passes the WAL end boundary covering this modification —
-    /// reserved *before* this call, so a crash mid-writeback protocol can
-    /// never write a page whose record does not exist. Writeback waits on
-    /// the gate until durability reaches `wal_end`. Unlogged modification
-    /// stays available via [`write`](PageGuardMut::write).
+    /// The logged form of [`write`](PageGuardMut::write): the caller
+    /// passes the WAL end boundary covering this modification — reserved
+    /// *before* this call, so a crash can never leave a page stamped with
+    /// a record that does not exist. The stamp is the page's LSN (S17:
+    /// the end of the last record applied); the §12.5 eviction rule reads
+    /// it against the scope's durable LSN, and the page store — replaying
+    /// the same log — materializes the same image independently. The
+    /// caller's duty (the mini-transaction rule, §12.5): the group's
+    /// bytes are in the log *before or with* this apply reaching the
+    /// frame — the log is the only durable write.
     pub fn write_logged<R>(&mut self, wal_end: Lsn, f: impl FnOnce(&mut [u8]) -> R) -> R {
         let frame = &self.bpm.frames[self.idx as usize];
         let mut inner = frame.lock();
         inner.dirty = true;
-        inner.mod_count += 1;
         // LSN 0 is the not-stamped sentinel (a reserved record precedes
         // every real stamp, so boundaries are ≥ 1).
         if wal_end.0 != 0 {
