@@ -7,7 +7,7 @@ Citations: `§9`, `§12`, `§6.3`, `§7`, `§11` refer to the upstream HLD's sec
 
 **Corrections of 2026-11-27 (round-3 review fix V31; these win over anything below that disagrees).**
 
-- **B-tree page formats live in `cascade-page`, not in `cascade-btree`** (layer decision A3). `cascade-redo` sits below the access layer and must apply B-tree records, so it cannot depend on `cascade-btree`. The B-tree *bytes* (branch, IOT leaf, index leaf, metapage: kinds 2–5) and their apply functions are `cascade-page`'s; `cascade-btree` owns only the tree logic. Every sentence below that places B-tree formats or their apply functions in `cascade-btree` is superseded.
+- **B-tree page formats live in `cascade-page`, not in `cascade-btree-core`** (layer decision A3). `cascade-redo` sits below the access layer and must apply B-tree records, so it cannot depend on `cascade-btree-core`. The B-tree *bytes* (branch, IOT leaf, index leaf, metapage: kinds 2–5) and their apply functions are `cascade-page`'s; `cascade-btree-core` owns only the tree logic. Every sentence below that places B-tree formats or their apply functions in `cascade-btree-core` is superseded.
 - **There is no owning core.** A scope is a shared-memory engine across its write core set (layer A4, §8): any core of the set may read or write any page, and pages are protected by the buffer pool's pins alone. The "Concurrency, in one paragraph" section below is rewritten accordingly.
 - **Vacuum does not remove index entries first.** It frees a heap slot once the row's death is older than the cleanup watermark, because every index entry carries its own delete word, stamped by the same transaction (heap H6). Index vacuum is a separate pass that the heap does not wait for.
 - **Names.** `apply_delete_mark` is renamed `apply_stamp_deleter(img, slot, word, flags)`, and `apply_relink` preserves the `next` word's lock flags (heap §4.2, fix V17). "Stub" means a cell kept only so a cross-page chain stays resolvable.
@@ -15,7 +15,7 @@ Citations: `§9`, `§12`, `§6.3`, `§7`, `§11` refer to the upstream HLD's sec
 
 **This document in one look:**
 
-1. cascade-page is the **page layer** shared by its two consumers — cascade-heap today, cascade-btree later — and §1–§3 pin what the layer owns vs what each consumer's format owns. The crate exists, first, so the heap format can sit below both the engine and the storage-side consumers of its bytes (WAL producers, replay/PageStore) — see "Why a separate crate at all" in §1.
+1. cascade-page is the **page layer** shared by its two consumers — cascade-heap today, cascade-btree-core later — and §1–§3 pin what the layer owns vs what each consumer's format owns. The crate exists, first, so the heap format can sit below both the engine and the storage-side consumers of its bytes (WAL producers, replay/PageStore) — see "Why a separate crate at all" in §1.
 2. §4 is the heap format's MVCC mutation design: slot states (D1), plan-carried prune (D2), compact-on-prune (D3), redo primitives (D4), chain traversal (D5).
 3. D6 lists the reservations to make now, while no page is frozen in production.
 4. **Nothing here changes M6** — the current milestone (real heap INSERT/SELECT through the buffer pool, pages persisted, but no MVCC visibility yet) needs none of it; this design lands in the MVCC milestone that follows.
@@ -35,7 +35,7 @@ Citations: `§9`, `§12`, `§6.3`, `§7`, `§11` refer to the upstream HLD's sec
 | redo | the WAL record that lets a replaying side reproduce one change on one page image |
 | cleanup watermark | the oldest timestamp any active reader may still need; things older than it are safe to remove |
 | MVCC | multi-version concurrency control — readers see snapshots; writers add new versions instead of overwriting |
-| IOT | index-organized table — the PK-clustered B-tree organization; the row lives in the leaf. Its page formats are this crate's (layer A3); its tree logic is cascade-btree's |
+| IOT | index-organized table — the PK-clustered B-tree organization; the row lives in the leaf. Its page formats are this crate's (layer A3); its tree logic is cascade-btree-core's |
 | golden test | a test that pins the exact expected bytes, so any layout drift fails loudly |
 
 **The page, in one picture** (the locked T6.1 layout this design extends):
@@ -66,7 +66,7 @@ cascade DB engine
   └── table access API            (WP5: Table — engine-neutral row operations)
         ├── cascade-heap          heap organization   (page_kind 1)     ──┐
         │                                                          ├── cascade-page
-        └── cascade-btree        IOT organization    (future kinds)  ──┘   (the page layer)
+        └── cascade-btree-core        IOT organization    (future kinds)  ──┘   (the page layer)
 ```
 
 Three requirements define the layer:
@@ -99,7 +99,7 @@ Precedent check: this is the PostgreSQL `bufpage.h` shape — one shared page AP
 | The redo binding | every kind's redo obeys §9's contract — self-contained per page, deterministic, versioned, idempotent by LSN — and each format's apply functions live at that format's authority (L2) |
 | Helpers | little-endian field accessors and prologue reads shared by every format's parser |
 
-**Each format owns everything else** — its full header, its slot/entry layout, its cell shapes, its parse, its redo apply functions. Today the heap format (kind 1) is the only one implemented, and it lives in this crate. The btree leaf/branch formats will live in this crate under the same contract (layer A3, corrected 2026-11-27), with the tree logic in cascade-btree; columnar keeps its own crate and consumes the same unit.
+**Each format owns everything else** — its full header, its slot/entry layout, its cell shapes, its parse, its redo apply functions. Today the heap format (kind 1) is the only one implemented, and it lives in this crate. The btree leaf/branch formats will live in this crate under the same contract (layer A3, corrected 2026-11-27), with the tree logic in cascade-btree-core; columnar keeps its own crate and consumes the same unit.
 
 **The line the layer does not cross — cells are not unified.** The heap cell is `[len][xmin][xmax][next]`: a *forward* chain over heap tuples. The future btree leaf entry points *backward* into undo (`roll_ptr`). Different direction, different target space, different mutation model (append-and-prune vs overwrite-in-place). A union cell would tax every heap tuple 8 bytes for a field the heap can never use — and this format's history already rejected the idea: v1's original `undo_ref` reservation *was* the unified-cell accommodation, and WP1 F2 deliberately repurposed it into `NextWord` because "the heap has no undo; undo chains are IOT". That rejection is reaffirmed here as a boundary, not a footnote.
 
@@ -128,14 +128,14 @@ The redo binding (§9's four rules) is layer property: every kind's WAL redo mus
 
 The same split applies to mutation safety: the layer owns the *rule* (a mutation validates through the read path and refuses atomically — an invalid transform leaves the image untouched); each format implements it for its own layout. Idempotence-by-LSN needs a per-kind stamp position: each format's header defines where its `page_lsn` lives (heap: offset 8), and the replayer checks it before applying; the BPM frame stamp remains the compute-side authority while nothing replays from page images (T6.1's M6 stance).
 
-### L3 — Crate consequence: split the module before cascade-btree lands
+### L3 — Crate consequence: split the module before cascade-btree-core lands
 
 Today `src/lib.rs` is heap through and through — `parse` hardcodes kind 1, `init` stamps `PAGE_KIND_HEAP`, `CELL_FIXED` is heap cell law. Becoming the layer (R1/R2) needs a small, cheap refactor, in two moves:
 
 - **frame module** — prologue reads, the kind registry, `is_initialized`, shared accessors, the discipline's shared rules;
 - **heap module** — everything T6.1 landed, moved under kind 1 unchanged; goldens move with it byte-for-byte.
 
-This must land *before* cascade-btree starts, so the btree consumes the contract instead of forking its own prologue logic. No format change, no version bump — pure code organization.
+This must land *before* cascade-btree-core starts, so the btree consumes the contract instead of forking its own prologue logic. No format change, no version bump — pure code organization.
 
 ## 4. Heap format decisions (kind 1 — the MVCC milestone's format work)
 
@@ -375,8 +375,8 @@ New `PageError` variants for the marker paths (e.g. `SlotNotLive`, `RedirectTarg
 ## 7. Landing plan
 
 - **Milestone:** the heap mutation work (D1–D6) lands in the MVCC milestone (post-M6; task numbers assigned when its plan is authored). Nothing in M6's ladder changes.
-- **The L3 module split is the one piece that should land early** — before cascade-btree starts consuming pages — and D1's `SlotState` + parse extension + goldens can ride with it (no callers yet; it is the piece whose pre-deployment timing matters most).
-- **Doc sync at landing (T6.7 discipline):** amend `crates/05-access/cascade-page/AI/CONTEXT.md` — its Role line today ("the 8 KB byte layout that every access method shares") is ambiguous against its own out-of-scope list; this doc resolves the ambiguity toward the layer model (R1–R3): the layer hosts many formats, the heap format is kind 1, btree formats live in cascade-btree. Also grep the other crates' contexts for drifted mirrors of the format description, and append the evolution entry to the WP1 evolution log (crates/02-storage/AI/storage-layer-design.md §12.7).
+- **The L3 module split is the one piece that should land early** — before cascade-btree-core starts consuming pages — and D1's `SlotState` + parse extension + goldens can ride with it (no callers yet; it is the piece whose pre-deployment timing matters most).
+- **Doc sync at landing (T6.7 discipline):** amend `crates/05-access/cascade-page/AI/CONTEXT.md` — its Role line today ("the 8 KB byte layout that every access method shares") is ambiguous against its own out-of-scope list; this doc resolves the ambiguity toward the layer model (R1–R3): the layer hosts many formats, the heap format is kind 1, btree formats live in cascade-btree-core. Also grep the other crates' contexts for drifted mirrors of the format description, and append the evolution entry to the WP1 evolution log (crates/02-storage/AI/storage-layer-design.md §12.7).
 - **Forward obligation to reserve now (WP8):** the moment index entries carry Tids, replay must reproduce live layout exactly — HeapInsert's redo record must then carry its slot (a physiological record: it names the slot, and replay reproduces the placement), and prune plans already do. M6's accepted "live layout may differ from replay layout" ends at the first index; the record-shape decision belongs to cascade-wal's contract review, flagged here so it is not rediscovered under pressure.
 
 ## 8. Open questions
@@ -385,23 +385,23 @@ New `PageError` variants for the marker paths (e.g. `SlotNotLive`, `RedirectTarg
 | :---- | :---- |
 | Amend while major 0 vs. ship markers as 1.0 for D1 (recommended: amend — same substance as the old amend-v1-vs-bump-to-2 question, restated in L1's major.minor terms) | This doc's review |
 | `page_kind` number assignments beyond kind 1 (btree leaf/branch, undo, FSM) | Each landing authority assigns its own; this crate owns only kind 1 |
-| Whether cascade-btree needs more from the frame module than the prologue + discipline (e.g. shared slot-array mechanics for ordered entries) | cascade-btree's format design (§11) — answer there, not by pre-growing this layer |
+| Whether cascade-btree-core needs more from the frame module than the prologue + discipline (e.g. shared slot-array mechanics for ordered entries) | cascade-btree-core's format design (§11) — answer there, not by pre-growing this layer |
 | Schema epoch adoption (byte reserved at heap header @16; eager-rewrite re-encode record shape sketched in D6) | ALTER TABLE era / before logical decoding ships (§6.3) |
 | Cleanup watermark learning across scopes and replicas | Engine/vacuum design (§12, §17) — this format only ever sees verdicts |
 | FSM page kind and layout | Heap-engine maintenance design (§12 — ordinary WAL-logged pages; layout under the L1 prologue rule) |
-| IOT leaf/undo cell formats | cascade-btree (§11), under the same prologue + golden discipline |
+| IOT leaf/undo cell formats | cascade-btree-core (§11), under the same prologue + golden discipline |
 | Bulk-load page handoff (pre-built pages to the PageStore) | §9 open question; page format joins when the record type does |
 
 ## 9. Decision log
 
 | Decision | Status |
 | :---- | :---- |
-| R1–R3 root requirement: cascade-page = the page layer serving cascade-heap and cascade-btree under one contract | Proposed — re-rooted from first draft's trailing D6.3/D7 |
+| R1–R3 root requirement: cascade-page = the page layer serving cascade-heap and cascade-btree-core under one contract | Proposed — re-rooted from first draft's trailing D6.3/D7 |
 | Cascade-page stays a separate crate: it hosts the heap format *below* the engine so storage-side consumers (WAL producers, replay/PageStore) encode and apply it without engine semantics; common logic alone would not justify the crate — dependency topology does | Proposed — added in review (challenged: "if formats aren't shared, why the layer?") |
 | Version = major.minor per kind (major = breaking, refuse; minor = previously-reserved additions only, older same-major parsers keep working; major 0 = pre-deployment, no promises) | Proposed — from review, folded into L1 |
 | L1 prologue switch: kind registry + per-kind version namespaces | Proposed |
 | L2 rules shared at the layer, apply functions per format authority | Proposed |
-| L3 frame/heap module split before cascade-btree lands | Proposed (code organization only — no format change) |
+| L3 frame/heap module split before cascade-btree-core lands | Proposed (code organization only — no format change) |
 | D1 heap slot state machine (Live/Redirect/Dead/Unused in the u16 marker space) | Proposed — DRAFT |
 | D2 prune = plan-carried transform; verdicts computed engine-side, never replayed | Proposed — forced by §9's contract |
 | D3 compact-on-prune in the same pass; lowest-first slot reuse via `append_into` | Proposed |

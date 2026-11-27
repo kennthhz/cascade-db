@@ -197,6 +197,7 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | C5 | `TxnCtx` is concrete in `cascade-txn-api`; `begin_statement` and `fresh_snapshot` are async | Kenneth, 2026-11-27 |
 | C6 | `end_statement` returns unresolved speculative tokens; the executor aborts them | Kenneth, 2026-11-27 |
 | Names | The dispatch crate is `cascade-access-dispatch` (was `cascade-access`); the dispatch enum is `Table` (was `AnyTable`) | Kenneth, 2026-11-27 |
+| Names | The generic tree crate is `cascade-btree-core` (was `cascade-btree`); `cascade-index` and `cascade-iot` keep their names. The crate directory and `Cargo.toml` name change when its code lands | Kenneth, 2026-11-27 |
 | C10 | One fake engine with two locator flavours, `Heap` and `Iot` | Kenneth, 2026-11-27 |
 | H9 | While the heap insert record is type 5, placement follows `cascade-redo`'s sequential-fill rule and the fill cursor advances in LSN order | Kenneth, 2026-11-26 |
 

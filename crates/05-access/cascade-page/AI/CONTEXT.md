@@ -55,7 +55,7 @@ has no undo; undo chains are IOT, §11). Fresh cells stamp `xmax`/`next` zero.
 
 ## Out of Scope
 
-- Index-specific node layout (B+Tree internals live in `cascade-btree`).
+- Index-specific node layout (B+Tree internals live in `cascade-btree-core`).
 - Heap-specific row encoding (lives in `cascade-heap`).
 - Columnar segment format (lives in `cascade-columnar` — different format, different crate, same 8 KB unit).
 - The outer integrity CRC (lives in the page store's per-page record, see invariant 1).

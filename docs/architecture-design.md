@@ -179,7 +179,7 @@ Every component in the architecture is listed here with its single responsibilit
 | L6 | `cascade-stats` | `ANALYZE` and automatic statistics collection. |
 | L6 | `cascade-authz` | Privilege checks and row-level security policies. |
 | L5 | `cascade-access-api` | The table access contract that every engine implements, and table descriptors. |
-| L5 | `cascade-btree` | A B-tree over the page cache that knows nothing about transactions. |
+| L5 | `cascade-btree-core` | A B-tree over the page cache that knows nothing about transactions. |
 | L5 | `cascade-iot` | The default index-organized engine, with in-place updates and undo. |
 | L5 | `cascade-heap` | The PostgreSQL-compatible heap engine, with incremental pruning and vacuum. |
 | L5 | `cascade-index` | Secondary indexes of every kind, each carrying its own visibility, for both engines. |
@@ -520,7 +520,7 @@ pub trait ScopeTxn {                                 // Send + Sync on the leade
 - *`TableDescriptor`.* An engine instance is constructed with a descriptor that lists columns, key columns and indexes. Engines never call the catalog. The scope host builds descriptors from the catalog, and the catalog's own system tables use hard-coded bootstrap descriptors.
 - *Conformance and fake.* One suite runs against every engine, including temporary tables. A simple in-memory multi-version table implements the contract with no pages, for testing the catalog, executor and data plane.
 
-**`cascade-btree`.** A B-tree over the page cache with byte keys and values. It changes pages only through mini-transactions and knows nothing about transactions or visibility.
+**`cascade-btree-core`.** A B-tree over the page cache with byte keys and values. It changes pages only through mini-transactions and knows nothing about transactions or visibility.
 
 **`cascade-iot`, `cascade-heap` and `cascade-index`.** Both table engines use `cascade-index`, and neither depends on the other.
 

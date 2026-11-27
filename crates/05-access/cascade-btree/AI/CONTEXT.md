@@ -1,4 +1,4 @@
-# cascade-btree — AI Design Context
+# cascade-btree-core — AI Design Context
 
 ## Role
 
