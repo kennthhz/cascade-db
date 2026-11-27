@@ -19,7 +19,7 @@ It has two faces, as every surveyed system does:
 
 Three engines implement one contract under one visibility rule:
 
-- **IOT** (index-organized) — the default. Rows are the leaves of a B-tree ordered by primary key; the newest version is in the leaf, older ones are undo deltas (kept §1). It is built from `cascade-iot` over `cascade-btree`.
+- **IOT** (index-organized) — the default. Rows are the leaves of a B-tree ordered by primary key; the newest version is in the leaf, older ones are undo deltas (kept §1). It is built from `cascade-iot` over `cascade-btree-core`.
 - **Heap** — the compatibility engine. Every update appends a new row version; HOT chains, prune and vacuum work as in PostgreSQL (kept §2). It is `cascade-heap` over the heap page format.
 - **Temporary tables** — session-private, never logged, built on the same contract (layer §11.6).
 
@@ -159,13 +159,13 @@ Each decision carries one status: **Proposed** (the author's proposal, awaiting 
 | :--- | :--- | :--- | :--- |
 | A1 | The mini-transaction — one logical page change together with its redo records, applied as a whole (§9.1) — is the only write primitive. An engine never changes a page any other way | §9.1 | Restates architecture §4.4 |
 | A2 | Redo has one dispatch point, `cascade-redo`. The byte transforms live at the format authorities, the payload encodings in `cascade-wal-format` | §9.2 | Proposed |
-| A3 | B-tree page formats live in `cascade-page`; `cascade-btree` owns tree logic, not bytes | §9.2 | Proposed; follows architecture §3.2 |
+| A3 | B-tree page formats live in `cascade-page`; `cascade-btree-core` owns tree logic, not bytes | §9.2 | Proposed; follows architecture §3.2 |
 | A4 | A scope is a shared-memory engine across its write core set. This supersedes the retired WP5 D8 (message-to-owner reads) | §8 | Restates architecture §4.8 |
 | A5 | Engines are built from a `TableDescriptor` and never read the catalog | §6.12 | Restates architecture §4.6 |
 | A6 | Segment and page allocation is a scope-level facility. Ids are never reused | §10 | Proposed |
 | A7 | The key contract stays in `cascade-pgtypes` until `cascade-datum` exists. The dependency is a documented exception. Text indexes support the `C` collation only until then | §5.2 | Proposed |
 | A8 | Visibility needs one injected contract, `VisibilitySource`, so engines do not depend on the runtime | §6.6 | Proposed |
-| A9 | `cascade-btree` is the tree mechanism for the IOT and for secondary indexes, and knows nothing about transactions | §11.1 | Restates architecture §4.6 |
+| A9 | `cascade-btree-core` is the tree mechanism for the IOT and for secondary indexes, and knows nothing about transactions | §11.1 | Restates architecture §4.6 |
 | A10 | The engine builds a mini-transaction's records, and the seam applies each record to the data page it names — the heap, IOT or index page in the buffer pool — through `cascade-redo`. Leader and replay therefore run one code path. A page's LSN is the end of its last record | §9.1, §9.3 | Proposed |
 | A11 | Row locks: on a heap, exclusive locks are recorded in the row header and shared locks in the lock manager; on an IOT, all in the lock manager | §6.10 | Proposed; changes architecture §4.5 (see §13.2) |
 | A12 | An engine that must wait sleeps in an injected wait seam (`WaitSource`) until woken, instead of polling. The wait layer's two aborts — deadlock victim, `lock_timeout` — arrive as errors | §6.5, §6.11 | Proposed |
@@ -192,10 +192,10 @@ The decisions of the retired WP5 design (its D1–D15) are part of the contract 
 | `cascade-access-api` | To create | The contract of layer §6: the types, the suite's trait, the in-memory fake and the conformance suite | `cascade-types`, `cascade-txn-api`, `cascade-pgtypes` (A7), `cascade-telemetry` |
 | `cascade-access-dispatch` | To create | The dispatch enums `Table`, `TableScan` and `Maintenance` (layer §6.1). It sits above the engines, because the enums name their types | `cascade-access-api` and every engine crate |
 | `cascade-page` | Landed | The page layer: prologue, kind registry and the heap format (kind 1); the B-tree and free-space-map formats as they land (A3) | `cascade-types` |
-| `cascade-btree` | Stub | The B+tree mechanism: descent, latching, structure changes, operations on byte keys | `cascade-types`, `cascade-page`, the page cache contract |
+| `cascade-btree-core` | Stub | The B+tree mechanism: descent, latching, structure changes, operations on byte keys | `cascade-types`, `cascade-page`, the page cache contract |
 | `cascade-heap` | Stub | The heap engine | `cascade-types`, `cascade-page`, the page cache contract, `cascade-access-api`, `cascade-index` once it exists |
-| `cascade-iot` | To create | The IOT engine | `cascade-access-api`, `cascade-btree`, `cascade-undo`, `cascade-index`, the page cache contract |
-| `cascade-index` | To create | Secondary indexes for both engines | `cascade-access-api`, `cascade-btree` |
+| `cascade-iot` | To create | The IOT engine | `cascade-access-api`, `cascade-btree-core`, `cascade-undo`, `cascade-index`, the page cache contract |
+| `cascade-index` | To create | Secondary indexes for both engines | `cascade-access-api`, `cascade-btree-core` |
 | `cascade-sequence` | To create | Sequences, `serial` and identity columns | `cascade-access-api` |
 | `cascade-maintenance` | To create | The scheduler for undo purge, heap prune and vacuum | `cascade-access-api`, `cascade-watermark` once it exists |
 | `cascade-temptable` | To create | Session-private temporary tables on the same contract | `cascade-access-api`, `cascade-tempstore` |
@@ -226,7 +226,7 @@ pub enum Table { Iot(IotTable), Heap(HeapTable), Temp(TempTable) }
 
 `Table` re-exposes the whole surface as inherent `async fn`s that `match self` and delegate. The futures are `!Send`, as the runtime requires. A trait object would need boxed futures and would erase that; generics do not fit because the executor holds mixed collections of tables. Temporary tables are a third engine on the same contract, so the enum has three arms (A13). The temporary arm arrives with `cascade-temptable` (Step 9); every `match` on the enum lives in this repository, so adding it is a compile-time change and not a contract break.
 
-**Names (decided by Kenneth, 2026-11-27).** The dispatch crate is `cascade-access-dispatch`, because all it does is route each call to the engine the catalog's table type names. The enum is `Table`, formerly `AnyTable`: callers hold "a table", and the arm says which engine stores it. `TableHandle` was not used because it already names the `{ rel, scope }` pair that `handle()` returns.
+**Names (decided by Kenneth, 2026-11-27).** The generic tree crate is `cascade-btree-core` (formerly `cascade-btree`), so that its name says it is the shared mechanism under the IOT and every index, not an index itself. The dispatch crate is `cascade-access-dispatch`, because all it does is route each call to the engine the catalog's table type names. The enum is `Table`, formerly `AnyTable`: callers hold "a table", and the arm says which engine stores it. `TableHandle` was not used because it already names the `{ rel, scope }` pair that `handle()` returns.
 
 **Where the enum lives (access-api C1).** Not in `cascade-access-api`: the enum names `IotTable`, `HeapTable` and `TempTable`, and every engine crate depends on the contract crate, so the enum there would be a dependency cycle. It lives in `cascade-access-dispatch`, a thin crate above all the engines.
 
@@ -806,7 +806,7 @@ A redo record must be applicable to its page alone, give the same bytes every ti
 
 *Sources:* storage §12.4 (the redo contract); architecture §3.2 and Rule 5 (the three-way split); heap §9 and btree §8 (the records); page D4 (the page methods); layer §13.3 (the shared free-space item). Round-3 fix V35 moved these citations out of the sentences.
 
-**A3 — B-tree page formats live in `cascade-page`.** The architecture lists the index-organized leaf layouts under `cascade-page`, and `cascade-redo` (L1) cannot depend on `cascade-btree` (L5). So the B-tree *bytes* — branch nodes, IOT leaf rows, index entries, their headers and their parse — are `cascade-page` kinds, and `cascade-btree` owns the tree *logic* over them. This corrects the page design's §2, which assigned those formats to `cascade-btree`; the architecture wins (architecture §1.1). The page design's boundary "cells are never unified across kinds" stands: an IOT leaf row and an index entry are different cell shapes that happen to live in one crate.
+**A3 — B-tree page formats live in `cascade-page`.** The architecture lists the index-organized leaf layouts under `cascade-page`, and `cascade-redo` (L1) cannot depend on `cascade-btree-core` (L5). So the B-tree *bytes* — branch nodes, IOT leaf rows, index entries, their headers and their parse — are `cascade-page` kinds, and `cascade-btree-core` owns the tree *logic* over them. This corrects the page design's §2, which assigned those formats to `cascade-btree-core`; the architecture wins (architecture §1.1). The page design's boundary "cells are never unified across kinds" stands: an IOT leaf row and an index entry are different cell shapes that happen to live in one crate.
 
 **Page-kind registry.** Kinds are assigned by the authority that lands them and frozen with golden tests (page L1). Assigned: **1 = heap**. Proposed, frozen when each lands: **2 = B-tree branch, 3 = IOT leaf, 4 = index leaf** (btree §2), **5 = tree metapage** (btree §2), **6 = free-space map** (heap §7.2), **7 = undo page** (the IOT design). An unknown kind is `WrongKind`, which is not corruption.
 
@@ -842,7 +842,9 @@ Free space *inside* a heap's pages is the heap's own free-space map (heap §7.2)
 
 ## 11. The Engines
 
-### 11.1 `cascade-btree` — the tree mechanism (A9)
+**The mental model in brief.** `cascade-btree-core` is a generic B+tree: a sorted map from key bytes to opaque value bytes, with no knowledge of rows or transactions. `cascade-iot` uses one btree-core tree *as* the table: key = primary key, value = the whole row (creator word, undo pointer, flags, columns). `cascade-heap` keeps rows in heap pages addressed by (page, slot), with no tree. `cascade-index` is every index whose entries point at a row, each its own btree-core tree: key = indexed columns (plus the locator when not unique), value = the locator and two visibility words. On a heap table that includes the primary key's index; on an IOT table the primary key is the table itself. The [design overview](access-design-overview.md) §3 walks through an example.
+
+### 11.1 `cascade-btree-core` — the tree mechanism (A9)
 
 A B+tree over the page cache with byte keys and byte values, shared by the IOT's primary tree and by every secondary index. It knows nothing about transactions or visibility: version words inside leaf payloads are opaque bytes to it (architecture §4.6). It owns descent and latching, structure changes, ordered iteration with mark/restore, and the byte-level operations its two users need — insert, lookup, update in place, delete-mark, stamp, compact. The btree design is its detailed design.
 
@@ -919,7 +921,7 @@ Each step keeps the workspace building and its tests passing.
 | 3 | The heap's first slice (plan T6.4): insert and scan, no visibility yet, sequential fill in LSN order (heap §2). A row's record is reserved and applied in the commit path (layer §7), so a rolled-back insert never reaches a page | Steps 1–2; `cascade-redo` (storage M7) |
 | 4 | The MVCC milestone: slot states (page D1), visibility, the DML paths with real outcomes, prune, and the switch to record type 10 | Step 3; layer §13.1 decided |
 | 5 | Engine hygiene: the dead dependencies go, the context files are synced | — |
-| 6 | `cascade-btree` | the page design's module split (page L3); Steps 1–2 |
+| 6 | `cascade-btree-core` | the page design's module split (page L3); Steps 1–2 |
 | 7 | `cascade-iot` and undo | Step 6; the IOT design |
 | 8 | `cascade-index` and out-of-line storage | Steps 4 and 6 |
 | 9 | Sequence, maintenance, temporary tables | Step 1 |
@@ -1031,7 +1033,7 @@ Three further points are confirmations, not changes: A3 follows the architecture
 | A6 | Scope-level segment and page allocation; ids never reused | Proposed. Applies storage S18 to this layer |
 | A7 | The key contract stays in `cascade-pgtypes` for now, as a named exception | Proposed |
 | A8 | One injected `VisibilitySource` | Proposed |
-| A9 | `cascade-btree` is a transaction-blind tree | Restates architecture §4.6 |
+| A9 | `cascade-btree-core` is a transaction-blind tree | Restates architecture §4.6 |
 | A10 | The engine supplies records; the seam applies them through `cascade-redo`. A page's LSN is the end of its last record | Proposed |
 | A11 | Heap: exclusive row locks in the row header, shared ones in the lock manager. IOT: all in the lock manager | Proposed. Changes architecture §4.5 (layer §13.2) |
 | A12 | An injected wait seam (`WaitSource`): engines sleep until woken; deadlock and `lock_timeout` arrive as errors | Proposed |

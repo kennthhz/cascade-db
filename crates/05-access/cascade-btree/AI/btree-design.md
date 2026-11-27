@@ -1,8 +1,8 @@
-# cascade-btree design — the B+tree mechanism
+# cascade-btree-core design — the B+tree mechanism
 
 **Status:** Draft v0.2 for review, 2026-11-26, amended 2026-11-27 for the round-4 review (W1, W9) and the round-3 review ([`access-design-review-2026-11-27.md`](../../AI/access-design-review-2026-11-27.md): V3, V10, V11, V21, V36). v0.2 applies the review of v0.1 ([`access-design-review.md`](../../AI/access-design-review.md)): writers now pin before they validate, the root pointer is checked, tree keys and equal keys are defined, every entry carries its length, `mod_count` has a rule, and the no-merge policy is written down (R6, R7, R12–R14, R22, R23, R27–R29). Decision numbers are stable identifiers, so B8–B11, added by v0.2, sit where their subject is rather than in numeric order.
 
-**What this document is.** The detailed design of `cascade-btree`: the B+tree mechanism shared by the IOT's primary tree (`cascade-iot`) and by every secondary index (`cascade-index`). It owns the tree — descent, latching, structure changes, ordered iteration, and operations on byte keys — and nothing else. Page bytes belong to `cascade-page` (layer A3), record payloads to `cascade-wal-format`, redo dispatch to `cascade-redo`, and every visibility decision to the engines above it.
+**What this document is.** The detailed design of `cascade-btree-core`: the B+tree mechanism shared by the IOT's primary tree (`cascade-iot`) and by every secondary index (`cascade-index`). It owns the tree — descent, latching, structure changes, ordered iteration, and operations on byte keys — and nothing else. Page bytes belong to `cascade-page` (layer A3), record payloads to `cascade-wal-format`, redo dispatch to `cascade-redo`, and every visibility decision to the engines above it.
 
 **Background for readers new to B-tree concurrency (round-3 fix V36).** A B+tree keeps its entries in leaf pages ordered by key, linked left to right, with branch pages above them that route a search to the right leaf. The classic way to make it safe under concurrent writers is *latch coupling*: hold the parent's latch while taking the child's, then release the parent. That needs a latch to be held while the child is fetched. Here a page that is not in memory must be fetched with an `await`, and a buffer-pool pin may never be held across an `await` (pins are spin-style holds measured in microseconds, and a suspended task would block every other session on that core that wants the page). So this tree is *optimistic*: a reader copies each page without holding its parent, and afterwards checks that nothing it passed through has changed, starting over if something has (the idea behind optimistic lock coupling and Lehman–Yao's B-link trees). Writers pin only the leaf they change, and a split pins its few pages together after making them resident.
 
@@ -336,7 +336,7 @@ Records 20–23 name "which entry of the run on this page", so that a delete-mar
 ## 11. Landing Plan
 
 1. **Prerequisite.** The page design's module split (page L3). The tree consumes the page layer's contract and never a copy of its prologue logic.
-2. **Kinds and views.** Kinds 2–5 in `cascade-page`, with typed views, parse and golden tests. Then in `cascade-btree`, over the in-memory seam: descent and validation (§3), lookup, insert and split (§5.1), scan (§5.2), with the tests of §9.
+2. **Kinds and views.** Kinds 2–5 in `cascade-page`, with typed views, parse and golden tests. Then in `cascade-btree-core`, over the in-memory seam: descent and validation (§3), lookup, insert and split (§5.1), scan (§5.2), with the tests of §9.
 3. **The rest of the surface.** Update in place, marks and stamps, purge-compact, the metapage record.
 4. **The hosts adopt it.** `cascade-index` freezes the index entry's bytes; `cascade-iot` freezes the IOT leaf row's.
 

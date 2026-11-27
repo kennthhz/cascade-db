@@ -1,4 +1,4 @@
-# cascade-btree
+# cascade-btree-core
 
 B+Tree access method.
 
