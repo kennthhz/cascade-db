@@ -10,7 +10,7 @@
 
 ## 1. Open decisions
 
-Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-15 to D-17, the DDL gaps, were added on 2026-11-27 at Kenneth's request. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
+Ordered by what they block. "Owner" is who decides; Kenneth is the project owner and ratifies every row. D-18 (access-api v0.2) was added on 2026-11-28. D-15 to D-17, the DDL gaps, were added on 2026-11-27 at Kenneth's request. D-1, D-12, D-13 and D-14 were changed or added by the round-4 fixes ([`access-design-review-round4-2026-11-27.md`](access-design-review-round4-2026-11-27.md)). D-1 and D-11 to D-13 were added or changed by the fixes for the round-3 review ([`access-design-review-2026-11-27.md`](access-design-review-2026-11-27.md)).
 
 ### D-2. Who builds the transaction-side seams, and when
 
@@ -88,6 +88,17 @@ Ordered by what they block. "Owner" is who decides; Kenneth is the project owner
 | D-9f | A shared free-space predicate for `cascade-page` and `cascade-redo` instead of a mirror | Do it with the next change to either | — |
 | D-9g | Text indexes support only the `C` collation until `cascade-datum` provides collation-aware keys; other collations are refused at `CREATE INDEX` (layer A7, round-3 V24) | Accept, and list it in product definition §5.5 | Step 8 |
 | D-9h | Sequence range size (default 32, growing with use); allocation waits for durability (layer §11.5, round-3 V23) | Accept | Step 8 |
+
+### D-18. The access-api v0.2 additions (C14–C23)
+
+| | |
+| :--- | :--- |
+| **Question** | Accept the ten proposals of the [access-api design](../cascade-access-api/AI/access-api-design.md) v0.2 (§13)? |
+| **Highlights** | C14: shared row locks need an interface in `cascade-txn-api` (`RowLockTable`), because `WaitSource` can only sleep and signal, so half of A11 had no API. C15: a scan holds an owned `ReadView` instead of borrowing `TxnCtx`, because `UPDATE` over a scan needs `&mut TxnCtx` while the scan is alive. C16–C23: error codes, `#[non_exhaustive]` policy, lock-key encoding, `abort_unresolved` signature, lint allowance, `ColumnType`, key helpers |
+| **Recommendation** | Accept all ten. C14 and C15 are requirements on the transaction layer (api §11 X1), so its owner should confirm them too |
+| **Owner** | Kenneth |
+| **Blocks** | Step 1 (commit 1 for C16–C23; commit 0, `cascade-txn-api`, for C14–C15) |
+| **Status** | Open |
 
 ### D-15. Who drops a table's or an index's storage
 
